@@ -1,0 +1,51 @@
+// Copyright (c) 2026 The Utreexo Bridge developers
+// Distributed under the MIT software license.
+#ifndef UTREEXO_SYNC_H
+#define UTREEXO_SYNC_H
+
+#include <utreexo/core_rpc.h>
+#include <utreexo/forest.h>
+#include <utreexo/result.h>
+
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+namespace utreexo {
+
+struct BlockProcessingMetrics {
+    uint64_t chain_check_us{0};
+    uint64_t block_hash_us{0};
+    uint64_t block_fetch_us{0};
+    uint64_t parse_us{0};
+    uint64_t modify_us{0};
+    uint64_t total_us{0};
+};
+
+struct ProcessedBlock {
+    BlockDelta delta;
+    BlockProcessingMetrics metrics;
+};
+
+/** Sequential adapter. It owns no Core internals and can later consume an IPC BlockSource. */
+class SequentialSync
+{
+public:
+    SequentialSync(BlockSource& source, PackedForest& forest,
+                   std::vector<Hash256> chain_hashes = {});
+
+    Result<ProcessedBlock> ProcessNext();
+    Result<uint32_t> TipHeight();
+
+    const std::vector<Hash256>& ChainHashes() const { return m_chain_hashes; }
+    std::optional<ChainPoint> CurrentPoint() const;
+
+private:
+    BlockSource& m_source;
+    PackedForest& m_forest;
+    std::vector<Hash256> m_chain_hashes;
+};
+
+} // namespace utreexo
+
+#endif // UTREEXO_SYNC_H
