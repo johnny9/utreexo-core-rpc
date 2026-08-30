@@ -71,6 +71,26 @@ To make one recoverable checkpoint at shutdown or at the reached tip:
 full forest. Large intervals reduce restart cost while avoiding the per-block rewrite
 pattern this project is meant to eliminate.
 
+## Offline arena compaction
+
+`utreexo-checkpoint-compact` rewrites a checkpoint with dense node IDs. It preserves
+the checkpoint format, chain point, leaf count, and roots; only internal node IDs and
+links change. It is an offline operation: stop the sidecar first, keep the input
+checkpoint unchanged, and write to a new path on the same filesystem.
+
+```sh
+./build/utreexo-checkpoint-compact \
+  /fast/storage/utreexo-forest.chk \
+  /fast/storage/utreexo-forest.compact.chk
+```
+
+The command validates the input checksum, writes and fsyncs the new checkpoint before
+publishing it atomically, and prints source/compact slot counts. It uses a disk-backed
+four-byte-per-old-slot ID map rather than loading either forest, so it is suitable for
+memory-constrained hosts. Reserve space for the old checkpoint, the new checkpoint,
+and the map (roughly 34 GiB at the current 900k-scale checkpoint); do not delete the
+original until the compacted checkpoint has been independently loaded and validated.
+
 ## Logging and milestone validation
 
 The sidecar emits UTC, single-line key/value records in the form

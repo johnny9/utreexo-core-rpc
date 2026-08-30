@@ -80,6 +80,11 @@ target_compile_features(utreexo_checkpoint PUBLIC cxx_std_20)
 target_link_libraries(utreexo_checkpoint PUBLIC utreexo_accumulator utreexo_logging)
 utreexo_configure_target(utreexo_checkpoint)
 
+add_executable(utreexo-checkpoint-compact src/checkpoint_compact.cpp)
+target_link_libraries(utreexo-checkpoint-compact PRIVATE utreexo_logging)
+target_compile_features(utreexo-checkpoint-compact PRIVATE cxx_std_20)
+utreexo_configure_target(utreexo-checkpoint-compact)
+
 if(UTREEXO_BUILD_BENCHMARKS)
     add_executable(utreexo-resource-estimate bench/resource_estimate.cpp)
     target_compile_features(utreexo-resource-estimate PRIVATE cxx_std_20)
