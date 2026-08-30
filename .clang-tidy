@@ -1,0 +1,11 @@
+---
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-use-after-move,
+  bugprone-unhandled-self-assignment,
+  performance-*
+WarningsAsErrors: '*'
+HeaderFilterRegex: '^(.*[/\\])?(include|src|test|bench)[/\\].*'
+SystemHeaders: false
+...

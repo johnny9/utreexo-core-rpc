@@ -164,3 +164,41 @@ The test returns CTest's skip code 77 when an external executable is absent. A
 wrong Floresta version is an error because it would test a different wire protocol.
 Use `--keep-data` with `test/integration/floresta_regtest.py` to retain daemon logs
 and chain data after a successful direct run.
+
+## Continuous validation
+
+GitHub Actions runs the following checks on every push to `master` and every pull
+request:
+
+- GCC Debug, GCC Release without the RPC adapter, Clang Release, and Apple Clang
+  Release builds, all with warnings treated as errors.
+- Address/Leak/UndefinedBehavior Sanitizers and ThreadSanitizer in separate jobs.
+- Clang-Tidy's Clang analyzer, use-after-move, and performance checks.
+- ASan/UBSan-backed libFuzzer smoke tests for forest deserialization and verbose
+  Bitcoin Core RPC JSON parsing.
+- Valgrind leak and memory-error checks for both deterministic test executables.
+- ShellCheck, Python bytecode compilation, and whitespace validation.
+- The pinned Bitcoin Core/reference bridge/Floresta differential regtest described
+  above.
+
+The sanitizer interface is also available locally:
+
+```sh
+cmake -S . -B build-asan -DUTREEXO_SANITIZERS=address,undefined
+cmake --build build-asan -j2
+ctest --test-dir build-asan --output-on-failure
+
+cmake -S . -B build-tsan -DUTREEXO_SANITIZERS=thread
+cmake --build build-tsan -j2
+ctest --test-dir build-tsan --output-on-failure
+
+CC=clang CXX=clang++ cmake -S . -B build-fuzz \
+  -DUTREEXO_BUILD_FUZZERS=ON -DBUILD_TESTING=OFF
+cmake --build build-fuzz -j2 --target utreexo_fuzz_forest utreexo_fuzz_rpc_json
+./build-fuzz/utreexo_fuzz_forest -runs=10000 -max_len=65536
+./build-fuzz/utreexo_fuzz_rpc_json -runs=10000 -max_len=65536
+```
+
+Sanitizers supported by the CMake option are `address`, `undefined`, `thread`,
+and `leak`. AddressSanitizer and ThreadSanitizer are intentionally rejected when
+requested together because the runtimes are incompatible.

@@ -1,0 +1,208 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: GCC Debug
+            os: ubuntu-24.04
+            cc: gcc
+            cxx: g++
+            build_type: Debug
+            rpc: "ON"
+          - name: GCC Release without RPC
+            os: ubuntu-24.04
+            cc: gcc
+            cxx: g++
+            build_type: Release
+            rpc: "OFF"
+          - name: Clang Release
+            os: ubuntu-24.04
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            rpc: "ON"
+          - name: Apple Clang Release
+            os: macos-14
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            rpc: "ON"
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DUTREEXO_BUILD_RPC=${{ matrix.rpc }}
+          -DUTREEXO_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ASan + LSan + UBSan
+            sanitizers: address,undefined
+          - name: TSan
+            sanitizers: thread
+    env:
+      CC: clang
+      CXX: clang++
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:strict_string_checks=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1:report_error_type=1
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Reduce address-space randomization for TSan
+        if: matrix.sanitizers == 'thread'
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DUTREEXO_SANITIZERS=${{ matrix.sanitizers }}
+          -DUTREEXO_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  static-analysis:
+    name: Clang-Tidy and source lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install analysis tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends clang-tidy shellcheck
+      - name: Configure compilation database
+        env:
+          CC: clang
+          CXX: clang++
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Run Clang-Tidy
+        run: run-clang-tidy -p build -quiet '.*/(src|test|bench)/.*\.cpp$'
+      - name: Check shell scripts
+        run: shellcheck tools/*.sh
+      - name: Check Python syntax
+        run: python3 -m compileall -q test/integration
+      - name: Check whitespace
+        run: git diff --check
+
+  valgrind:
+    name: Valgrind
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends valgrind
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Check accumulator tests
+        run: >-
+          valgrind --error-exitcode=1 --leak-check=full
+          --show-leak-kinds=all --errors-for-leak-kinds=definite,possible
+          ./build/utreexo_tests
+      - name: Check RPC tests
+        run: >-
+          valgrind --error-exitcode=1 --leak-check=full
+          --show-leak-kinds=all --errors-for-leak-kinds=definite,possible
+          ./build/utreexo_rpc_tests
+
+  fuzz:
+    name: libFuzzer smoke test
+    runs-on: ubuntu-24.04
+    env:
+      CC: clang
+      CXX: clang++
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Configure fuzz targets
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DUTREEXO_BUILD_FUZZERS=ON
+          -DBUILD_TESTING=OFF
+      - name: Build fuzz targets
+        run: cmake --build build --parallel 2 --target utreexo_fuzz_forest utreexo_fuzz_rpc_json
+      - name: Fuzz forest deserialization
+        run: ./build/utreexo_fuzz_forest -runs=10000 -max_len=65536
+      - name: Fuzz verbose RPC JSON parsing
+        run: ./build/utreexo_fuzz_rpc_json -runs=10000 -max_len=65536
+
+  differential-regtest:
+    name: Bitcoin Core / reference bridge / Floresta regtest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CORE_VERSION: "31.1"
+      CORE_ARCHIVE_SHA256: b80d9c3e04da78fb6f0569685673418cf686fadba9042d926d13fb87ff503f9e
+      REFERENCE_COMMIT: 9582853345839d625e80ef46b1a23b6dd0fef6c6
+      FLORESTA_COMMIT: aaef08453a89a55fdb42e1541de7a18c151cdbe8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build sidecar
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel 2
+      - name: Install verified Bitcoin Core binary
+        working-directory: ${{ runner.temp }}
+        run: |
+          archive="bitcoin-${CORE_VERSION}-x86_64-linux-gnu.tar.gz"
+          base="https://bitcoincore.org/bin/bitcoin-core-${CORE_VERSION}"
+          curl --fail --silent --show-error --location --remote-name "${base}/${archive}"
+          echo "${CORE_ARCHIVE_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xf "${archive}"
+          echo "${RUNNER_TEMP}/bitcoin-${CORE_VERSION}/bin" >> "${GITHUB_PATH}"
+      - name: Build pinned reference bridge
+        working-directory: ${{ runner.temp }}
+        run: |
+          git clone --filter=blob:none https://github.com/getfloresta/rpc-utreexo-bridge reference-bridge
+          git -C reference-bridge checkout --detach "${REFERENCE_COMMIT}"
+          cargo build --manifest-path reference-bridge/Cargo.toml --release --locked
+      - name: Build pinned Floresta
+        working-directory: ${{ runner.temp }}
+        run: |
+          git clone --filter=blob:none https://github.com/getfloresta/Floresta floresta
+          git -C floresta checkout --detach "${FLORESTA_COMMIT}"
+          cargo build --manifest-path floresta/Cargo.toml --release --locked -p florestad
+      - name: Run differential regtest
+        run: >-
+          python3 test/integration/floresta_regtest.py
+          --bitcoind="${RUNNER_TEMP}/bitcoin-${CORE_VERSION}/bin/bitcoind"
+          --sidecar="${GITHUB_WORKSPACE}/build/utreexo-bridge"
+          --reference-bridge="${RUNNER_TEMP}/reference-bridge/target/release/bridge"
+          --florestad="${RUNNER_TEMP}/floresta/target/release/florestad"
+          --timeout=300
