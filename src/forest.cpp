@@ -97,6 +97,25 @@ public:
                static_cast<uint64_t>(m_free.capacity()) * sizeof(NodeId);
     }
 
+    /**
+     * Ensure allocating `count` nodes cannot allocate while a block transition
+     * is mutating the forest.  This lets callers retain the previous block as
+     * a recoverable checkpoint boundary after std::bad_alloc.
+     */
+    void PrepareAllocations(uint64_t count)
+    {
+        if (count <= m_free.size()) return;
+        const uint64_t new_slots{count - m_free.size()};
+        const uint64_t last{m_next + new_slots - 1};
+        if (last >= NO_NODE) throw std::length_error{"packed forest exhausted 32-bit node IDs"};
+        Ensure(static_cast<NodeId>(last));
+    }
+
+    void PrepareFrees(uint64_t count)
+    {
+        m_free.reserve(m_free.size() + count);
+    }
+
     void Import(NodeId id, NodeType type, const Hash256& hash, NodeId parent, NodeId left, NodeId right)
     {
         Ensure(id);
@@ -188,6 +207,18 @@ public:
         return static_cast<uint64_t>(m_slots.capacity()) * sizeof(NodeId) + m_control.capacity();
     }
 
+    /** Reserve enough room that inserts following a block's deletions cannot
+     * rehash while the forest is being modified. */
+    void PrepareInsertions(uint64_t deletions, uint64_t additions)
+    {
+        // Deletions turn full slots into tombstones, so they do not reduce the
+        // occupied-slot count which controls when Insert() rehashes.
+        static_cast<void>(deletions);
+        const uint64_t needed{m_size + m_tombstones + additions + 1};
+        const uint64_t capacity_needed{(needed * 10 + 7) / 8};
+        if (capacity_needed > m_slots.size()) Rehash(static_cast<std::size_t>(capacity_needed));
+    }
+
 private:
     static constexpr uint8_t EMPTY{0};
     static constexpr uint8_t FULL{1};
@@ -208,17 +239,26 @@ private:
     void Rehash(std::size_t capacity)
     {
         capacity = std::max<std::size_t>(16, std::bit_ceil(capacity));
-        std::vector<NodeId> old_slots{std::move(m_slots)};
-        std::vector<uint8_t> old_control{std::move(m_control)};
-        m_slots.assign(capacity, NO_NODE);
-        m_control.assign(capacity, EMPTY);
-        m_size = 0;
-        m_tombstones = 0;
-        for (std::size_t i{0}; i < old_slots.size(); ++i) {
-            if (old_control[i] == FULL && m_arena.IsLeaf(old_slots[i])) {
-                Insert(m_arena.Hash(old_slots[i]), old_slots[i]);
+        // Construct replacement storage before changing this index.  A failed
+        // allocation therefore leaves the existing forest and index usable for
+        // an emergency checkpoint.
+        std::vector<NodeId> slots(capacity, NO_NODE);
+        std::vector<uint8_t> control(capacity, EMPTY);
+        uint64_t size{0};
+        const std::size_t mask{capacity - 1};
+        for (std::size_t i{0}; i < m_slots.size(); ++i) {
+            if (m_control[i] == FULL && m_arena.IsLeaf(m_slots[i])) {
+                std::size_t slot{Bucket(m_arena.Hash(m_slots[i])) & mask};
+                while (control[slot] == FULL) slot = (slot + 1) & mask;
+                slots[slot] = m_slots[i];
+                control[slot] = FULL;
+                ++size;
             }
         }
+        m_slots.swap(slots);
+        m_control.swap(control);
+        m_size = size;
+        m_tombstones = 0;
     }
 
     const NodeArena& m_arena;
@@ -257,6 +297,18 @@ public:
         roots[row] = node;
         ++num_leaves;
         return Result<void>::Ok();
+    }
+
+    void PrepareModify(uint64_t additions, uint64_t deletions)
+    {
+        uint64_t branches{0};
+        for (uint64_t i{0}; i < additions; ++i) {
+            branches += std::countr_one(num_leaves + i);
+        }
+        // Each deletion frees at most a leaf and one branch.
+        arena.PrepareFrees(deletions * 2);
+        index.PrepareInsertions(deletions, additions);
+        arena.PrepareAllocations(additions + branches);
     }
 
     Result<void> DeleteId(NodeId leaf)
@@ -395,6 +447,9 @@ Result<void> PackedForest::Modify(std::span<const Hash256> additions,
     }
 
     std::ranges::sort(delete_nodes, {}, &std::pair<uint64_t, NodeId>::first);
+    // No operation after this point may need to allocate.  If preparation
+    // throws std::bad_alloc, the caller can safely checkpoint the old tip.
+    m_impl->PrepareModify(additions.size(), deletions.size());
     for (const auto& [position, id] : delete_nodes) {
         static_cast<void>(position);
         const auto deleted{m_impl->DeleteId(id)};

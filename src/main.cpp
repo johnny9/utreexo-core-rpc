@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -82,6 +83,7 @@ void Usage()
         << "  --rpc-port=PORT             Bitcoin Core RPC port (default 8332)\n"
         << "  --checkpoint=PATH           Load/save a sparse atomic checkpoint\n"
         << "  --checkpoint-interval=N     Full checkpoint every N blocks (default 0: final only)\n"
+        << "                              Allocation failures save the last completed checkpoint\n"
         << "  --state-json=PATH           Write final height, leaf count, and roots as JSON\n"
         << "  --stop-height=N             Stop before the current Core tip\n"
         << "  --log-level=LEVEL           error, warn, info, debug, or trace (default info)\n"
@@ -347,7 +349,36 @@ int main(int argc, char** argv)
     const auto sync_wall_start{Clock::now()};
 
     while (sync.ChainHashes().size() <= target) {
-        auto block{sync.ProcessNext()};
+        utreexo::Result<utreexo::ProcessedBlock> block{utreexo::Result<utreexo::ProcessedBlock>::Err("uninitialized")};
+        try {
+            block = sync.ProcessNext();
+        } catch (const std::bad_alloc&) {
+            const auto point{sync.CurrentPoint()};
+            const uint32_t safe_height{point ? point->height : 0};
+            utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
+                "phase=block_transition safe_height=" + std::to_string(safe_height) +
+                " target_height=" + std::to_string(target) +
+                " action=emergency_checkpoint");
+            if (!options.checkpoint || !point) {
+                utreexo::Log(utreexo::LogLevel::ERROR, "emergency_checkpoint_unavailable",
+                    "reason=" + std::string{!options.checkpoint ? "no_checkpoint_path" : "no_completed_block"} +
+                    " recovery=restart_from_last_checkpoint");
+                return 2;
+            }
+            const auto saved{save_checkpoint(*point, "memory_allocation_failure")};
+            if (!saved) {
+                utreexo::Log(utreexo::LogLevel::ERROR, "emergency_checkpoint_failed",
+                    "height=" + std::to_string(safe_height) +
+                    " error=" + StringField(saved.Error()) +
+                    " recovery=restart_from_last_checkpoint");
+                return 2;
+            }
+            utreexo::Log(utreexo::LogLevel::ERROR, "sync_aborted_memory_limit",
+                "safe_height=" + std::to_string(safe_height) +
+                " checkpoint_status=saved exit_code=2"
+                " recovery=restart_from_saved_checkpoint_after_freeing_memory");
+            return 2;
+        }
         if (!block) {
             utreexo::Log(utreexo::LogLevel::ERROR, "sync_failed",
                 "height=" + std::to_string(sync.ChainHashes().size()) +
