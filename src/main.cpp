@@ -104,28 +104,28 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
             std::exit(0);
         } else if (argument == "--version") {
             options.show_version = true;
-        } else if (auto parsed{value("--rpc-host")}) {
-            options.host = *parsed;
-        } else if (auto parsed{value("--rpc-port")}) {
-            if (!ParseInteger(*parsed, options.port)) return utreexo::Result<Options>::Err("invalid --rpc-port");
-        } else if (auto parsed{value("--rpc-auth")}) {
-            options.authorization = *parsed;
-        } else if (auto parsed{value("--rpc-cookie")}) {
-            options.cookie = *parsed;
-        } else if (auto parsed{value("--checkpoint")}) {
-            options.checkpoint = std::filesystem::path{*parsed};
-        } else if (auto parsed{value("--checkpoint-interval")}) {
-            if (!ParseInteger(*parsed, options.checkpoint_interval)) {
+        } else if (auto host{value("--rpc-host")}) {
+            options.host = *host;
+        } else if (auto port{value("--rpc-port")}) {
+            if (!ParseInteger(*port, options.port)) return utreexo::Result<Options>::Err("invalid --rpc-port");
+        } else if (auto auth{value("--rpc-auth")}) {
+            options.authorization = *auth;
+        } else if (auto cookie{value("--rpc-cookie")}) {
+            options.cookie = *cookie;
+        } else if (auto checkpoint{value("--checkpoint")}) {
+            options.checkpoint = std::filesystem::path{*checkpoint};
+        } else if (auto interval{value("--checkpoint-interval")}) {
+            if (!ParseInteger(*interval, options.checkpoint_interval)) {
                 return utreexo::Result<Options>::Err("invalid --checkpoint-interval");
             }
-        } else if (auto parsed{value("--state-json")}) {
-            options.state_json = std::filesystem::path{*parsed};
-        } else if (auto parsed{value("--stop-height")}) {
+        } else if (auto state_json{value("--state-json")}) {
+            options.state_json = std::filesystem::path{*state_json};
+        } else if (auto stop_height{value("--stop-height")}) {
             uint32_t height{0};
-            if (!ParseInteger(*parsed, height)) return utreexo::Result<Options>::Err("invalid --stop-height");
+            if (!ParseInteger(*stop_height, height)) return utreexo::Result<Options>::Err("invalid --stop-height");
             options.stop_height = height;
-        } else if (auto parsed{value("--log-level")}) {
-            auto level{utreexo::ParseLogLevel(*parsed)};
+        } else if (auto log_level{value("--log-level")}) {
+            auto level{utreexo::ParseLogLevel(*log_level)};
             if (!level) return utreexo::Result<Options>::Err(level.Error());
             options.log_level = level.Value();
         } else {

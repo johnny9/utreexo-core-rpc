@@ -6,19 +6,62 @@ include(CTest)
 
 option(UTREEXO_BUILD_RPC "Build the Bitcoin Core JSON-RPC adapter" ON)
 option(UTREEXO_BUILD_BENCHMARKS "Build deterministic resource estimation tools" ON)
+option(UTREEXO_BUILD_FUZZERS "Build libFuzzer targets (requires Clang)" OFF)
 option(UTREEXO_ENABLE_REGTEST_INTEGRATION "Enable external Core/bridge/Floresta differential test" OFF)
+option(UTREEXO_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+set(UTREEXO_SANITIZERS "" CACHE STRING
+    "Comma-separated compiler sanitizers (for example: address,undefined or thread)")
+if(UTREEXO_BUILD_FUZZERS AND NOT UTREEXO_SANITIZERS)
+    set(UTREEXO_SANITIZERS "address,undefined")
+endif()
 set(UTREEXO_REFERENCE_BRIDGE_EXECUTABLE "" CACHE FILEPATH "Path to rpc-utreexo-bridge")
 set(FLORESTAD_EXECUTABLE "" CACHE FILEPATH "Path to florestad")
 set(UTREEXO_UNIVALUE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/univalue" CACHE PATH
     "Path to the vendored UniValue source tree")
 
+add_library(utreexo_warnings INTERFACE)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(utreexo_warnings INTERFACE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+        -Wshadow
+        -Wformat=2
+        -Wundef)
+    if(UTREEXO_WARNINGS_AS_ERRORS)
+        target_compile_options(utreexo_warnings INTERFACE -Werror)
+    endif()
+endif()
+
+add_library(utreexo_sanitizers INTERFACE)
+if(UTREEXO_SANITIZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "UTREEXO_SANITIZERS requires GCC or Clang")
+    endif()
+    if(UTREEXO_SANITIZERS MATCHES "(^|,)address(,|$)" AND
+       UTREEXO_SANITIZERS MATCHES "(^|,)thread(,|$)")
+        message(FATAL_ERROR "AddressSanitizer and ThreadSanitizer cannot be enabled together")
+    endif()
+    if(NOT UTREEXO_SANITIZERS MATCHES
+       "^(address|undefined|thread|leak)(,(address|undefined|thread|leak))*$")
+        message(FATAL_ERROR "Unsupported value in UTREEXO_SANITIZERS=${UTREEXO_SANITIZERS}")
+    endif()
+    target_compile_options(utreexo_sanitizers INTERFACE
+        -fno-omit-frame-pointer
+        "-fsanitize=${UTREEXO_SANITIZERS}")
+    target_link_options(utreexo_sanitizers INTERFACE
+        "-fsanitize=${UTREEXO_SANITIZERS}")
+endif()
+
+function(utreexo_configure_target target)
+    target_link_libraries(${target} PRIVATE utreexo_warnings utreexo_sanitizers)
+endfunction()
+
 add_library(utreexo_logging src/log.cpp)
 target_include_directories(utreexo_logging PUBLIC include)
 target_compile_features(utreexo_logging PUBLIC cxx_std_20)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(utreexo_logging PRIVATE
-        -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror)
-endif()
+utreexo_configure_target(utreexo_logging)
 
 add_library(utreexo_accumulator
     src/bridge_wire.cpp
@@ -29,28 +72,18 @@ add_library(utreexo_accumulator
 )
 target_include_directories(utreexo_accumulator PUBLIC include)
 target_compile_features(utreexo_accumulator PUBLIC cxx_std_20)
-
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(utreexo_accumulator PRIVATE
-        -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror)
-endif()
+utreexo_configure_target(utreexo_accumulator)
 
 add_library(utreexo_checkpoint src/checkpoint.cpp)
 target_include_directories(utreexo_checkpoint PUBLIC include)
 target_compile_features(utreexo_checkpoint PUBLIC cxx_std_20)
 target_link_libraries(utreexo_checkpoint PUBLIC utreexo_accumulator utreexo_logging)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(utreexo_checkpoint PRIVATE
-        -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror)
-endif()
+utreexo_configure_target(utreexo_checkpoint)
 
 if(UTREEXO_BUILD_BENCHMARKS)
     add_executable(utreexo-resource-estimate bench/resource_estimate.cpp)
     target_compile_features(utreexo-resource-estimate PRIVATE cxx_std_20)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(utreexo-resource-estimate PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror)
-    endif()
+    utreexo_configure_target(utreexo-resource-estimate)
 endif()
 
 if(UTREEXO_BUILD_RPC)
@@ -67,6 +100,7 @@ if(UTREEXO_BUILD_RPC)
     target_include_directories(utreexo_univalue SYSTEM PUBLIC
         ${UTREEXO_UNIVALUE_DIR}/include)
     target_compile_features(utreexo_univalue PUBLIC cxx_std_20)
+    target_link_libraries(utreexo_univalue PRIVATE utreexo_sanitizers)
 
     add_library(utreexo_core_rpc
         src/core_rpc.cpp
@@ -75,15 +109,37 @@ if(UTREEXO_BUILD_RPC)
     target_include_directories(utreexo_core_rpc PUBLIC include)
     target_compile_features(utreexo_core_rpc PUBLIC cxx_std_20)
     target_link_libraries(utreexo_core_rpc PUBLIC utreexo_accumulator utreexo_univalue utreexo_logging)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(utreexo_core_rpc PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror)
-    endif()
+    utreexo_configure_target(utreexo_core_rpc)
 
     add_executable(utreexo-bridge src/main.cpp)
     target_link_libraries(utreexo-bridge PRIVATE utreexo_core_rpc utreexo_checkpoint)
     target_compile_definitions(utreexo-bridge PRIVATE
         UTREEXO_BRIDGE_VERSION="${PROJECT_VERSION}")
+    utreexo_configure_target(utreexo-bridge)
+endif()
+
+if(UTREEXO_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "UTREEXO_BUILD_FUZZERS requires Clang with libFuzzer")
+    endif()
+    if(NOT UTREEXO_BUILD_RPC)
+        message(FATAL_ERROR "UTREEXO_BUILD_FUZZERS requires UTREEXO_BUILD_RPC=ON")
+    endif()
+
+    add_executable(utreexo_fuzz_forest test/fuzz/forest.cpp)
+    target_link_libraries(utreexo_fuzz_forest PRIVATE utreexo_accumulator)
+
+    add_executable(utreexo_fuzz_rpc_json test/fuzz/rpc_json.cpp)
+    target_link_libraries(utreexo_fuzz_rpc_json PRIVATE utreexo_core_rpc)
+
+    foreach(fuzz_target IN ITEMS utreexo_fuzz_forest utreexo_fuzz_rpc_json)
+        target_compile_features(${fuzz_target} PRIVATE cxx_std_20)
+        target_compile_options(${fuzz_target} PRIVATE
+            -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined)
+        target_link_options(${fuzz_target} PRIVATE
+            -fsanitize=fuzzer,address,undefined)
+        utreexo_configure_target(${fuzz_target})
+    endforeach()
 endif()
 
 if(BUILD_TESTING)
@@ -101,10 +157,7 @@ if(BUILD_TESTING)
     target_link_libraries(utreexo_tests PRIVATE utreexo_accumulator utreexo_checkpoint utreexo_logging)
     target_include_directories(utreexo_tests PRIVATE test)
     target_compile_features(utreexo_tests PRIVATE cxx_std_20)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(utreexo_tests PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror)
-    endif()
+    utreexo_configure_target(utreexo_tests)
     add_test(NAME utreexo_tests COMMAND utreexo_tests)
 
     if(UTREEXO_BUILD_RPC)
@@ -116,10 +169,7 @@ if(BUILD_TESTING)
         target_link_libraries(utreexo_rpc_tests PRIVATE utreexo_core_rpc)
         target_include_directories(utreexo_rpc_tests PRIVATE test)
         target_compile_features(utreexo_rpc_tests PRIVATE cxx_std_20)
-        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-            target_compile_options(utreexo_rpc_tests PRIVATE
-                -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror)
-        endif()
+        utreexo_configure_target(utreexo_rpc_tests)
         add_test(NAME utreexo_rpc_tests COMMAND utreexo_rpc_tests)
 
         if(UTREEXO_ENABLE_REGTEST_INTEGRATION)
