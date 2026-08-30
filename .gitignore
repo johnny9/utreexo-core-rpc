@@ -1,0 +1,28 @@
+# CMake build trees and generated files
+/build/
+/cmake-build-*/
+CMakeUserPresets.json
+compile_commands.json
+
+# Compiled artifacts
+*.a
+*.o
+*.so
+*.dylib
+*.exe
+
+# Runtime logs and process state
+*.log
+*.pid
+
+# Generated accumulator and checkpoint state
+*.forest
+*.checkpoint
+*.state
+
+# Editor and operating-system files
+.cache/
+.idea/
+.vscode/
+*~
+.DS_Store
