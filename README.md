@@ -19,7 +19,8 @@ the sidecar transport with it.
 - Rustreexo-compatible positions, roots, deletion promotion, and batch proofs.
 - Exact handling of same-block spends, provably unspendable outputs, genesis, and the
   two historical BIP30-unspendable coinbases.
-- A minimal HTTP JSON-RPC transport using the vendored Bitcoin Core UniValue parser.
+- A persistent HTTP JSON-RPC transport with two-block bounded prefetch and a
+  selective streaming parser for Bitcoin Core verbosity-3 responses.
 - Sequential chain-continuity and reorganization detection.
 - Bridge-compatible compact leaf classification and UData serialization.
 - Optional sparse, atomic, fsync-and-rename checkpoints. Checkpoints include the
@@ -53,6 +54,13 @@ Bitcoin Core must be unpruned and have undo data for every processed block. `txi
 is not required. With no `--checkpoint`, the sidecar writes no forest state while it
 builds and a process failure restarts from genesis.
 
+The JSON-RPC chain source keeps one HTTP connection alive, performs one
+`getblockhash` and one verbosity-3 `getblock` call per block, and overlaps a bounded
+two-block fetch queue with forest mutation. It checks every block's hash and previous
+hash in sequence, then performs one final active-chain hash check before publishing a
+checkpoint. The response parser projects only the fields needed for leaf derivation,
+rather than constructing a full UniValue tree for the large verbosity-3 payload.
+
 ```sh
 ./build/utreexo-bridge \
   --rpc-cookie=/path/to/bitcoin/.cookie
@@ -66,6 +74,11 @@ To make one recoverable checkpoint at shutdown or at the reached tip:
   --checkpoint=/fast/storage/utreexo-forest.chk \
   --log-level=info
 ```
+
+Checkpoint format 3 retains the two overwritten BIP30 originals as permanent
+Utreexo leaves. The corrected sidecar intentionally refuses format-2 checkpoints,
+which may contain the incompatible forest; reconstruct from genesis or from an
+independently validated format-3 proving-forest checkpoint.
 
 `--checkpoint-interval=N` is intentionally opt-in because every checkpoint streams the
 full forest. Large intervals reduce restart cost while avoiding the per-block rewrite
@@ -124,6 +137,47 @@ The expected JSON must contain `height`, `block_hash`, `num_leaves`, and `roots`
 the same form as `--state-json`. The supervisor compares all four exactly, writes a
 `reference_validation` event and embeds the expected state in the milestone manifest.
 A mismatch exits with status 2 and does not promote the result to `latest-state.json`.
+
+### Unattended mainnet rebuild and validation
+
+For a format-3 reconstruction from genesis through the pinned 943013 reference,
+the supervisor has a staged, resumable controller:
+
+```sh
+tools/mainnet-sync.sh rebuild-validate 943013
+tools/mainnet-sync.sh rebuild-status
+tools/mainnet-sync.sh rebuild-follow
+```
+
+The first command performs a Bitcoin Core mainnet/unpruned/undo-data preflight,
+pins the reference JSON and executable digests, and starts one detached tmux
+session. Internally it checkpoints at 250000, 500000, 800000, and 900000. It then
+compacts the 900000 checkpoint, reloads the compact result and compares its full
+state with the pre-compaction state, and resumes a reflink/copy rather than the
+preserved compact file. The final stage must exactly match the reference height,
+block hash, leaf count, and ordered roots.
+
+By default, artifacts are isolated in `artifacts/mainnet-validation-v3`. The
+preserved checkpoint is `mainnet-900000-compact-v3.chk`; the 943013 run modifies
+only `mainnet-final-active-v3.chk`. A failed transient transport stage is retried
+up to three times from the last completed checkpoint. Reference mismatches,
+reorganizations, checkpoint errors, memory exhaustion, and other deterministic
+failures stop immediately without deleting either 900000 checkpoint. Re-running
+`rebuild-validate` resumes a consistent failed run.
+
+To adopt a tested replacement executable without discarding an active stage, schedule
+a checkpoint-boundary handoff:
+
+```sh
+tools/mainnet-sync.sh rebuild-handoff-binary /path/to/new/utreexo-bridge
+```
+
+The active sidecar finishes its milestone unchanged. A digest guard prevents the old
+controller from starting the next stage, the completed checkpoint is re-hashed against
+its manifest, and the pipeline then resumes under the new executable. The final
+validation manifest records both binary hashes, versions, the transition height, and
+the exact checkpoint state. If the active stage fails, the old digest is restored so
+the existing retry policy remains effective.
 
 ## Memory model
 

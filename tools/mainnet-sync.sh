@@ -26,6 +26,14 @@ Usage: $(basename "$0") COMMAND [ARGUMENT]
 
 Commands:
   start HEIGHT       Start a detached tmux sync to an explicit milestone height
+  rebuild-validate [HEIGHT]
+                     Start/resume the unattended format-3 rebuild, 900000
+                     compaction, and exact reference validation pipeline
+  rebuild-status     Show unattended rebuild pipeline status
+  rebuild-follow     Follow the unattended rebuild pipeline log
+  rebuild-attach     Attach to the unattended rebuild tmux session
+  rebuild-handoff-binary PATH
+                     Switch to PATH after the active rebuild stage checkpoints
   status             Show session, height, memory, disk, and last-run status
   follow             Follow the current run log (Ctrl-C only stops tail)
   attach             Attach to the tmux session (detach with Ctrl-b, then d)
@@ -126,7 +134,7 @@ initialize_checkpoint()
         echo "Error: init requires an existing checkpoint file" >&2
         exit 1
     fi
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
         echo "Error: cannot replace the checkpoint while $SESSION_NAME is running" >&2
         exit 1
     fi
@@ -190,7 +198,7 @@ start_sync()
         echo "Initialize it first with: $(basename "$0") init PATH" >&2
         exit 1
     fi
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
         echo "Error: tmux session already exists: $SESSION_NAME" >&2
         exit 1
     fi
@@ -429,7 +437,7 @@ show_status()
     fi
     paths_for_target "$target"
 
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
         echo "session=$SESSION_NAME state=running target=$target"
     else
         echo "session=$SESSION_NAME state=stopped target=$target"
@@ -483,15 +491,20 @@ follow_log()
 attach_session()
 {
     require_command tmux
-    if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if ! tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
         echo "Error: tmux session is not running: $SESSION_NAME" >&2
         exit 1
     fi
-    exec tmux attach-session -t "$SESSION_NAME"
+    exec tmux attach-session -t "=$SESSION_NAME"
 }
 
 case ${1:-help} in
     start) start_sync "${2:-}" ;;
+    rebuild-validate) exec "$SCRIPT_DIR/mainnet-rebuild-validate.sh" start "${2:-}" ;;
+    rebuild-status) exec "$SCRIPT_DIR/mainnet-rebuild-validate.sh" status ;;
+    rebuild-follow) exec "$SCRIPT_DIR/mainnet-rebuild-validate.sh" follow ;;
+    rebuild-attach) exec "$SCRIPT_DIR/mainnet-rebuild-validate.sh" attach ;;
+    rebuild-handoff-binary) exec "$SCRIPT_DIR/mainnet-binary-handoff.sh" start "${2:-}" ;;
     run) run_sync "${2:-}" ;;
     status) show_status ;;
     follow) follow_log ;;

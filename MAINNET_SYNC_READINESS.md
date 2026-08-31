@@ -1,16 +1,19 @@
 # Mainnet sync readiness checklist
 
-Last reviewed: 2026-08-28
+Last reviewed: 2026-08-31
 
 ## Current recommendation
 
-The sidecar is ready for a monitored, staged mainnet smoke test through height
-100,000. It is not yet recommended for an unattended genesis-to-tip run.
+The sidecar has a dedicated unattended controller for the bounded format-3 replay
+to a pinned reference height. The controller uses sparse recovery checkpoints,
+preserves and reload-validates the compact 900000 checkpoint, and fails closed on
+an exact-state mismatch. Use that controller for the 943013 validation run rather
+than a single uninterrupted sidecar invocation.
 
-The current deterministic accumulator and checkpoint tests, RPC/sync tests, and
-Bitcoin Core/Floresta differential regtest pass. The remaining concern is operational
-recovery: a transient RPC failure or process signal currently exits without writing a
-new checkpoint, potentially losing all work since the previous checkpoint.
+The sidecar process itself still does not checkpoint on every signal or ordinary
+RPC failure. The controller limits that exposure by checkpointing at 250000,
+500000, 800000, and 900000 and retrying transport failures from the last completed
+milestone. A host failure can still lose work since the preceding milestone.
 
 ## Required Bitcoin Core preflight
 
@@ -111,6 +114,21 @@ Attach with `./sidecar/tools/mainnet-sync.sh attach` and detach with `Ctrl-b`, t
 `d`. Do not press `Ctrl-C` in the sync window because signal-triggered checkpoints
 are not implemented yet.
 
+For the complete known-reference reconstruction, launch the detached controller
+once and monitor it without interacting with the sync process:
+
+```sh
+./sidecar/tools/mainnet-sync.sh rebuild-validate 943013
+./sidecar/tools/mainnet-sync.sh rebuild-status
+./sidecar/tools/mainnet-sync.sh rebuild-follow
+```
+
+The controller requires at least 80 GiB free by default, uses `info` logging, pins
+the sidecar/compactor/reference SHA-256 digests, verifies historical undo prevouts,
+and retains both the uncompressed and compact 900000 checkpoints. Its final active
+checkpoint is a separate reflink/copy, so reaching 943013 cannot overwrite the
+preserved compact recovery point.
+
 Record for every stage:
 
 - final height and active-chain block hash;
@@ -146,7 +164,7 @@ is therefore important until the planned recent-reversal ring exists.
 
 ## Go/no-go decision
 
-- **Go:** monitored sync to height 100,000, followed by an immediate checkpoint-resume
-  test to height 100,100.
-- **No-go:** unattended genesis-to-tip operation until clean termination checkpoints,
-  recoverable-error checkpoints, and RPC retry/backoff are implemented.
+- **Go:** the dedicated `rebuild-validate` pipeline to the pinned 943013 reference,
+  after its automatic Core, binary-format, reference, and storage preflight passes.
+- **No-go:** an unbounded unattended tip-following process or a direct genesis-to-tip
+  sidecar invocation without the controller's milestone recovery points.
