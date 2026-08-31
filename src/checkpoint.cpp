@@ -125,7 +125,7 @@ Result<void> SaveCheckpoint(const std::filesystem::path& path,
         if (!output) return Result<void>::Err("could not create checkpoint temporary file");
         constexpr std::array<char, 8> magic{'U', 'T', 'R', 'C', 'H', 'K', 'P', 'T'};
         output.write(magic.data(), static_cast<std::streamsize>(magic.size()));
-        if (!WriteLE(output, uint32_t{2}) || !WriteLE(output, point.height)) {
+        if (!WriteLE(output, CHECKPOINT_FORMAT_VERSION) || !WriteLE(output, point.height)) {
             return Result<void>::Err("failed to write checkpoint metadata");
         }
         output.write(reinterpret_cast<const char*>(point.block_hash.Bytes().data()), Hash256::SIZE);
@@ -218,7 +218,10 @@ Result<LoadedCheckpoint> LoadCheckpoint(const std::filesystem::path& path,
     if (!input || magic != expected || !ReadLE(input, version) || !ReadLE(input, height)) {
         return Result<LoadedCheckpoint>::Err("invalid or truncated checkpoint header");
     }
-    if (version != 2) return Result<LoadedCheckpoint>::Err("unsupported checkpoint version");
+    if (version != CHECKPOINT_FORMAT_VERSION) {
+        return Result<LoadedCheckpoint>::Err(
+            "unsupported checkpoint version; pre-BIP30-fix checkpoints require reconstruction");
+    }
     input.read(reinterpret_cast<char*>(block_hash.data()), Hash256::SIZE);
     if (!input) return Result<LoadedCheckpoint>::Err("truncated checkpoint chain point");
     uint64_t chain_hash_count{0};

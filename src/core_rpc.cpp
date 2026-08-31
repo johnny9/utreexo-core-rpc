@@ -22,6 +22,7 @@
 #include <string_view>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -53,6 +54,11 @@ public:
         return *this;
     }
     int Get() const { return m_value; }
+    void Reset(int value = -1)
+    {
+        if (m_value >= 0) ::close(m_value);
+        m_value = value;
+    }
     explicit operator bool() const { return m_value >= 0; }
 
 private:
@@ -99,6 +105,17 @@ std::string Lower(std::string_view input)
     return output;
 }
 
+bool IsRetryableTransportError(std::string_view error)
+{
+    const std::string lower{Lower(error)};
+    return lower.find("resource temporarily unavailable") != std::string::npos ||
+           lower.find("temporarily unavailable") != std::string::npos ||
+           lower.find("timed out") != std::string::npos ||
+           lower.find("connection reset") != std::string::npos ||
+           lower.find("connection refused") != std::string::npos ||
+           lower.find("closed a framed rpc response early") != std::string::npos;
+}
+
 Result<std::string> DecodeChunked(std::string_view encoded)
 {
     std::string output;
@@ -121,6 +138,108 @@ Result<std::string> DecodeChunked(std::string_view encoded)
         output.append(encoded.substr(cursor, chunk_size));
         cursor += chunk_size;
         if (encoded.substr(cursor, 2) != "\r\n") return Result<std::string>::Err("invalid chunk terminator");
+        cursor += 2;
+    }
+}
+
+struct HttpHeaders {
+    std::size_t header_end{0};
+    bool chunked{false};
+    bool connection_close{false};
+    std::optional<std::size_t> content_length;
+};
+
+Result<HttpHeaders> ParseHttpHeaders(std::string_view response)
+{
+    const std::size_t header_end{response.find("\r\n\r\n")};
+    if (header_end == std::string_view::npos) {
+        return Result<HttpHeaders>::Err("HTTP response has no complete header");
+    }
+    const std::size_t status_end{response.find("\r\n")};
+    if (status_end == std::string_view::npos || status_end > header_end) {
+        return Result<HttpHeaders>::Err("HTTP response has no status line");
+    }
+    HttpHeaders headers{
+        .header_end = header_end,
+        .chunked = false,
+        .connection_close = false,
+        .content_length = std::nullopt,
+    };
+    std::size_t cursor{status_end + 2};
+    while (cursor < header_end) {
+        const std::size_t line_end{response.find("\r\n", cursor)};
+        if (line_end == std::string_view::npos || line_end > header_end) {
+            return Result<HttpHeaders>::Err("malformed HTTP header line");
+        }
+        const std::string_view line{response.data() + cursor, line_end - cursor};
+        const std::size_t colon{line.find(':')};
+        if (colon != std::string_view::npos) {
+            const std::string name{Lower(line.substr(0, colon))};
+            std::string_view value{line.substr(colon + 1)};
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1);
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.remove_suffix(1);
+            const std::string lower_value{Lower(value)};
+            if (name == "transfer-encoding" && lower_value.find("chunked") != std::string::npos) {
+                headers.chunked = true;
+            } else if (name == "content-length") {
+                std::size_t parsed{0};
+                const auto [end, error]{std::from_chars(value.data(), value.data() + value.size(), parsed)};
+                if (error != std::errc{} || end != value.data() + value.size()) {
+                    return Result<HttpHeaders>::Err("invalid HTTP content length");
+                }
+                headers.content_length = parsed;
+            } else if (name == "connection" && lower_value.find("close") != std::string::npos) {
+                headers.connection_close = true;
+            }
+        }
+        cursor = line_end + 2;
+    }
+    if (headers.chunked && headers.content_length) {
+        return Result<HttpHeaders>::Err("HTTP response has conflicting body framing");
+    }
+    return Result<HttpHeaders>::Ok(headers);
+}
+
+Result<std::optional<std::size_t>> CompleteChunkedSize(std::string_view encoded)
+{
+    std::size_t cursor{0};
+    while (true) {
+        const std::size_t line_end{encoded.find("\r\n", cursor)};
+        if (line_end == std::string_view::npos) {
+            return Result<std::optional<std::size_t>>::Ok(std::nullopt);
+        }
+        const auto line{encoded.substr(cursor, line_end - cursor)};
+        const auto extension{line.find(';')};
+        const auto size_text{line.substr(0, extension)};
+        std::size_t chunk_size{0};
+        const auto [end, error]{std::from_chars(
+            size_text.data(), size_text.data() + size_text.size(), chunk_size, 16)};
+        if (error != std::errc{} || end != size_text.data() + size_text.size()) {
+            return Result<std::optional<std::size_t>>::Err("invalid chunk size");
+        }
+        cursor = line_end + 2;
+        if (chunk_size == 0) {
+            while (true) {
+                const std::size_t trailer_end{encoded.find("\r\n", cursor)};
+                if (trailer_end == std::string_view::npos) {
+                    return Result<std::optional<std::size_t>>::Ok(std::nullopt);
+                }
+                if (trailer_end == cursor) {
+                    return Result<std::optional<std::size_t>>::Ok(trailer_end + 2);
+                }
+                cursor = trailer_end + 2;
+            }
+        }
+        if (chunk_size > encoded.size() - cursor) {
+            return Result<std::optional<std::size_t>>::Ok(std::nullopt);
+        }
+        cursor += chunk_size;
+        if (encoded.size() - cursor < 2) {
+            return Result<std::optional<std::size_t>>::Ok(std::nullopt);
+        }
+        if (encoded.substr(cursor, 2) != "\r\n") {
+            return Result<std::optional<std::size_t>>::Err("invalid chunk terminator");
+        }
         cursor += 2;
     }
 }
@@ -211,17 +330,17 @@ Result<Hash256> JsonBitcoinHash(const UniValue& value, std::string_view field)
     return hash;
 }
 
-bool IsBip30UnspendableCoinbase(uint32_t height, const Hash256& hash)
+bool IsBip30UnspendableLeaf(const Hash256& hash)
 {
-    if (height == 91722) {
-        static const Hash256 expected{Hash256::FromBitcoinHex("00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e").Value()};
-        return hash == expected;
-    }
-    if (height == 91812) {
-        static const Hash256 expected{Hash256::FromBitcoinHex("00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f").Value()};
-        return hash == expected;
-    }
-    return false;
+    // The original coinbase outputs later overwritten by the two historical
+    // BIP30 exceptions remain leaves in Utreexo because the creation block hash
+    // disambiguates them from the repeated transactions. Bitcoin's UTXO view
+    // nevertheless makes the originals unspendable, so reject their deletion.
+    static const Hash256 block_91722{
+        Hash256::FromHex("84b3af0783b410b4564c5d1f361868559f7cf77cfc65ce2be951210357022fe3").Value()};
+    static const Hash256 block_91812{
+        Hash256::FromHex("bc6b4bf7cebbd33a18d6b0fe1f8ecc7aa5403083c39ee343b985d51fd0295ad8").Value()};
+    return hash == block_91722 || hash == block_91812;
 }
 
 Result<TxOut> JsonTxOut(const UniValue& object)
@@ -240,6 +359,153 @@ Result<TxOut> JsonTxOut(const UniValue& object)
 
 } // namespace
 
+struct HttpRpcTransport::Impl {
+    explicit Impl(HttpRpcConfig value) : config{std::move(value)} {}
+
+    Result<void> Connect()
+    {
+        socket.Reset();
+        response_buffer.clear();
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        addrinfo* raw_addresses{nullptr};
+        const std::string port{std::to_string(config.port)};
+        const int lookup{::getaddrinfo(config.host.c_str(), port.c_str(), &hints, &raw_addresses)};
+        if (lookup != 0) {
+            return Result<void>::Err("RPC address lookup failed: " + std::string{gai_strerror(lookup)});
+        }
+        AddressInfo addresses{raw_addresses};
+        for (addrinfo* address{addresses.Get()}; address; address = address->ai_next) {
+            FileDescriptor candidate{::socket(
+                address->ai_family, address->ai_socktype | SOCK_CLOEXEC, address->ai_protocol)};
+            if (!candidate) continue;
+            const timeval timeout{config.timeout_seconds, 0};
+            static_cast<void>(::setsockopt(
+                candidate.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
+            static_cast<void>(::setsockopt(
+                candidate.Get(), SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)));
+            if (::connect(candidate.Get(), address->ai_addr, address->ai_addrlen) == 0) {
+                socket = std::move(candidate);
+                return Result<void>::Ok();
+            }
+        }
+        return Result<void>::Err("could not connect to Bitcoin Core RPC");
+    }
+
+    Result<std::string> ReadResponse()
+    {
+        constexpr std::size_t MAX_HEADER_BYTES{64U * 1024U};
+        std::optional<HttpHeaders> headers;
+        std::array<char, 64U * 1024U> buffer{};
+        while (true) {
+            if (!headers) {
+                const std::size_t header_end{response_buffer.find("\r\n\r\n")};
+                if (header_end != std::string::npos) {
+                    auto parsed{ParseHttpHeaders(response_buffer)};
+                    if (!parsed) return Result<std::string>::Err(parsed.Error());
+                    headers = parsed.Take();
+                    if (headers->content_length && *headers->content_length > config.max_response_bytes) {
+                        return Result<std::string>::Err("RPC response exceeds configured size limit");
+                    }
+                } else if (response_buffer.size() > MAX_HEADER_BYTES) {
+                    return Result<std::string>::Err("HTTP response headers exceed size limit");
+                }
+            }
+
+            if (headers) {
+                const std::size_t body_begin{headers->header_end + 4};
+                std::optional<std::size_t> response_size;
+                if (headers->content_length) {
+                    response_size = body_begin + *headers->content_length;
+                } else if (headers->chunked && response_buffer.size() >= body_begin) {
+                    auto complete{CompleteChunkedSize(std::string_view{response_buffer}.substr(body_begin))};
+                    if (!complete) return Result<std::string>::Err(complete.Error());
+                    if (complete.Value()) response_size = body_begin + *complete.Value();
+                }
+                if (response_size && response_buffer.size() >= *response_size) {
+                    std::string response{response_buffer.substr(0, *response_size)};
+                    response_buffer.erase(0, *response_size);
+                    if (headers->connection_close) {
+                        socket.Reset();
+                        response_buffer.clear();
+                    }
+                    return ParseHttpResponse(std::move(response));
+                }
+            }
+
+            const ssize_t received{::recv(socket.Get(), buffer.data(), buffer.size(), 0)};
+            if (received == 0) {
+                if (headers && !headers->content_length && !headers->chunked) {
+                    std::string response{std::move(response_buffer)};
+                    response_buffer.clear();
+                    socket.Reset();
+                    return ParseHttpResponse(std::move(response));
+                }
+                socket.Reset();
+                response_buffer.clear();
+                return Result<std::string>::Err("Bitcoin Core closed a framed RPC response early");
+            }
+            if (received < 0) {
+                if (errno == EINTR) continue;
+                socket.Reset();
+                response_buffer.clear();
+                return Result<std::string>::Err(
+                    "reading RPC response failed: " + std::string{std::strerror(errno)});
+            }
+            if (response_buffer.size() + static_cast<std::size_t>(received) >
+                config.max_response_bytes + MAX_HEADER_BYTES) {
+                socket.Reset();
+                response_buffer.clear();
+                return Result<std::string>::Err("RPC response exceeds configured size limit");
+            }
+            response_buffer.append(buffer.data(), static_cast<std::size_t>(received));
+        }
+    }
+
+    Result<std::string> Post(std::string body)
+    {
+        std::ostringstream request;
+        request << "POST " << config.path << " HTTP/1.1\r\n"
+                << "Host: " << config.host << ':' << config.port << "\r\n"
+                << "Authorization: Basic " << Base64Encode(config.authorization) << "\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.size() << "\r\n"
+                << "Connection: keep-alive\r\n\r\n"
+                << body;
+        const std::string wire{request.str()};
+
+        for (int connection_attempt{0}; connection_attempt < 2; ++connection_attempt) {
+            if (!socket) {
+                auto connected{Connect()};
+                if (!connected) return Result<std::string>::Err(connected.Error());
+            }
+            std::size_t sent{0};
+            while (sent < wire.size()) {
+                const ssize_t result{::send(
+                    socket.Get(), wire.data() + sent, wire.size() - sent, MSG_NOSIGNAL)};
+                if (result < 0 && errno == EINTR) continue;
+                if (result <= 0) {
+                    const std::string error{
+                        "sending RPC request failed: " + std::string{std::strerror(errno)}};
+                    socket.Reset();
+                    response_buffer.clear();
+                    if (sent == 0 && connection_attempt == 0) break;
+                    return Result<std::string>::Err(error);
+                }
+                sent += static_cast<std::size_t>(result);
+            }
+            if (sent != wire.size()) continue;
+            return ReadResponse();
+        }
+        return Result<std::string>::Err("sending RPC request failed after reconnect");
+    }
+
+    HttpRpcConfig config;
+    FileDescriptor socket;
+    std::string response_buffer;
+};
+
 Result<std::string> ReadCookieAuthorization(const std::filesystem::path& cookie_file)
 {
     std::ifstream input{cookie_file};
@@ -252,69 +518,25 @@ Result<std::string> ReadCookieAuthorization(const std::filesystem::path& cookie_
     return Result<std::string>::Ok(std::move(cookie));
 }
 
-HttpRpcTransport::HttpRpcTransport(HttpRpcConfig config) : m_config{std::move(config)} {}
-
-Result<std::string> HttpRpcTransport::Post(std::string body)
+HttpRpcTransport::HttpRpcTransport(HttpRpcConfig config)
+    : m_impl{std::make_unique<Impl>(std::move(config))}
 {
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* raw_addresses{nullptr};
-    const std::string port{std::to_string(m_config.port)};
-    const int lookup{::getaddrinfo(m_config.host.c_str(), port.c_str(), &hints, &raw_addresses)};
-    if (lookup != 0) return Result<std::string>::Err("RPC address lookup failed: " + std::string{gai_strerror(lookup)});
-    AddressInfo addresses{raw_addresses};
-
-    FileDescriptor socket;
-    for (addrinfo* address{addresses.Get()}; address; address = address->ai_next) {
-        FileDescriptor candidate{::socket(address->ai_family, address->ai_socktype | SOCK_CLOEXEC, address->ai_protocol)};
-        if (!candidate) continue;
-        const timeval timeout{m_config.timeout_seconds, 0};
-        static_cast<void>(::setsockopt(candidate.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
-        static_cast<void>(::setsockopt(candidate.Get(), SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)));
-        if (::connect(candidate.Get(), address->ai_addr, address->ai_addrlen) == 0) {
-            socket = std::move(candidate);
-            break;
-        }
-    }
-    if (!socket) return Result<std::string>::Err("could not connect to Bitcoin Core RPC");
-
-    std::ostringstream request;
-    request << "POST " << m_config.path << " HTTP/1.1\r\n"
-            << "Host: " << m_config.host << ':' << m_config.port << "\r\n"
-            << "Authorization: Basic " << Base64Encode(m_config.authorization) << "\r\n"
-            << "Content-Type: application/json\r\n"
-            << "Content-Length: " << body.size() << "\r\n"
-            << "Connection: close\r\n\r\n"
-            << body;
-    const std::string wire{request.str()};
-    std::size_t sent{0};
-    while (sent < wire.size()) {
-        const ssize_t result{::send(socket.Get(), wire.data() + sent, wire.size() - sent, MSG_NOSIGNAL)};
-        if (result <= 0) return Result<std::string>::Err("sending RPC request failed: " + std::string{std::strerror(errno)});
-        sent += static_cast<std::size_t>(result);
-    }
-
-    std::string response;
-    std::array<char, 64U * 1024U> buffer{};
-    while (true) {
-        const ssize_t received{::recv(socket.Get(), buffer.data(), buffer.size(), 0)};
-        if (received == 0) break;
-        if (received < 0) return Result<std::string>::Err("reading RPC response failed: " + std::string{std::strerror(errno)});
-        if (response.size() + static_cast<std::size_t>(received) > m_config.max_response_bytes) {
-            return Result<std::string>::Err("RPC response exceeds configured size limit");
-        }
-        response.append(buffer.data(), static_cast<std::size_t>(received));
-    }
-    return ParseHttpResponse(std::move(response));
 }
 
-CoreRpcClient::CoreRpcClient(std::unique_ptr<RpcTransport> transport) : m_transport{std::move(transport)} {}
+HttpRpcTransport::~HttpRpcTransport() = default;
+
+Result<std::string> HttpRpcTransport::Post(std::string body) { return m_impl->Post(std::move(body)); }
+
+CoreRpcClient::CoreRpcClient(std::unique_ptr<RpcTransport> transport, uint32_t max_retries)
+    : m_transport{std::move(transport)}, m_max_retries{max_retries}
+{
+}
 
 void CoreRpcClient::RecordLastCall()
 {
     ++m_aggregate.calls;
     if (!m_last_call.success) ++m_aggregate.failures;
+    m_aggregate.retries += m_last_call.retries;
     m_aggregate.request_bytes += m_last_call.request_bytes;
     m_aggregate.response_bytes += m_last_call.response_bytes;
     m_aggregate.elapsed_us += m_last_call.elapsed_us;
@@ -330,10 +552,23 @@ void CoreRpcClient::RecordLastCall()
 
 Result<UniValue> CoreRpcClient::Call(const std::string& method, UniValue parameters)
 {
+    auto raw{CallRaw(method, std::move(parameters))};
+    if (!raw) return Result<UniValue>::Err(raw.Error());
+    UniValue result;
+    if (!result.read(raw.Value().Value())) {
+        Log(LogLevel::WARN, "rpc_response_invalid",
+            "method=" + method + " response_bytes=" + std::to_string(m_last_call.response_bytes));
+        return Result<UniValue>::Err("Bitcoin Core returned invalid JSON-RPC result");
+    }
+    return Result<UniValue>::Ok(std::move(result));
+}
+
+Result<RawJsonValue> CoreRpcClient::CallRaw(const std::string& method, UniValue parameters)
+{
     if (!m_transport) {
         m_last_call = RpcCallMetrics{.method = method};
         RecordLastCall();
-        return Result<UniValue>::Err("RPC transport is not configured");
+        return Result<RawJsonValue>::Err("RPC transport is not configured");
     }
     UniValue request{UniValue::VOBJ};
     request.pushKV("jsonrpc", "1.0");
@@ -346,7 +581,21 @@ Result<UniValue> CoreRpcClient::Call(const std::string& method, UniValue paramet
         .request_bytes = request_body.size(),
     };
     const auto start{std::chrono::steady_clock::now()};
-    auto body{m_transport->Post(request_body)};
+    Result<std::string> body{Result<std::string>::Err("RPC request was not attempted")};
+    for (uint32_t attempt{0}; attempt <= m_max_retries; ++attempt) {
+        ++m_last_call.attempts;
+        body = m_transport->Post(request_body);
+        if (body || !IsRetryableTransportError(body.Error()) || attempt == m_max_retries) break;
+        ++m_last_call.retries;
+        const auto delay{std::chrono::milliseconds{250ULL << std::min<uint32_t>(attempt, 2)}};
+        Log(LogLevel::WARN, "rpc_retry_scheduled",
+            "method=" + method +
+            " attempt=" + std::to_string(m_last_call.attempts) +
+            " retry=" + std::to_string(m_last_call.retries) +
+            " delay_ms=" + std::to_string(delay.count()) +
+            " error=" + Quoted(body.Error()));
+        std::this_thread::sleep_for(delay);
+    }
     m_last_call.elapsed_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - start).count());
     if (!body) {
@@ -355,34 +604,22 @@ Result<UniValue> CoreRpcClient::Call(const std::string& method, UniValue paramet
                 "method=" + method +
                 " request_bytes=" + std::to_string(m_last_call.request_bytes) +
                 " response_bytes=0 elapsed_us=" + std::to_string(m_last_call.elapsed_us) +
-                " attempts=1 retries=0 error=" + Quoted(body.Error()));
+                " attempts=" + std::to_string(m_last_call.attempts) +
+                " retries=" + std::to_string(m_last_call.retries) +
+                " error=" + Quoted(body.Error()));
         }
         RecordLastCall();
-        return Result<UniValue>::Err(body.Error());
+        return Result<RawJsonValue>::Err(body.Error());
     }
     m_last_call.response_bytes = body.Value().size();
-
-    UniValue response;
-    if (!response.read(body.Value()) || !response.isObject()) {
-        Log(LogLevel::WARN, "rpc_response_invalid",
-            "method=" + method + " response_bytes=" + std::to_string(m_last_call.response_bytes));
-        RecordLastCall();
-        return Result<UniValue>::Err("Bitcoin Core returned invalid JSON-RPC");
-    }
-    const UniValue& error{response.find_value("error")};
-    if (!error.isNull()) {
-        Log(LogLevel::WARN, "rpc_response_error",
+    auto response{ExtractJsonRpcResult(body.Take())};
+    if (!response) {
+        const bool rpc_error{response.Error().starts_with("Bitcoin Core RPC error:")};
+        Log(LogLevel::WARN, rpc_error ? "rpc_response_error" : "rpc_response_invalid",
             "method=" + method + " response_bytes=" + std::to_string(m_last_call.response_bytes) +
-            " error=" + Quoted(error.write()));
+            " error=" + Quoted(response.Error()));
         RecordLastCall();
-        return Result<UniValue>::Err("Bitcoin Core RPC error: " + error.write());
-    }
-    if (!response.exists("result")) {
-        Log(LogLevel::WARN, "rpc_response_invalid",
-            "method=" + method + " reason=missing_result response_bytes=" +
-            std::to_string(m_last_call.response_bytes));
-        RecordLastCall();
-        return Result<UniValue>::Err("Bitcoin Core RPC response has no result");
+        return Result<RawJsonValue>::Err(response.Error());
     }
     m_last_call.success = true;
     if (LogEnabled(LogLevel::TRACE)) {
@@ -391,10 +628,11 @@ Result<UniValue> CoreRpcClient::Call(const std::string& method, UniValue paramet
             " request_bytes=" + std::to_string(m_last_call.request_bytes) +
             " response_bytes=" + std::to_string(m_last_call.response_bytes) +
             " elapsed_us=" + std::to_string(m_last_call.elapsed_us) +
-            " attempts=1 retries=0 status=ok");
+            " attempts=" + std::to_string(m_last_call.attempts) +
+            " retries=" + std::to_string(m_last_call.retries) + " status=ok");
     }
     RecordLastCall();
-    return Result<UniValue>::Ok(response.find_value("result"));
+    return response;
 }
 
 CoreRpcBlockSource::CoreRpcBlockSource(CoreRpcClient client) : m_client{std::move(client)} {}
@@ -419,25 +657,40 @@ Result<Hash256> CoreRpcBlockSource::BlockHash(uint32_t height)
     return JsonBitcoinHash(result.Value(), "getblockhash result");
 }
 
-Result<UniValue> CoreRpcBlockSource::BlockWithPrevouts(const Hash256& hash)
+Result<FetchedBlock> CoreRpcBlockSource::FetchBlock(uint32_t height)
 {
+    const auto hash_start{std::chrono::steady_clock::now()};
+    auto hash{BlockHash(height)};
+    const uint64_t hash_us{static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - hash_start).count())};
+    if (!hash) return Result<FetchedBlock>::Err(hash.Error());
     UniValue parameters{UniValue::VARR};
-    parameters.push_back(hash.ToBitcoinHex());
+    parameters.push_back(hash.Value().ToBitcoinHex());
     parameters.push_back(3);
-    auto result{m_client.Call("getblock", std::move(parameters))};
+    const auto fetch_start{std::chrono::steady_clock::now()};
+    auto result{m_client.CallRaw("getblock", std::move(parameters))};
+    const uint64_t fetch_us{static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - fetch_start).count())};
     const auto& metrics{m_client.LastCallMetrics()};
     if (result && metrics.response_bytes > m_largest_block_response_bytes) {
         m_largest_block_response_bytes = metrics.response_bytes;
         m_largest_block_response_elapsed_us = metrics.elapsed_us;
-        m_largest_block_response_hash = hash;
+        m_largest_block_response_hash = hash.Value();
         if (LogEnabled(LogLevel::DEBUG)) {
             Log(LogLevel::DEBUG, "rpc_largest_block_response",
-                "block_hash=" + hash.ToBitcoinHex() +
+                "block_hash=" + hash.Value().ToBitcoinHex() +
                 " response_bytes=" + std::to_string(metrics.response_bytes) +
                 " elapsed_us=" + std::to_string(metrics.elapsed_us));
         }
     }
-    return result;
+    if (!result) return Result<FetchedBlock>::Err(result.Error());
+    return Result<FetchedBlock>::Ok(FetchedBlock{
+        .height = height,
+        .hash = hash.Take(),
+        .json = result.Take(),
+        .block_hash_us = hash_us,
+        .block_fetch_us = fetch_us,
+    });
 }
 
 Result<uint64_t> ParseBitcoinAmount(const UniValue& value)
@@ -492,7 +745,6 @@ Result<BlockDelta> ParseVerboseBlock(const UniValue& block,
         std::vector<Hash256> deletions;
         std::vector<CompactLeafData> proof_leaves;
         std::map<OutPoint, std::size_t> same_block_outputs;
-        const bool skip_bip30_coinbase{IsBip30UnspendableCoinbase(height, block_hash.Value())};
 
         for (std::size_t tx_index{0}; tx_index < transactions.size(); ++tx_index) {
             const UniValue& transaction{transactions[tx_index]};
@@ -533,12 +785,17 @@ Result<BlockDelta> ParseVerboseBlock(const UniValue& block,
                         .coinbase = prevout.find_value("generated").get_bool(),
                         .output = output.Take(),
                     };
-                    deletions.push_back(LeafHash(leaf));
+                    const Hash256 leaf_hash{LeafHash(leaf)};
+                    if (IsBip30UnspendableLeaf(leaf_hash)) {
+                        return Result<BlockDelta>::Err(
+                            "block attempts to spend an unspendable BIP30 leaf: " + leaf_hash.ToHex());
+                    }
+                    deletions.push_back(leaf_hash);
                     proof_leaves.push_back(CompactLeaf(leaf));
                 }
             }
 
-            if (height == 0 || (coinbase && skip_bip30_coinbase)) continue;
+            if (height == 0) continue;
             for (const UniValue& output_json : outputs.getValues()) {
                 const uint32_t index{output_json.find_value("n").getInt<uint32_t>()};
                 auto output{JsonTxOut(output_json)};

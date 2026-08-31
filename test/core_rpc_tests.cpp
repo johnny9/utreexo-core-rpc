@@ -2,10 +2,19 @@
 #include <utreexo/core_rpc.h>
 
 #include <memory>
+#include <atomic>
 #include <array>
+#include <arpa/inet.h>
+#include <charconv>
+#include <cerrno>
 #include <cstddef>
+#include <netinet/in.h>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <sys/socket.h>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace utreexo;
@@ -33,12 +42,13 @@ std::vector<std::byte> Bytes(std::string_view hex)
 }
 
 UniValue CoinbaseBlock(uint32_t height, std::string_view hash, std::string_view txid,
-                       std::string_view extra_transactions = {})
+                       std::string_view extra_transactions = {}, std::string_view script = "51")
 {
     return Json("{\"hash\":\"" + std::string{hash} + "\",\"height\":" + std::to_string(height) +
                 ",\"previousblockhash\":\"" + std::string(64, '0') + "\",\"tx\":["
                 "{\"txid\":\"" + std::string{txid} +
-                "\",\"vin\":[{\"coinbase\":\"00\"}],\"vout\":[{\"n\":0,\"value\":50.0,\"scriptPubKey\":{\"hex\":\"51\"}}]}" +
+                "\",\"vin\":[{\"coinbase\":\"00\"}],\"vout\":[{\"n\":0,\"value\":50.0,\"scriptPubKey\":{\"hex\":\"" +
+                std::string{script} + "\"}}]}" +
                 std::string{extra_transactions} + "]}");
 }
 
@@ -56,6 +66,55 @@ public:
 private:
     std::string m_response;
 };
+
+class FlakyTransport final : public RpcTransport
+{
+public:
+    Result<std::string> Post(std::string) override
+    {
+        ++calls;
+        if (calls == 1) return Result<std::string>::Err("reading RPC response failed: Resource temporarily unavailable");
+        return Result<std::string>::Ok("{\"result\":7,\"error\":null,\"id\":1}");
+    }
+    uint32_t calls{0};
+};
+
+bool SendAll(int socket, std::string_view data)
+{
+    std::size_t sent{0};
+    while (sent < data.size()) {
+        const ssize_t result{::send(socket, data.data() + sent, data.size() - sent, MSG_NOSIGNAL)};
+        if (result <= 0) return false;
+        sent += static_cast<std::size_t>(result);
+    }
+    return true;
+}
+
+bool ReadHttpRequest(int socket, std::string& request)
+{
+    request.clear();
+    std::array<char, 4096> buffer{};
+    std::size_t required{0};
+    while (true) {
+        const auto header_end{request.find("\r\n\r\n")};
+        if (header_end != std::string::npos && required == 0) {
+            const auto length_header{request.find("Content-Length:")};
+            if (length_header == std::string::npos || length_header > header_end) return false;
+            std::size_t value_begin{length_header + std::string_view{"Content-Length:"}.size()};
+            const std::size_t value_end{request.find("\r\n", value_begin)};
+            while (value_begin < value_end && request[value_begin] == ' ') ++value_begin;
+            std::size_t content_length{0};
+            const auto [end, error]{std::from_chars(
+                request.data() + value_begin, request.data() + value_end, content_length)};
+            if (error != std::errc{} || end != request.data() + value_end) return false;
+            required = header_end + 4 + content_length;
+        }
+        if (required != 0 && request.size() >= required) return true;
+        const ssize_t received{::recv(socket, buffer.data(), buffer.size(), 0)};
+        if (received <= 0) return false;
+        request.append(buffer.data(), static_cast<std::size_t>(received));
+    }
+}
 } // namespace
 
 TEST(rpc_amount_parsing_is_exact)
@@ -96,6 +155,102 @@ TEST(rpc_client_counts_failed_calls)
     CHECK_EQ(client.AggregateMetrics().calls, 1U);
     CHECK_EQ(client.AggregateMetrics().failures, 1U);
     CHECK(client.AggregateMetrics().response_bytes > 0U);
+}
+
+TEST(rpc_client_retries_transient_transport_failure)
+{
+    auto transport{std::make_unique<FlakyTransport>()};
+    FlakyTransport* observed{transport.get()};
+    CoreRpcClient client{std::move(transport)};
+    const auto result{client.Call("getblockcount")};
+    CHECK(result);
+    CHECK_EQ(result.Value().getInt<int>(), 7);
+    CHECK_EQ(observed->calls, 2U);
+    CHECK_EQ(client.LastCallMetrics().attempts, 2U);
+    CHECK_EQ(client.LastCallMetrics().retries, 1U);
+    CHECK_EQ(client.AggregateMetrics().calls, 1U);
+    CHECK_EQ(client.AggregateMetrics().failures, 0U);
+    CHECK_EQ(client.AggregateMetrics().retries, 1U);
+}
+
+TEST(rpc_client_reuses_persistent_http_connection)
+{
+    const int listener{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
+    if (listener < 0 && (errno == EPERM || errno == EACCES)) return;
+    if (listener < 0) throw std::runtime_error{"could not create loopback test socket"};
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
+        ::listen(listener, 1) != 0) {
+        ::close(listener);
+        throw std::runtime_error{"could not bind loopback test socket"};
+    }
+    socklen_t address_size{sizeof(address)};
+    if (::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_size) != 0) {
+        ::close(listener);
+        throw std::runtime_error{"could not inspect loopback test socket"};
+    }
+
+    std::atomic<bool> server_ok{true};
+    std::string first_request;
+    std::thread server{[&] {
+        const int connection{::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC)};
+        if (connection < 0) {
+            server_ok = false;
+            return;
+        }
+        std::string second_request;
+        const std::string first_body{"{\"result\":7,\"error\":null,\"id\":1}"};
+        std::ostringstream chunk_size;
+        chunk_size << std::hex << first_body.size();
+        const std::string first_response{
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n" +
+            chunk_size.str() + "\r\n" + first_body + "\r\n0\r\n\r\n"};
+        const std::string second_body{"{\"result\":8,\"error\":null,\"id\":2}"};
+        const std::string second_response{
+            "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(second_body.size()) +
+            "\r\nConnection: keep-alive\r\n\r\n" + second_body};
+        if (!ReadHttpRequest(connection, first_request) || !SendAll(connection, first_response) ||
+            !ReadHttpRequest(connection, second_request) || !SendAll(connection, second_response)) {
+            server_ok = false;
+        }
+        ::close(connection);
+    }};
+
+    HttpRpcConfig config{
+        .host = "127.0.0.1",
+        .port = ntohs(address.sin_port),
+        .path = "/",
+        .authorization = "user:password",
+        .timeout_seconds = 5,
+        .max_response_bytes = 1024 * 1024,
+    };
+    CoreRpcClient client{std::make_unique<HttpRpcTransport>(std::move(config))};
+    const auto first{client.Call("getblockcount")};
+    const auto second{client.Call("getblockcount")};
+    server.join();
+    ::close(listener);
+
+    CHECK(server_ok.load());
+    CHECK(first);
+    CHECK(second);
+    CHECK_EQ(first.Value().getInt<int>(), 7);
+    CHECK_EQ(second.Value().getInt<int>(), 8);
+    CHECK(first_request.find("Connection: keep-alive") != std::string::npos);
+    CHECK_EQ(client.AggregateMetrics().calls, 2U);
+}
+
+TEST(raw_rpc_envelope_exposes_result_without_copying_the_value)
+{
+    auto response{ExtractJsonRpcResult(
+        " { \"id\" : 1, \"result\" : {\"height\":7}, \"error\" : null } ")};
+    CHECK(response);
+    CHECK_EQ(response.Value().Value(), "{\"height\":7}");
+    CHECK(!ExtractJsonRpcResult("{\"result\":null,\"error\":{\"code\":-1}}"));
+    CHECK(!ExtractJsonRpcResult("{\"error\":null}"));
+    CHECK(!ExtractJsonRpcResult("not-json"));
 }
 
 TEST(verbose_block_cancels_same_block_spends)
@@ -166,38 +321,92 @@ TEST(verbose_block_skips_genesis_outputs_on_every_network)
 
 TEST(verbose_block_handles_the_complete_bip30_quartet)
 {
-    constexpr std::string_view original_91722{"00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"};
-    constexpr std::string_view original_91812{"00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"};
-    constexpr std::string_view repeat_91842{"00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"};
-    constexpr std::string_view repeat_91880{"00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"};
-    const std::string duplicate_txid(64, '1');
-    const std::string ordinary_txid(64, '2');
-    const std::string ordinary{
-        ",{\"txid\":\"" + ordinary_txid +
-        "\",\"vin\":[],\"vout\":[{\"n\":3,\"value\":1.0,\"scriptPubKey\":{\"hex\":\"51\"}}]}"};
+    struct Bip30Case {
+        uint32_t original_height;
+        std::string_view original_block;
+        uint32_t repeat_height;
+        std::string_view repeat_block;
+        std::string_view txid;
+        std::string_view script;
+        std::string_view original_leaf;
+    };
+    constexpr std::array cases{
+        Bip30Case{
+            91722,
+            "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e",
+            91880,
+            "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721",
+            "e3bf3d07d4b0375638d5f1db5255fe07ba2c4cb067cd81b84ee974b6585fb468",
+            "4104124b212f5416598a92ccec88819105179dcb2550d571842601492718273fe0f2179a9695096bff94cd99dcccdea7cd9bd943bfca8fea649cac963411979a33e9ac",
+            "84b3af0783b410b4564c5d1f361868559f7cf77cfc65ce2be951210357022fe3",
+        },
+        Bip30Case{
+            91812,
+            "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f",
+            91842,
+            "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec",
+            "d5d27987d2a3dfc724e359870c6644b40e497bdc0589a033220fe15429d88599",
+            "41046896ecfc449cb8560594eb7f413f199deb9b4e5d947a142e7dc7d2de0b811b8e204833ea2a2fd9d4c7b153a8ca7661d0a0b7fc981df1f42f55d64b26b3da1e9cac",
+            "bc6b4bf7cebbd33a18d6b0fe1f8ecc7aa5403083c39ee343b985d51fd0295ad8",
+        },
+    };
     const auto resolver = [](uint32_t) { return Result<Hash256>::Err("unused"); };
 
-    for (const auto [height, hash] : std::array{
-             std::pair{91722U, original_91722}, std::pair{91812U, original_91812}}) {
-        const auto delta{ParseVerboseBlock(CoinbaseBlock(height, hash, duplicate_txid, ordinary), resolver)};
-        CHECK(delta);
-        CHECK_EQ(delta.Value().additions.size(), 1U); // Non-coinbase transactions remain normal.
-    }
-    std::vector<Hash256> repeated;
-    for (const auto [height, hash] : std::array{
-             std::pair{91842U, repeat_91842}, std::pair{91880U, repeat_91880}}) {
-        const auto delta{ParseVerboseBlock(CoinbaseBlock(height, hash, duplicate_txid), resolver)};
-        CHECK(delta);
-        CHECK_EQ(delta.Value().additions.size(), 1U);
-        repeated.push_back(delta.Value().additions[0]);
-    }
-    CHECK(repeated[0] != repeated[1]); // Repeated txid, distinct creation block commitment.
+    for (const auto& test_case : cases) {
+        const auto original{ParseVerboseBlock(
+            CoinbaseBlock(test_case.original_height, test_case.original_block, test_case.txid,
+                          {}, test_case.script), resolver)};
+        CHECK(original);
+        CHECK_EQ(original.Value().additions,
+                 std::vector<Hash256>{Hash256::FromHex(test_case.original_leaf).Value()});
 
-    const std::string wrong_hash(64, '3');
-    for (const uint32_t height : {91722U, 91812U}) {
-        const auto delta{ParseVerboseBlock(CoinbaseBlock(height, wrong_hash, duplicate_txid), resolver)};
-        CHECK(delta);
-        CHECK_EQ(delta.Value().additions.size(), 1U); // Height alone must not activate the exception.
+        const auto repeated{ParseVerboseBlock(
+            CoinbaseBlock(test_case.repeat_height, test_case.repeat_block, test_case.txid,
+                          {}, test_case.script), resolver)};
+        CHECK(repeated);
+        CHECK_EQ(repeated.Value().additions.size(), 1U);
+        CHECK(repeated.Value().additions[0] != original.Value().additions[0]);
+    }
+}
+
+TEST(verbose_block_rejects_spending_the_overwritten_bip30_originals)
+{
+    struct Bip30Original {
+        uint32_t height;
+        std::string_view block;
+        std::string_view txid;
+        std::string_view script;
+    };
+    constexpr std::array originals{
+        Bip30Original{
+            91722,
+            "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e",
+            "e3bf3d07d4b0375638d5f1db5255fe07ba2c4cb067cd81b84ee974b6585fb468",
+            "4104124b212f5416598a92ccec88819105179dcb2550d571842601492718273fe0f2179a9695096bff94cd99dcccdea7cd9bd943bfca8fea649cac963411979a33e9ac",
+        },
+        Bip30Original{
+            91812,
+            "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f",
+            "d5d27987d2a3dfc724e359870c6644b40e497bdc0589a033220fe15429d88599",
+            "41046896ecfc449cb8560594eb7f413f199deb9b4e5d947a142e7dc7d2de0b811b8e204833ea2a2fd9d4c7b153a8ca7661d0a0b7fc981df1f42f55d64b26b3da1e9cac",
+        },
+    };
+
+    for (const auto& original : originals) {
+        const UniValue block{Json(
+            "{\"hash\":\"" + std::string(64, '4') + "\",\"height\":100000,\"previousblockhash\":\"" +
+            std::string(64, '3') + "\",\"tx\":["
+            "{\"txid\":\"" + std::string(64, '0') + "\",\"vin\":[{\"coinbase\":\"00\"}],\"vout\":[]},"
+            "{\"txid\":\"" + std::string(64, '2') + "\",\"vin\":[{\"txid\":\"" + std::string{original.txid} +
+            "\",\"vout\":0,\"prevout\":{\"generated\":true,\"height\":" + std::to_string(original.height) +
+            ",\"value\":50.0,\"scriptPubKey\":{\"hex\":\"" + std::string{original.script} +
+            "\"}}}],\"vout\":[]}]}" )};
+        const auto delta{ParseVerboseBlock(block, [&original](uint32_t height) {
+            if (height != original.height) return Result<Hash256>::Err("wrong height");
+            return Hash256::FromBitcoinHex(original.block);
+        })};
+        CHECK(!delta);
+        CHECK(delta.Error().find("unspendable BIP30 leaf") != std::string::npos);
     }
 }
 
@@ -305,4 +514,43 @@ TEST(verbose_block_rejects_genesis_proof_leaf_before_hash_lookup)
     CHECK(!delta);
     CHECK(!resolved);
     CHECK(delta.Error().find("genesis") != std::string::npos);
+}
+
+TEST(streaming_verbose_block_projection_matches_dom_semantics)
+{
+    const std::string block_hash(64, '9');
+    const std::string previous_hash(64, '1');
+    const std::string coinbase_txid(64, 'a');
+    const std::string external_txid(64, 'b');
+    const std::string local_txid(64, 'c');
+    const std::string spending_txid(64, 'd');
+    const std::string json{
+        "{\"ignored\":{\"deep\":[1,true,null,{\"escaped\":\"x\\\\y\"}]},"
+        "\"hash\":\"" + block_hash + "\",\"height\":20,\"previousblockhash\":\"" +
+        previous_hash + "\",\"tx\":["
+        "{\"txid\":\"" + coinbase_txid +
+        "\",\"hash\":\"" + std::string(64, 'e') +
+        "\",\"vin\":[{\"coinbase\":\"00\",\"sequence\":4294967295}],"
+        "\"vout\":[{\"n\":0,\"value\":1.0,\"scriptPubKey\":{\"asm\":\"1\",\"hex\":\"51\",\"type\":\"nonstandard\"}}]},"
+        "{\"txid\":\"" + local_txid + "\",\"vin\":[{\"txid\":\"" + external_txid +
+        "\",\"vout\":2,\"scriptSig\":{\"hex\":\"\"},\"prevout\":{\"generated\":false,"
+        "\"height\":4,\"value\":2.5,\"scriptPubKey\":{\"hex\":\"51\",\"asm\":\"1\"}}}],"
+        "\"vout\":[{\"n\":5,\"value\":3,\"scriptPubKey\":{\"hex\":\"51\"}}]},"
+        "{\"txid\":\"" + spending_txid + "\",\"vin\":[{\"txid\":\"" + local_txid +
+        "\",\"vout\":5}],\"vout\":[{\"n\":0,\"value\":0,\"scriptPubKey\":{\"hex\":\"6a\"}}]}]}"};
+    const auto resolver = [](uint32_t height) {
+        Hash256::Storage bytes{};
+        bytes[0] = static_cast<std::byte>(height);
+        return Result<Hash256>::Ok(Hash256{bytes});
+    };
+    const auto dom{ParseVerboseBlock(Json(json), resolver)};
+    const auto streaming{ParseVerboseBlockJson(json, resolver)};
+    CHECK(dom);
+    CHECK(streaming);
+    CHECK_EQ(streaming.Value().point, dom.Value().point);
+    CHECK_EQ(streaming.Value().previous_block_hash, dom.Value().previous_block_hash);
+    CHECK_EQ(streaming.Value().additions, dom.Value().additions);
+    CHECK_EQ(streaming.Value().deletions, dom.Value().deletions);
+    CHECK_EQ(streaming.Value().proof_leaves, dom.Value().proof_leaves);
+    CHECK(!ParseVerboseBlockJson("{\"hash\":", resolver));
 }

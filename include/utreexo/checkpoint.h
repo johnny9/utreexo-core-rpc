@@ -13,6 +13,11 @@
 
 namespace utreexo {
 
+// Version 3 commits to retaining the two overwritten BIP30 originals as
+// permanent accumulator leaves. Version 2 checkpoints may contain the
+// incompatible forest that omitted them and must not be loaded.
+inline constexpr uint32_t CHECKPOINT_FORMAT_VERSION{3};
+
 struct CheckpointMetrics {
     uint64_t payload_bytes{0};
     uint64_t final_bytes{0};

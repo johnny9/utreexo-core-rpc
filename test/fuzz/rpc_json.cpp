@@ -13,15 +13,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, std::size_t size)
     constexpr std::size_t MAX_INPUT_SIZE{2U * 1024U * 1024U};
     if (size > MAX_INPUT_SIZE) return 0;
 
-    UniValue value;
     const std::string json{reinterpret_cast<const char*>(data), size};
+    const auto resolver = [](uint32_t) {
+        return utreexo::Result<utreexo::Hash256>::Ok(utreexo::Hash256{});
+    };
+    (void)utreexo::ParseVerboseBlockJson(json, resolver);
+
+    UniValue value;
     if (!value.read(json)) return 0;
 
     (void)utreexo::ParseBitcoinAmount(value);
     if (value.isObject()) {
-        (void)utreexo::ParseVerboseBlock(value, [](uint32_t) {
-            return utreexo::Result<utreexo::Hash256>::Ok(utreexo::Hash256{});
-        });
+        (void)utreexo::ParseVerboseBlock(value, resolver);
     }
     return 0;
 }

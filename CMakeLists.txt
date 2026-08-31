@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(utreexo_bridge VERSION 0.1.0 LANGUAGES CXX)
+project(utreexo_bridge VERSION 0.2.0 LANGUAGES CXX)
 
 include(CTest)
+find_package(Threads REQUIRED)
 
 option(UTREEXO_BUILD_RPC "Build the Bitcoin Core JSON-RPC adapter" ON)
 option(UTREEXO_BUILD_BENCHMARKS "Build deterministic resource estimation tools" ON)
@@ -109,11 +110,12 @@ if(UTREEXO_BUILD_RPC)
 
     add_library(utreexo_core_rpc
         src/core_rpc.cpp
+        src/json_stream.cpp
         src/sync.cpp
     )
     target_include_directories(utreexo_core_rpc PUBLIC include)
     target_compile_features(utreexo_core_rpc PUBLIC cxx_std_20)
-    target_link_libraries(utreexo_core_rpc PUBLIC utreexo_accumulator utreexo_univalue utreexo_logging)
+    target_link_libraries(utreexo_core_rpc PUBLIC utreexo_accumulator utreexo_univalue utreexo_logging Threads::Threads)
     utreexo_configure_target(utreexo_core_rpc)
 
     add_executable(utreexo-bridge src/main.cpp)
@@ -164,6 +166,11 @@ if(BUILD_TESTING)
     target_compile_features(utreexo_tests PRIVATE cxx_std_20)
     utreexo_configure_target(utreexo_tests)
     add_test(NAME utreexo_tests COMMAND utreexo_tests)
+
+    add_test(NAME mainnet_rebuild_validate_tests
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/mainnet_rebuild_validate_tests.sh)
+    set_tests_properties(mainnet_rebuild_validate_tests PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 60)
 
     if(UTREEXO_BUILD_RPC)
         add_executable(utreexo_rpc_tests

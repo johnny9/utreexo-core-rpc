@@ -74,6 +74,47 @@ TEST(checkpoint_rejects_corruption)
     std::filesystem::remove(path);
 }
 
+TEST(checkpoint_rejects_pre_bip30_fix_format)
+{
+    const auto path{std::filesystem::temp_directory_path() / "utreexo-old-policy-checkpoint.dat"};
+    PackedForest forest;
+    const ChainPoint point{0, Hash256{}};
+    const std::array<Hash256, 1> chain{point.block_hash};
+    CHECK(SaveCheckpoint(path, point, forest, chain));
+
+    std::vector<unsigned char> bytes(static_cast<std::size_t>(std::filesystem::file_size(path)));
+    {
+        std::ifstream input{path, std::ios::binary};
+        input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        CHECK(input.good());
+    }
+    CHECK(bytes.size() > 20U);
+    bytes[8] = 2;
+    bytes[9] = bytes[10] = bytes[11] = 0;
+
+    constexpr uint64_t FNV_OFFSET{14695981039346656037ULL};
+    constexpr uint64_t FNV_PRIME{1099511628211ULL};
+    uint64_t checksum{FNV_OFFSET};
+    for (std::size_t i{0}; i < bytes.size() - sizeof(checksum); ++i) {
+        checksum ^= bytes[i];
+        checksum *= FNV_PRIME;
+    }
+    for (std::size_t i{0}; i < sizeof(checksum); ++i) {
+        bytes[bytes.size() - sizeof(checksum) + i] =
+            static_cast<unsigned char>((checksum >> (i * 8)) & 0xffU);
+    }
+    {
+        std::ofstream output{path, std::ios::binary | std::ios::trunc};
+        output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        CHECK(output.good());
+    }
+
+    const auto loaded{LoadCheckpoint(path)};
+    CHECK(!loaded);
+    CHECK(loaded.Error().find("pre-BIP30-fix") != std::string::npos);
+    std::filesystem::remove(path);
+}
+
 TEST(checkpoint_checksum_detects_bit_rot)
 {
     const auto path{std::filesystem::temp_directory_path() / "utreexo-corrupt-checkpoint.dat"};

@@ -220,14 +220,16 @@ int main(int argc, char** argv)
     Options options{parsed.Take()};
     if (options.show_version) {
         std::cout << "utreexo-bridge " << UTREEXO_BRIDGE_VERSION
-                  << " checkpoint_format=2 forest_format="
+                  << " checkpoint_format=" << utreexo::CHECKPOINT_FORMAT_VERSION
+                  << " forest_format="
                   << utreexo::PackedForest::FORMAT_VERSION << '\n';
         return 0;
     }
     utreexo::SetLogLevel(options.log_level);
     utreexo::Log(utreexo::LogLevel::INFO, "sidecar_start",
         "version=" UTREEXO_BRIDGE_VERSION
-        " checkpoint_format=2 forest_format=" +
+        " checkpoint_format=" + std::to_string(utreexo::CHECKPOINT_FORMAT_VERSION) +
+        " forest_format=" +
         std::to_string(utreexo::PackedForest::FORMAT_VERSION) +
         " log_level=" + std::string{utreexo::LogLevelName(options.log_level)});
     if (options.authorization.empty()) {
@@ -296,7 +298,14 @@ int main(int argc, char** argv)
     utreexo::Log(utreexo::LogLevel::INFO, "sync_started",
         "start_height=" + std::to_string(sync.ChainHashes().empty() ? 0 : sync.ChainHashes().size() - 1) +
         " target_height=" + std::to_string(target) +
-        " core_tip_height=" + std::to_string(tip.Value()));
+        " core_tip_height=" + std::to_string(tip.Value()) +
+        " prefetch_blocks=2 rpc_transport=persistent json_parser=streaming_projection");
+    const auto prefetch_started{sync.StartPrefetch(target)};
+    if (!prefetch_started) {
+        utreexo::Log(utreexo::LogLevel::ERROR, "prefetch_start_failed",
+                     "error=" + StringField(prefetch_started.Error()));
+        return 1;
+    }
 
     const auto save_checkpoint = [&](const utreexo::ChainPoint& point,
                                      std::string_view reason) -> utreexo::Result<void> {
@@ -353,6 +362,7 @@ int main(int argc, char** argv)
         try {
             block = sync.ProcessNext();
         } catch (const std::bad_alloc&) {
+            sync.StopPrefetch();
             const auto point{sync.CurrentPoint()};
             const uint32_t safe_height{point ? point->height : 0};
             utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
@@ -380,6 +390,7 @@ int main(int argc, char** argv)
             return 2;
         }
         if (!block) {
+            sync.StopPrefetch();
             utreexo::Log(utreexo::LogLevel::ERROR, "sync_failed",
                 "height=" + std::to_string(sync.ChainHashes().size()) +
                 " error=" + StringField(block.Error()));
@@ -445,6 +456,15 @@ int main(int argc, char** argv)
         }
     }
 
+    sync.StopPrefetch();
+    const auto active_point{sync.ValidateCurrentPoint()};
+    if (!active_point) {
+        utreexo::Log(utreexo::LogLevel::ERROR, "sync_failed",
+            "height=" + std::to_string(sync.CurrentPoint() ? sync.CurrentPoint()->height : 0) +
+            " error=" + StringField(active_point.Error()));
+        return 1;
+    }
+
     const uint64_t sync_wall_us{static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - sync_wall_start).count())};
     if (overall.blocks != 0) {
@@ -459,7 +479,7 @@ int main(int argc, char** argv)
     utreexo::Log(utreexo::LogLevel::INFO, "rpc_summary",
         "calls=" + std::to_string(rpc_metrics.calls) +
         " failures=" + std::to_string(rpc_metrics.failures) +
-        " retries=0" +
+        " retries=" + std::to_string(rpc_metrics.retries) +
         " request_bytes=" + std::to_string(rpc_metrics.request_bytes) +
         " response_bytes=" + std::to_string(rpc_metrics.response_bytes) +
         " elapsed_us=" + std::to_string(rpc_metrics.elapsed_us) +
@@ -500,7 +520,8 @@ int main(int argc, char** argv)
         }
         utreexo::Log(utreexo::LogLevel::INFO, "milestone_manifest",
             "version=" UTREEXO_BRIDGE_VERSION
-            " checkpoint_format=2 forest_format=" +
+            " checkpoint_format=" + std::to_string(utreexo::CHECKPOINT_FORMAT_VERSION) +
+            " forest_format=" +
             std::to_string(utreexo::PackedForest::FORMAT_VERSION) +
             " height=" + std::to_string(sync.CurrentPoint()->height) +
             " block_hash=" + sync.CurrentPoint()->block_hash.ToBitcoinHex() +

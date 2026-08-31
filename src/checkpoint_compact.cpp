@@ -4,6 +4,7 @@
 // Offline checkpoint compactor. It deliberately does not construct a PackedForest:
 // the old-to-new NodeId table is mmap'ed from a temporary disk file, keeping peak
 // resident memory bounded independently of the forest arena.
+#include <utreexo/checkpoint.h>
 #include <utreexo/log.h>
 
 #include <array>
@@ -75,12 +76,15 @@ bool ParseHeader(std::istream& in, Header& h)
 {
     std::array<char, 8> magic{}; uint32_t version{0}, height{0}; uint64_t chains{0};
     in.read(magic.data(), 8);
-    if (!in || magic != std::array<char, 8>{'U','T','R','C','H','K','P','T'} || !ReadLE(in, version) || !ReadLE(in, height)) return false;
+    if (!in || magic != std::array<char, 8>{'U','T','R','C','H','K','P','T'} || !ReadLE(in, version) ||
+        version != utreexo::CHECKPOINT_FORMAT_VERSION || !ReadLE(in, height)) return false;
     in.ignore(32); if (!in || !ReadLE(in, chains) || chains > uint64_t{height} + 1) return false;
     in.ignore(static_cast<std::streamsize>(chains * 32));
     h.prefix_bytes = static_cast<uint64_t>(in.tellg());
     in.read(magic.data(), 8);
-    if (!in || magic != std::array<char, 8>{'U','T','R','F','O','R','S','T'} || !ReadLE(in, version) || !ReadLE(in, h.leaves) || !ReadLE(in, h.slots) || version != 1 || h.slots >= NO_NODE) return false;
+    if (!in || magic != std::array<char, 8>{'U','T','R','F','O','R','S','T'} || !ReadLE(in, version) ||
+        !ReadLE(in, h.leaves) || !ReadLE(in, h.slots) || version != utreexo::PackedForest::FORMAT_VERSION ||
+        h.slots >= NO_NODE) return false;
     for (auto& root : h.roots) if (!ReadLE(in, root) || (root != NO_NODE && root >= h.slots)) return false;
     return true;
 }
@@ -142,7 +146,7 @@ int main(int argc, char** argv)
     in.clear(); in.seekg(0);
     Header ignored; if (!ParseHeader(in, ignored)) { std::cerr << "Error: input changed during compaction\n"; munmap(map, static_cast<size_t>(header.slots * 4)); close(map_fd); return 1; }
     out.write("UTRFORST", 8); std::array<char, 8> le{};
-    AppendLE(le, uint32_t{1}); out.write(le.data(), 4); AppendLE(le, header.leaves); out.write(le.data(), 8); AppendLE(le, live); out.write(le.data(), 8);
+    AppendLE(le, utreexo::PackedForest::FORMAT_VERSION); out.write(le.data(), 4); AppendLE(le, header.leaves); out.write(le.data(), 8); AppendLE(le, live); out.write(le.data(), 8);
     for (const uint32_t root : header.roots) { AppendLE(le, root == NO_NODE ? NO_NODE : map[root]); out.write(le.data(), 4); }
     for (uint64_t id{0}; id < header.slots; ++id) {
         in.read(record.data(), static_cast<std::streamsize>(record.size())); if (!in) { std::cerr << "Error: input changed during compaction\n"; return 1; }

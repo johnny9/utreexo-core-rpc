@@ -8,6 +8,7 @@
 #include <utreexo/result.h>
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -33,17 +34,25 @@ class SequentialSync
 public:
     SequentialSync(BlockSource& source, PackedForest& forest,
                    std::vector<Hash256> chain_hashes = {});
+    ~SequentialSync();
 
     Result<ProcessedBlock> ProcessNext();
     Result<uint32_t> TipHeight();
+    Result<void> StartPrefetch(uint32_t target_height);
+    void StopPrefetch();
+    Result<void> ValidateCurrentPoint();
 
     const std::vector<Hash256>& ChainHashes() const { return m_chain_hashes; }
     std::optional<ChainPoint> CurrentPoint() const;
 
 private:
+    struct PrefetchState;
+    Result<FetchedBlock> NextFetchedBlock(uint32_t height);
+
     BlockSource& m_source;
     PackedForest& m_forest;
     std::vector<Hash256> m_chain_hashes;
+    std::unique_ptr<PrefetchState> m_prefetch;
 };
 
 } // namespace utreexo
