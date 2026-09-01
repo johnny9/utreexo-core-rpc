@@ -15,6 +15,12 @@ mmap generation and switches future block updates to a synchronized WAL. A host 
 then loses no published block: restart replays committed WAL records over the last
 durable base. Preserve the validated format-3 checkpoint for deep-reorg recovery.
 
+To bootstrap Floresta nodes from that checkpoint, add `--proof-store=DIR` while replaying
+the checkpoint to the tip. The proof data is appended once, its compact index WAL is
+group-synchronized after the data, and the mmap lookup index is rebuildable. Use a new
+online-state path for this replay; an existing online directory takes precedence over
+the checkpoint and cannot reconstruct proofs for blocks already applied to its forest.
+
 ## Required Bitcoin Core preflight
 
 - Run against a fully synchronized mainnet node.
@@ -147,8 +153,8 @@ Record for every stage:
 - Automatic rollback is limited to retained connect transactions (1,008 blocks by
   default). A deeper reorganization, or one crossing the original online-generation
   boundary without a retained connect record, requires the preserved checkpoint.
-- The current executable has no proof-serving listener yet. `--follow` maintains the
-  proving forest but does not expose it to remote clients.
+- Optional Bitcoin-v1 P2P serves recent proofs from RAM and checkpoint-to-tip proofs
+  from `--proof-store`. It deliberately does not claim full-genesis archive coverage.
 - Graceful signal handling remains desirable for log clarity, but correctness does not
   depend on a shutdown-time full checkpoint once online: committed WAL replay is the
   recovery path.

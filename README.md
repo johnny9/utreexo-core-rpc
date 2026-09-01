@@ -5,7 +5,8 @@ bootstrap design. It reads sequential active-chain blocks from an unpruned Bitco
 Core node using `getblock(hash, 3)`, derives the exact Utreexo leaf hashes, and keeps
 the full proving forest in RAM during bulk bootstrap. At the validated Core tip it
 can atomically publish a native mmap generation and continue through a block-atomic
-write-ahead log with bounded coalesced RAM deltas.
+write-ahead log with bounded coalesced RAM deltas. An optional ordered proof pipeline
+can retain every Floresta-compatible proof from an AssumeUtreexo checkpoint to the tip.
 
 The accumulator library has no RPC, JSON, filesystem, or P2P dependency. Its value
 types and component boundaries are deliberately close to Bitcoin Core conventions so
@@ -32,15 +33,18 @@ the sidecar transport with it.
   durable superblocks.
 - Automatic shallow-reorg rollback from retained WAL before-images. Reorgs older
   than the configured window fail closed to the preserved validated checkpoint.
+- A durable checkpoint-to-tip proof store with parallel serialization, ordered group
+  commit, checksummed append-only data, a compact index WAL, and a rebuildable mmap
+  height index.
 - An optional inbound Bitcoin-v1 `NODE_UTREEXO` proof peer with bounded recent-proof
-  caching, Floresta-compatible `getuproof`/`uproof`, handshake, ping/pong, and safe
-  handling of unsupported messages.
+  caching plus proof-store fallback, Floresta-compatible `getuproof`/`uproof`,
+  handshake, ping/pong, and safe handling of unsupported messages.
 
-The executable constructs the tip forest and compact spent-leaf records but
-does not generate historical proofs during bootstrap because they are neither retained
-nor served. When P2P is enabled, it generates one proof against the pre-mutation forest
-for each newly followed block and keeps only a bounded, disposable recent cache. It does
-not advertise or provide archive service.
+Without `--proof-store`, bootstrap still omits historical proof generation and P2P
+keeps only a bounded, disposable recent cache. With `--proof-store`, each missing proof
+is generated and verified against the pre-mutation forest, made durable, and available
+to P2P. Coverage begins with the block after the store's AssumeUtreexo base, so the node
+does not claim full-genesis `NODE_UTREEXO_ARCHIVE` service.
 
 ## Build and test
 
@@ -130,7 +134,66 @@ alternating `state.*` superblocks, and `wal-*.log` segments. Do not copy it as a
 checkpoint while unapplied WAL exists; use the preserved format-3 checkpoint until an
 explicit online export command is added.
 
-## Serve recent proofs to Floresta
+## Build an AssumeUtreexo proof store
+
+Start from the validated proving-forest checkpoint that will be distributed as the
+AssumeUtreexo base. The `--online-state` path in this first invocation must not already
+exist; an existing online directory takes precedence over `--checkpoint` and would make
+the new proof store start at the online tip instead.
+
+```sh
+./build/utreexo-bridge \
+  --rpc-cookie=/path/to/bitcoin/.cookie \
+  --checkpoint=/checkpoint-disk/assumeutreexo-mainnet.chk \
+  --proof-store=/nvme/utreexo-proofs \
+  --online-state=/nvme/utreexo-online-new \
+  --follow \
+  --p2p-port=8338 \
+  --p2p-bind=127.0.0.1 \
+  --log-level=debug
+```
+
+The checkpoint height and hash become the immutable proof-store base. Proofs cover
+`base + 1` through the durable proof tip. During bulk replay, one sequential forest
+thread performs `prove -> verify -> modify`; two workers serialize completed proofs;
+one writer publishes them in height order. The default queue is bounded by both 1,008
+blocks and 256 MiB. During RAM bootstrap, a batch contains up to 32 proofs; with the
+default zero group delay, the writer waits for a full batch unless queue backpressure,
+a checkpoint, or shutdown requests an earlier flush. This reduces proof-store syncs by
+about 32 times for a long uninterrupted replay. Set a nonzero group delay to enable
+timed partial batches. Change these limits with `--proof-store-threads`,
+`--proof-store-queue-blocks`, `--proof-store-queue-mib`,
+`--proof-store-group-blocks`, and `--proof-store-group-delay-ms`.
+
+The directory has three files:
+
+- `proofs.dat` is append-only proof payload data. Each record includes its height,
+  block/previous hashes, SHA-256 checksum, and commit marker.
+- `index.wal` is the small authoritative active-chain index. A batch is appended and
+  synchronized only after all referenced proof data has been synchronized.
+- `height.index` is an 80-byte-per-proof mmap lookup table. It is rebuilt from the WAL
+  on every open and is not synchronized per block; losing or corrupting it does not
+  lose proofs.
+
+The pipeline drains before a sparse checkpoint is published and before the forest
+switches to online mmap/WAL storage. Once the forest is online, including restart
+catch-up and live-tip following, each proof WAL entry is synchronized before the next
+block is processed or the proof is put in the P2P cache. A crash between the forest WAL
+commit and the proof commit can leave the forest at most one block ahead; startup rolls
+the forest back using its retained undo WAL and replays that block. Existing durable
+proofs are hash-checked, their compact leaves are compared with Core-derived leaves,
+and their proofs are verified against the pre-mutation forest before reuse on restart.
+A logically invalid record is truncated and regenerated. Shallow reorgs append one
+proof-index truncation record and overwrite only mmap index entries; old payload bytes
+are not rewritten or immediately reclaimed.
+
+For distribution, copy the proof directory only while the sidecar is stopped or from
+one filesystem-level snapshot; copying `proofs.dat` and `index.wal` at unrelated live
+instants is not a coherent archive. Ship the matching format-3 checkpoint and record
+the base/tip hashes plus file digests in the release manifest. The mmap index need not
+be distributed because it is reconstructed from `index.wal`.
+
+## Serve proofs to Floresta
 
 P2P service is deliberately available only in durable follow mode. It advertises
 `NODE_UTREEXO` but not `NODE_NETWORK` or `NODE_UTREEXO_ARCHIVE`: Floresta downloads
@@ -147,13 +210,13 @@ ordinary headers and blocks from another Bitcoin peer and selects this sidecar f
   --p2p-network=mainnet
 ```
 
-The default cache retains at most 288 proofs and 256 MiB. Both limits apply, and can
-be changed with `--p2p-proof-cache-blocks` and `--p2p-proof-cache-mib`. Proofs are
-captured only for blocks arriving after this process starts. The cache is disposable:
-restart begins empty, while reorganization rollback immediately removes proofs above
-the recovered active-chain height. A request that races the sidecar's Core poll waits up
-to 15 seconds for publication, avoiding Floresta's much longer request retry. This is tip
-service, not a historical proof index.
+The default RAM cache retains at most 288 proofs and 256 MiB. Both limits apply, and
+can be changed with `--p2p-proof-cache-blocks` and `--p2p-proof-cache-mib`. The cache is
+disposable: restart begins empty, while reorganization rollback immediately removes
+entries above the recovered active-chain height. With `--proof-store`, a cache miss is
+served from the durable checkpoint-to-tip index. Without it, proofs are captured only
+for blocks arriving after this process starts. A request that races the sidecar's Core
+poll waits up to 15 seconds for publication, avoiding Floresta's longer retry.
 
 The first implementation supports the Bitcoin v1 transport. Current Floresta must be
 configured with `--allow-v1-fallback`. When using Floresta's fixed-peer mode, include
@@ -168,7 +231,7 @@ florestad \
 
 Keep the listener on loopback while testing; binding `0.0.0.0` is an explicit operator
 choice. BIP 324 transport, peer discovery, transaction relay, standard block service,
-and archive proofs remain out of scope.
+and proofs at or before the AssumeUtreexo base remain out of scope.
 
 ## Offline arena compaction
 
@@ -294,7 +357,9 @@ maximum-vout handling; same-block spends; missing-undo rejection; proof-leaf ord
 free-slot reuse; mutation prevalidation; duplicate-leaf checkpoint round trips;
 sequential sync; reorg detection; randomized RAM-versus-mmap differential
 sequences; WAL crash/corruption recovery; alternating-superblock recovery;
-multi-block undo/redo; and WAL rotation/retention boundaries. The accumulator
+multi-block undo/redo; WAL rotation/retention boundaries; ordered proof-pipeline
+publication; proof-WAL torn-tail and corruption recovery; mmap-index rebuild;
+proof-store reorgs; and real-socket P2P archive fallback. The accumulator
 tests run without RPC or Bitcoin Core. See
 [test/UPSTREAM_TESTS.md](test/UPSTREAM_TESTS.md) for the exact upstream pins,
 case mapping, utreexod durability-test review, and intentionally inapplicable
