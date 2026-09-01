@@ -41,6 +41,8 @@ public:
     Result<void> StartPrefetch(uint32_t target_height);
     void StopPrefetch();
     Result<void> ValidateCurrentPoint();
+    /** Roll back an online forest until its point is on Core's active chain. */
+    Result<uint32_t> ReconcileCurrentPoint();
 
     const std::vector<Hash256>& ChainHashes() const { return m_chain_hashes; }
     std::optional<ChainPoint> CurrentPoint() const;

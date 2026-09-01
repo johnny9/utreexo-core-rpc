@@ -4,7 +4,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <thread>
+#include <unistd.h>
 
 using namespace utreexo;
 
@@ -153,4 +155,35 @@ TEST(sequential_sync_prefetches_at_most_two_complete_blocks)
     CHECK(sync.ProcessNext());
     sync.StopPrefetch();
     CHECK(sync.ValidateCurrentPoint());
+}
+
+TEST(sequential_sync_reconciles_online_reorg_from_wal)
+{
+    const auto path{std::filesystem::temp_directory_path() /
+        ("utreexo-sync-reorg-" + std::to_string(::getpid()))};
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(path, cleanup_error);
+    {
+        FakeBlockSource source;
+        PackedForest forest;
+        SequentialSync sync{source, forest};
+        CHECK(sync.ProcessNext());
+        CHECK(forest.EnableOnline(path, *sync.CurrentPoint(), sync.ChainHashes(),
+            OnlineForestConfig{.max_dirty_bytes = 1024 * 1024,
+                               .wal_segment_bytes = 1024 * 1024,
+                               .undo_depth = 8,
+                               .sync_wal = true}));
+        CHECK(sync.ProcessNext());
+        CHECK_EQ(sync.CurrentPoint()->height, 1U);
+        CHECK_EQ(forest.NumLeaves(), 1U);
+
+        source.hashes[1] = Hash256::FromBitcoinHex(std::string(64, 'f')).Value();
+        const auto reconciled{sync.ReconcileCurrentPoint()};
+        CHECK(reconciled);
+        CHECK_EQ(reconciled.Value(), 1U);
+        CHECK_EQ(sync.CurrentPoint()->height, 0U);
+        CHECK_EQ(forest.NumLeaves(), 0U);
+        CHECK(sync.ValidateCurrentPoint());
+    }
+    std::filesystem::remove_all(path, cleanup_error);
 }

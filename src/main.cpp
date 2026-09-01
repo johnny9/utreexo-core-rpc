@@ -19,6 +19,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <unistd.h>
 
 namespace {
 
@@ -34,10 +36,16 @@ struct Options {
     std::string authorization;
     std::filesystem::path cookie;
     std::optional<std::filesystem::path> checkpoint;
+    std::optional<std::filesystem::path> online_state;
     std::optional<std::filesystem::path> state_json;
     std::optional<uint32_t> stop_height;
     uint32_t checkpoint_interval{0};
+    uint64_t online_cache_mib{0};
+    uint64_t online_wal_segment_mib{256};
+    uint32_t online_undo_depth{1'008};
+    uint32_t poll_interval_ms{5'000};
     utreexo::LogLevel log_level{utreexo::LogLevel::INFO};
+    bool follow{false};
     bool show_version{false};
 };
 
@@ -84,6 +92,12 @@ void Usage()
         << "  --checkpoint=PATH           Load/save a sparse atomic checkpoint\n"
         << "  --checkpoint-interval=N     Full checkpoint every N blocks (default 0: final only)\n"
         << "                              Allocation failures save the last completed checkpoint\n"
+        << "  --online-state=DIR          Native mmap/WAL state; create after reaching Core tip\n"
+        << "  --online-cache-mib=N        Dirty-node cache (default: 128 on <=20GiB, else 512)\n"
+        << "  --online-wal-segment-mib=N  WAL segment size (default 256)\n"
+        << "  --online-undo-depth=N       Retained WAL before-image window (default 1008)\n"
+        << "  --follow                    Poll Core and remain online after the initial sync\n"
+        << "  --poll-interval-ms=N        Follow-mode Core tip poll interval (default 5000)\n"
         << "  --state-json=PATH           Write final height, leaf count, and roots as JSON\n"
         << "  --stop-height=N             Stop before the current Core tip\n"
         << "  --log-level=LEVEL           error, warn, info, debug, or trace (default info)\n"
@@ -116,12 +130,32 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
             options.cookie = *cookie;
         } else if (auto checkpoint{value("--checkpoint")}) {
             options.checkpoint = std::filesystem::path{*checkpoint};
+        } else if (auto online_state{value("--online-state")}) {
+            options.online_state = std::filesystem::path{*online_state};
         } else if (auto interval{value("--checkpoint-interval")}) {
             if (!ParseInteger(*interval, options.checkpoint_interval)) {
                 return utreexo::Result<Options>::Err("invalid --checkpoint-interval");
             }
         } else if (auto state_json{value("--state-json")}) {
             options.state_json = std::filesystem::path{*state_json};
+        } else if (auto cache{value("--online-cache-mib")}) {
+            if (!ParseInteger(*cache, options.online_cache_mib) || options.online_cache_mib == 0) {
+                return utreexo::Result<Options>::Err("invalid --online-cache-mib");
+            }
+        } else if (auto segment{value("--online-wal-segment-mib")}) {
+            if (!ParseInteger(*segment, options.online_wal_segment_mib) || options.online_wal_segment_mib == 0) {
+                return utreexo::Result<Options>::Err("invalid --online-wal-segment-mib");
+            }
+        } else if (auto depth{value("--online-undo-depth")}) {
+            if (!ParseInteger(*depth, options.online_undo_depth) || options.online_undo_depth == 0) {
+                return utreexo::Result<Options>::Err("invalid --online-undo-depth");
+            }
+        } else if (auto poll{value("--poll-interval-ms")}) {
+            if (!ParseInteger(*poll, options.poll_interval_ms) || options.poll_interval_ms == 0) {
+                return utreexo::Result<Options>::Err("invalid --poll-interval-ms");
+            }
+        } else if (argument == "--follow") {
+            options.follow = true;
         } else if (auto stop_height{value("--stop-height")}) {
             uint32_t height{0};
             if (!ParseInteger(*stop_height, height)) return utreexo::Result<Options>::Err("invalid --stop-height");
@@ -137,7 +171,35 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
     if (!options.show_version && options.authorization.empty() && options.cookie.empty()) {
         return utreexo::Result<Options>::Err("provide --rpc-cookie or --rpc-auth");
     }
+    if (options.follow && !options.online_state) {
+        return utreexo::Result<Options>::Err("--follow requires --online-state");
+    }
+    if (options.follow && options.stop_height) {
+        return utreexo::Result<Options>::Err("--follow cannot be combined with --stop-height");
+    }
     return utreexo::Result<Options>::Ok(std::move(options));
+}
+
+uint64_t PhysicalMemoryBytes()
+{
+    const long pages{::sysconf(_SC_PHYS_PAGES)};
+    const long page_size{::sysconf(_SC_PAGESIZE)};
+    if (pages <= 0 || page_size <= 0) return 0;
+    return static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+}
+
+utreexo::OnlineForestConfig OnlineConfig(const Options& options)
+{
+    constexpr uint64_t MIB{1024ULL * 1024};
+    const uint64_t physical{PhysicalMemoryBytes()};
+    const uint64_t automatic_mib{
+        physical != 0 && physical <= 20ULL * 1024 * MIB ? 128ULL : 512ULL};
+    return utreexo::OnlineForestConfig{
+        .max_dirty_bytes = (options.online_cache_mib == 0 ? automatic_mib : options.online_cache_mib) * MIB,
+        .wal_segment_bytes = options.online_wal_segment_mib * MIB,
+        .undo_depth = options.online_undo_depth,
+        .sync_wal = true,
+    };
 }
 
 std::string RootsField(const utreexo::PackedForest& forest)
@@ -186,6 +248,25 @@ void LogMemoryBreakdown(std::string_view phase, uint32_t height,
         " arena_bytes=" + std::to_string(usage.arena_estimated_bytes) +
         " index_bytes=" + std::to_string(usage.index_estimated_bytes) +
         " estimated_bytes=" + std::to_string(usage.estimated_bytes));
+}
+
+void LogOnlineBreakdown(std::string_view phase, uint32_t height,
+                        const utreexo::PackedForest& forest)
+{
+    if (!forest.IsOnline()) return;
+    const auto usage{forest.OnlineUsage()};
+    utreexo::Log(utreexo::LogLevel::DEBUG, "online_storage",
+        "phase=" + std::string{phase} +
+        " height=" + std::to_string(height) +
+        " base_bytes=" + std::to_string(usage.base_bytes) +
+        " dirty_nodes=" + std::to_string(usage.dirty_nodes) +
+        " dirty_bytes=" + std::to_string(usage.dirty_bytes) +
+        " wal_bytes=" + std::to_string(usage.wal_bytes) +
+        " redo_wal_bytes=" + std::to_string(usage.redo_wal_bytes) +
+        " base_lsn=" + std::to_string(usage.base_lsn) +
+        " current_lsn=" + std::to_string(usage.current_lsn) +
+        " last_transaction_nodes=" + std::to_string(usage.last_transaction_nodes) +
+        " last_transaction_wal_bytes=" + std::to_string(usage.last_transaction_wal_bytes));
 }
 
 utreexo::Result<void> WriteStateJson(const std::filesystem::path& path,
@@ -242,9 +323,35 @@ int main(int argc, char** argv)
         options.authorization = cookie.Take();
     }
 
+    const auto online_config{OnlineConfig(options)};
     utreexo::PackedForest forest;
     std::vector<utreexo::Hash256> chain_hashes;
-    if (options.checkpoint && std::filesystem::exists(*options.checkpoint)) {
+    bool loaded_online{false};
+    if (options.online_state && std::filesystem::exists(*options.online_state)) {
+        utreexo::Log(utreexo::LogLevel::INFO, "online_state_load_started",
+            "path=" + PathField(*options.online_state) +
+            " cache_bytes=" + std::to_string(online_config.max_dirty_bytes) +
+            " wal_segment_bytes=" + std::to_string(online_config.wal_segment_bytes) +
+            " undo_depth=" + std::to_string(online_config.undo_depth));
+        utreexo::ChainPoint recovered_point;
+        auto opened{utreexo::PackedForest::OpenOnline(*options.online_state, chain_hashes,
+                                                       recovered_point, online_config)};
+        if (!opened) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "online_state_load_failed",
+                "path=" + PathField(*options.online_state) +
+                " error=" + StringField(opened.Error()) +
+                " action=fail_closed");
+            return 1;
+        }
+        forest = opened.Take();
+        loaded_online = true;
+        utreexo::Log(utreexo::LogLevel::INFO, "online_state_loaded",
+            "height=" + std::to_string(recovered_point.height) +
+            " block_hash=" + recovered_point.block_hash.ToBitcoinHex() +
+            " path=" + PathField(*options.online_state));
+        LogMemoryBreakdown("online_state_loaded", recovered_point.height, forest);
+        LogOnlineBreakdown("online_state_loaded", recovered_point.height, forest);
+    } else if (options.checkpoint && std::filesystem::exists(*options.checkpoint)) {
         utreexo::Log(utreexo::LogLevel::INFO, "checkpoint_load_started",
                      "path=" + PathField(*options.checkpoint));
         utreexo::CheckpointMetrics checkpoint_metrics;
@@ -288,6 +395,21 @@ int main(int argc, char** argv)
     utreexo::CoreRpcBlockSource source{utreexo::CoreRpcClient{
         std::make_unique<utreexo::HttpRpcTransport>(std::move(rpc_config))}};
     utreexo::SequentialSync sync{source, forest, std::move(chain_hashes)};
+    if (forest.IsOnline()) {
+        const auto reconciled{sync.ReconcileCurrentPoint()};
+        if (!reconciled) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "online_reconcile_failed",
+                "height=" + std::to_string(sync.CurrentPoint() ? sync.CurrentPoint()->height : 0) +
+                " error=" + StringField(reconciled.Error()) +
+                " action=fail_closed_restore_validated_checkpoint");
+            return 1;
+        }
+        if (reconciled.Value() != 0) {
+            utreexo::Log(utreexo::LogLevel::WARN, "online_reorg_rolled_back",
+                "disconnected_blocks=" + std::to_string(reconciled.Value()) +
+                " recovered_height=" + std::to_string(sync.CurrentPoint()->height));
+        }
+    }
     auto tip{sync.TipHeight()};
     if (!tip) {
         utreexo::Log(utreexo::LogLevel::ERROR, "core_tip_failed",
@@ -299,6 +421,7 @@ int main(int argc, char** argv)
         "start_height=" + std::to_string(sync.ChainHashes().empty() ? 0 : sync.ChainHashes().size() - 1) +
         " target_height=" + std::to_string(target) +
         " core_tip_height=" + std::to_string(tip.Value()) +
+        " storage_mode=" + std::string{loaded_online ? "mmap_wal" : "ram_bootstrap"} +
         " prefetch_blocks=2 rpc_transport=persistent json_parser=streaming_projection");
     const auto prefetch_started{sync.StartPrefetch(target)};
     if (!prefetch_started) {
@@ -365,6 +488,14 @@ int main(int argc, char** argv)
             sync.StopPrefetch();
             const auto point{sync.CurrentPoint()};
             const uint32_t safe_height{point ? point->height : 0};
+            if (forest.IsOnline()) {
+                const auto usage{forest.OnlineUsage()};
+                utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
+                    "phase=online_block_transition safe_height=" + std::to_string(safe_height) +
+                    " durable_lsn=" + std::to_string(usage.current_lsn) +
+                    " action=stop_without_full_checkpoint recovery=reopen_mmap_and_replay_wal");
+                return 2;
+            }
             utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
                 "phase=block_transition safe_height=" + std::to_string(safe_height) +
                 " target_height=" + std::to_string(target) +
@@ -426,6 +557,7 @@ int main(int argc, char** argv)
                 " estimated_ram_mib=" + std::to_string(usage.estimated_bytes / (1024 * 1024)) +
                 " blocks_per_second_milli=" + std::to_string(blocks_per_second_milli));
             LogMemoryBreakdown("sync_progress", height, forest);
+            LogOnlineBreakdown("sync_progress", height, forest);
             if (utreexo::LogEnabled(utreexo::LogLevel::DEBUG) && interval.blocks != 0) {
                 utreexo::Log(utreexo::LogLevel::DEBUG, "block_timing_window",
                     "height=" + std::to_string(height) +
@@ -443,7 +575,7 @@ int main(int argc, char** argv)
             interval = {};
             interval_start = Clock::now();
         }
-        if (options.checkpoint && options.checkpoint_interval != 0 &&
+        if (options.checkpoint && !forest.IsOnline() && options.checkpoint_interval != 0 &&
             height != 0 && height % options.checkpoint_interval == 0) {
             const auto point{sync.CurrentPoint()};
             const auto saved{save_checkpoint(*point, "interval")};
@@ -465,6 +597,41 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    if (options.online_state && !forest.IsOnline()) {
+        if (target != tip.Value()) {
+            utreexo::Log(utreexo::LogLevel::INFO, "online_switch_deferred",
+                "height=" + std::to_string(sync.CurrentPoint() ? sync.CurrentPoint()->height : 0) +
+                " core_tip_height=" + std::to_string(tip.Value()) +
+                " reason=stop_height_before_core_tip");
+        } else if (!sync.CurrentPoint()) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "online_switch_failed",
+                         "reason=no_completed_chain_point");
+            return 1;
+        } else {
+            utreexo::Log(utreexo::LogLevel::INFO, "online_switch_started",
+                "height=" + std::to_string(sync.CurrentPoint()->height) +
+                " path=" + PathField(*options.online_state) +
+                " cache_bytes=" + std::to_string(online_config.max_dirty_bytes) +
+                " wal_segment_bytes=" + std::to_string(online_config.wal_segment_bytes) +
+                " undo_depth=" + std::to_string(online_config.undo_depth));
+            const auto switched{forest.EnableOnline(*options.online_state, *sync.CurrentPoint(),
+                                                    sync.ChainHashes(), online_config)};
+            if (!switched) {
+                utreexo::Log(utreexo::LogLevel::ERROR, "online_switch_failed",
+                    "height=" + std::to_string(sync.CurrentPoint()->height) +
+                    " path=" + PathField(*options.online_state) +
+                    " error=" + StringField(switched.Error()));
+                return 1;
+            }
+            utreexo::Log(utreexo::LogLevel::INFO, "online_switch_complete",
+                "height=" + std::to_string(sync.CurrentPoint()->height) +
+                " path=" + PathField(*options.online_state) +
+                " storage_mode=mmap_wal");
+            LogMemoryBreakdown("online_switch_complete", sync.CurrentPoint()->height, forest);
+            LogOnlineBreakdown("online_switch_complete", sync.CurrentPoint()->height, forest);
+        }
+    }
+
     const uint64_t sync_wall_us{static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - sync_wall_start).count())};
     if (overall.blocks != 0) {
@@ -475,6 +642,117 @@ int main(int argc, char** argv)
             " slowest_height=" + std::to_string(overall.slowest_height) +
             " slowest_total_us=" + std::to_string(overall.slowest_us));
     }
+
+    if (options.follow) {
+        if (!forest.IsOnline()) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "online_follow_failed",
+                         "reason=online_switch_was_not_completed");
+            return 1;
+        }
+        utreexo::Log(utreexo::LogLevel::INFO, "online_follow_started",
+            "height=" + std::to_string(sync.CurrentPoint()->height) +
+            " poll_interval_ms=" + std::to_string(options.poll_interval_ms) +
+            " wal_sync=per_block");
+        auto last_base_flush{Clock::now()};
+        while (true) {
+            const auto reconciled{sync.ReconcileCurrentPoint()};
+            if (!reconciled) {
+                utreexo::Log(utreexo::LogLevel::ERROR, "online_reconcile_failed",
+                    "height=" + std::to_string(sync.CurrentPoint()->height) +
+                    " error=" + StringField(reconciled.Error()) +
+                    " action=fail_closed_restore_validated_checkpoint retained_undo_depth=" +
+                    std::to_string(online_config.undo_depth));
+                return 1;
+            }
+            if (reconciled.Value() != 0) {
+                utreexo::Log(utreexo::LogLevel::WARN, "online_reorg_rolled_back",
+                    "disconnected_blocks=" + std::to_string(reconciled.Value()) +
+                    " recovered_height=" + std::to_string(sync.CurrentPoint()->height));
+            }
+            auto current_tip{sync.TipHeight()};
+            if (!current_tip) {
+                utreexo::Log(utreexo::LogLevel::WARN, "online_tip_poll_failed",
+                             "error=" + StringField(current_tip.Error()) + " action=retry");
+                std::this_thread::sleep_for(std::chrono::milliseconds(options.poll_interval_ms));
+                continue;
+            }
+            if (sync.ChainHashes().size() <= current_tip.Value()) {
+                auto started{sync.StartPrefetch(current_tip.Value())};
+                if (!started) {
+                    utreexo::Log(utreexo::LogLevel::ERROR, "online_prefetch_failed",
+                                 "error=" + StringField(started.Error()));
+                    return 1;
+                }
+                while (sync.ChainHashes().size() <= current_tip.Value()) {
+                    utreexo::Result<utreexo::ProcessedBlock> block{
+                        utreexo::Result<utreexo::ProcessedBlock>::Err("uninitialized online block")};
+                    try {
+                        block = sync.ProcessNext();
+                    } catch (const std::bad_alloc&) {
+                        sync.StopPrefetch();
+                        const auto storage{forest.OnlineUsage()};
+                        utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
+                            "phase=online_follow_block safe_height=" +
+                            std::to_string(sync.CurrentPoint()->height) +
+                            " durable_lsn=" + std::to_string(storage.current_lsn) +
+                            " dirty_bytes=" + std::to_string(storage.dirty_bytes) +
+                            " redo_wal_bytes=" + std::to_string(storage.redo_wal_bytes) +
+                            " action=stop_without_full_checkpoint"
+                            " recovery=reopen_mmap_and_replay_wal");
+                        return 2;
+                    }
+                    if (!block) {
+                        sync.StopPrefetch();
+                        utreexo::Log(utreexo::LogLevel::ERROR, "online_block_failed",
+                            "height=" + std::to_string(sync.ChainHashes().size()) +
+                            " error=" + StringField(block.Error()));
+                        return 1;
+                    }
+                    const auto storage{forest.OnlineUsage()};
+                    utreexo::Log(utreexo::LogLevel::INFO, "online_block_committed",
+                        "height=" + std::to_string(block.Value().delta.point.height) +
+                        " block_hash=" + block.Value().delta.point.block_hash.ToBitcoinHex() +
+                        " additions=" + std::to_string(block.Value().delta.additions.size()) +
+                        " deletions=" + std::to_string(block.Value().delta.deletions.size()) +
+                        " modify_us=" + std::to_string(block.Value().metrics.modify_us) +
+                        " total_us=" + std::to_string(block.Value().metrics.total_us) +
+                        " dirty_nodes=" + std::to_string(storage.dirty_nodes) +
+                        " dirty_bytes=" + std::to_string(storage.dirty_bytes) +
+                        " wal_bytes=" + std::to_string(storage.wal_bytes) +
+                        " redo_wal_bytes=" + std::to_string(storage.redo_wal_bytes) +
+                        " transaction_nodes=" + std::to_string(storage.last_transaction_nodes) +
+                        " transaction_wal_bytes=" + std::to_string(storage.last_transaction_wal_bytes) +
+                        " lsn=" + std::to_string(storage.current_lsn));
+                }
+                sync.StopPrefetch();
+                const auto validated{sync.ValidateCurrentPoint()};
+                if (!validated) {
+                    utreexo::Log(utreexo::LogLevel::WARN, "online_batch_reorg_detected",
+                                 "error=" + StringField(validated.Error()) +
+                                 " action=reconcile");
+                    continue;
+                }
+            }
+            if (Clock::now() - last_base_flush >= std::chrono::hours(24)) {
+                const auto before{forest.OnlineUsage()};
+                auto flushed{forest.FlushOnline()};
+                if (!flushed) {
+                    utreexo::Log(utreexo::LogLevel::ERROR, "online_base_flush_failed",
+                                 "error=" + StringField(flushed.Error()) + " action=stop");
+                    return 1;
+                }
+                const auto after{forest.OnlineUsage()};
+                utreexo::Log(utreexo::LogLevel::INFO, "online_base_flushed",
+                    "height=" + std::to_string(sync.CurrentPoint()->height) +
+                    " dirty_nodes=" + std::to_string(before.dirty_nodes) +
+                    " base_lsn_before=" + std::to_string(before.base_lsn) +
+                    " base_lsn_after=" + std::to_string(after.base_lsn));
+                last_base_flush = Clock::now();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(options.poll_interval_ms));
+        }
+    }
+
     const auto& rpc_metrics{source.RpcMetrics()};
     utreexo::Log(utreexo::LogLevel::INFO, "rpc_summary",
         "calls=" + std::to_string(rpc_metrics.calls) +
@@ -492,13 +770,32 @@ int main(int argc, char** argv)
         " largest_block_response_elapsed_us=" +
         std::to_string(source.LargestBlockResponseElapsedUs()));
 
-    if (options.checkpoint && sync.CurrentPoint()) {
+    if (forest.IsOnline()) {
+        const auto before{forest.OnlineUsage()};
+        const auto flushed{forest.FlushOnline()};
+        if (!flushed) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "online_base_flush_failed",
+                         "reason=clean_shutdown error=" + StringField(flushed.Error()));
+            return 1;
+        }
+        const auto after{forest.OnlineUsage()};
+        utreexo::Log(utreexo::LogLevel::INFO, "online_base_flushed",
+            "height=" + std::to_string(sync.CurrentPoint() ? sync.CurrentPoint()->height : 0) +
+            " reason=clean_shutdown dirty_nodes=" + std::to_string(before.dirty_nodes) +
+            " base_lsn_before=" + std::to_string(before.base_lsn) +
+            " base_lsn_after=" + std::to_string(after.base_lsn));
+    }
+    if (options.checkpoint && sync.CurrentPoint() && !forest.IsOnline()) {
         const auto saved{save_checkpoint(*sync.CurrentPoint(), "final")};
         if (!saved) {
             utreexo::Log(utreexo::LogLevel::ERROR, "checkpoint_save_failed",
                          "reason=final error=" + StringField(saved.Error()));
             return 1;
         }
+    } else if (options.checkpoint && sync.CurrentPoint() && forest.IsOnline()) {
+        utreexo::Log(utreexo::LogLevel::INFO, "checkpoint_save_skipped",
+            "height=" + std::to_string(sync.CurrentPoint()->height) +
+            " reason=online_native_state_is_durable fallback_checkpoint_preserved=true");
     }
     if (options.state_json && sync.CurrentPoint()) {
         const auto written{WriteStateJson(*options.state_json, *sync.CurrentPoint(), forest)};
@@ -527,7 +824,11 @@ int main(int argc, char** argv)
             " block_hash=" + sync.CurrentPoint()->block_hash.ToBitcoinHex() +
             " num_leaves=" + std::to_string(forest.NumLeaves()) +
             " roots=" + RootsField(forest) +
-            " checkpoint_bytes=" + std::to_string(checkpoint_bytes));
+            " checkpoint_bytes=" + std::to_string(checkpoint_bytes) +
+            " storage_mode=" + std::string{forest.IsOnline() ? "mmap_wal" : "ram_checkpoint"} +
+            " online_base_bytes=" + std::to_string(forest.OnlineUsage().base_bytes) +
+            " online_wal_bytes=" + std::to_string(forest.OnlineUsage().wal_bytes) +
+            " online_base_lsn=" + std::to_string(forest.OnlineUsage().base_lsn));
     }
     utreexo::Log(utreexo::LogLevel::INFO, "sync_complete",
                  "height=" + std::to_string(sync.CurrentPoint() ? sync.CurrentPoint()->height : 0));

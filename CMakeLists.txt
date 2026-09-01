@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(utreexo_bridge VERSION 0.2.0 LANGUAGES CXX)
+project(utreexo_bridge VERSION 0.3.0 LANGUAGES CXX)
 
 include(CTest)
 find_package(Threads REQUIRED)
@@ -156,6 +156,7 @@ if(BUILD_TESTING)
         test/leaf_tests.cpp
         test/position_tests.cpp
         test/forest_tests.cpp
+        test/online_forest_tests.cpp
         test/rustreexo_vector_tests.cpp
         test/checkpoint_tests.cpp
         test/bridge_wire_tests.cpp

@@ -1,5 +1,6 @@
 # CMake build trees and generated files
 /build/
+/build-*/
 /cmake-build-*/
 CMakeUserPresets.json
 compile_commands.json

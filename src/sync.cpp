@@ -138,6 +138,31 @@ Result<void> SequentialSync::ValidateCurrentPoint()
     return Result<void>::Ok();
 }
 
+Result<uint32_t> SequentialSync::ReconcileCurrentPoint()
+{
+    uint32_t disconnected{0};
+    while (true) {
+        const auto point{CurrentPoint()};
+        if (!point) return Result<uint32_t>::Err("cannot reconcile an empty chain point");
+        auto active_hash{m_source.BlockHash(point->height)};
+        if (!active_hash) return Result<uint32_t>::Err(active_hash.Error());
+        if (active_hash.Value() == point->block_hash) return Result<uint32_t>::Ok(disconnected);
+        if (!m_forest.IsOnline()) {
+            return Result<uint32_t>::Err(
+                "active-chain reorganization requires online WAL before-images or checkpoint restore");
+        }
+        auto rolled_back{m_forest.RollbackOnlineBlock()};
+        if (!rolled_back) return Result<uint32_t>::Err(rolled_back.Error());
+        if (m_chain_hashes.size() < 2 ||
+            rolled_back.Value().height + 1 != point->height ||
+            m_chain_hashes[rolled_back.Value().height] != rolled_back.Value().block_hash) {
+            return Result<uint32_t>::Err("online rollback returned a non-contiguous chain point");
+        }
+        m_chain_hashes.pop_back();
+        ++disconnected;
+    }
+}
+
 std::optional<ChainPoint> SequentialSync::CurrentPoint() const
 {
     if (m_chain_hashes.empty()) return std::nullopt;
@@ -183,7 +208,9 @@ Result<ProcessedBlock> SequentialSync::ProcessNext()
     }
 
     const auto modify_start{Clock::now()};
-    const auto modified{m_forest.Modify(delta.Value().additions, delta.Value().deletions)};
+    const auto modified{m_forest.ModifyBlock(delta.Value().additions,
+                                             delta.Value().deletions,
+                                             delta.Value().point)};
     if (!modified) return Result<ProcessedBlock>::Err("could not apply block transition: " + modified.Error());
     metrics.modify_us = micros(modify_start);
     m_chain_hashes.push_back(fetched.Value().hash);
