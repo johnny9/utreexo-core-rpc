@@ -68,3 +68,29 @@ same-block parent/child spend, and an OP_RETURN transaction. It requires:
 2. Floresta to validate every proof-bearing block, leave IBD, reach the exact
    Core tip, and report the same roots.
 
+The harness also converts the C++ forest to its mmap/WAL representation, mines
+one more block, reopens the online state, applies that block through the WAL,
+flushes the native base, and repeats the independent root/leaf comparison.
+
+## Utreexod durability-test review
+
+The mmap/WAL tests were reviewed against utreexod commit
+`25deba281b612f8b87f734b0ac169d8a46ede988` and its accumulator dependency,
+utreexo v0.18.0 commit `9869ffeefc970ab0aa46a7408589112a8970ddea`.
+The relevant upstream patterns are the accumulator's `wal_test.go`,
+`forest_test.go`, and `pollard_test.go`, plus utreexod's proof-index and reorg
+tests in `blockchain/indexers/indexers_test.go`.
+
+The corresponding C++ online-storage coverage includes:
+
+- a deterministic 120-block RAM-versus-mmap differential sequence with proof
+  equality, automatic/explicit flushes, and recovery every ten blocks;
+- multi-block disconnect, recovery after each disconnect, and alternate-branch
+  replay;
+- recovery from the older superblock plus WAL when the newest superblock is
+  corrupt;
+- rejection of a checksum-corrupt committed record and rollback of an
+  incomplete first record;
+- real WAL segment rotation, pruning, and fail-closed rollback outside the
+  retained undo window; and
+- the Core/reference-bridge/Floresta integration transition described above.

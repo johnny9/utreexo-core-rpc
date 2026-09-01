@@ -249,16 +249,22 @@ cases; SHA and Bitcoin leaf vectors; the complete BIP30 quartet; genesis handlin
 Core's exact unspendable-script boundaries; exact amount parsing; txid/wtxid and
 maximum-vout handling; same-block spends; missing-undo rejection; proof-leaf order;
 free-slot reuse; mutation prevalidation; duplicate-leaf checkpoint round trips;
-sequential sync; and reorg detection. The accumulator tests run without RPC or
-Bitcoin Core. See [test/UPSTREAM_TESTS.md](test/UPSTREAM_TESTS.md) for the exact
-upstream pins, case mapping, and intentionally inapplicable Rustreexo API suites.
+sequential sync; reorg detection; randomized RAM-versus-mmap differential
+sequences; WAL crash/corruption recovery; alternating-superblock recovery;
+multi-block undo/redo; and WAL rotation/retention boundaries. The accumulator
+tests run without RPC or Bitcoin Core. See
+[test/UPSTREAM_TESTS.md](test/UPSTREAM_TESTS.md) for the exact upstream pins,
+case mapping, utreexod durability-test review, and intentionally inapplicable
+Rustreexo API suites.
 
 ### Floresta differential regtest
 
 The opt-in integration harness creates an exceptional-output regtest chain in
 Bitcoin Core, independently reconstructs it with this sidecar and
-`rpc-utreexo-bridge`, then makes Floresta proof-validate the reference bridge's
-blocks. All three implementations must agree on the tip, leaf count, and roots.
+`rpc-utreexo-bridge`, switches the C++ sidecar to mmap/WAL storage, mines another
+block, reopens and advances that state, then makes Floresta proof-validate the
+reference bridge's blocks. All three implementations must agree on the tip,
+leaf count, and roots.
 
 The external binaries are deliberately pinned to:
 

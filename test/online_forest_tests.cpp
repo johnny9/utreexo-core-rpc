@@ -1,10 +1,13 @@
 #include <test_framework.h>
 #include <utreexo/forest.h>
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <random>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -16,6 +19,15 @@ namespace {
 Hash256 OnlineHash(uint8_t value)
 {
     std::array<std::byte, 1> input{static_cast<std::byte>(value)};
+    return Sha512_256(input);
+}
+
+Hash256 OnlineHash64(uint64_t value)
+{
+    std::array<std::byte, 8> input{};
+    for (std::size_t i{0}; i < input.size(); ++i) {
+        input[i] = static_cast<std::byte>((value >> (i * 8)) & 0xffU);
+    }
     return Sha512_256(input);
 }
 
@@ -31,6 +43,87 @@ void Cleanup(const std::filesystem::path& path)
     std::filesystem::remove_all(path, error);
     std::filesystem::remove_all(path.string() + ".tmp", error);
 }
+
+std::filesystem::path WalPath(const std::filesystem::path& directory)
+{
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        const auto name{entry.path().filename().string()};
+        if (name.starts_with("wal-") && name.ends_with(".log")) return entry.path();
+    }
+    return {};
+}
+
+void FlipByte(const std::filesystem::path& path, std::streamoff offset)
+{
+    std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
+    CHECK(file.good());
+    file.seekg(offset);
+    char value{0};
+    file.read(&value, 1);
+    CHECK(file.good());
+    value = static_cast<char>(static_cast<unsigned char>(value) ^ 0x80U);
+    file.seekp(offset);
+    file.write(&value, 1);
+    CHECK(file.good());
+}
+
+std::vector<Hash256> ConcreteRoots(const PackedForest& forest)
+{
+    std::vector<Hash256> roots;
+    for (const auto& root : forest.Roots()) roots.push_back(root.value_or(Hash256{}));
+    return roots;
+}
+
+void CheckEquivalent(const PackedForest& reference, const PackedForest& online,
+                     std::span<const Hash256> live)
+{
+    CHECK_EQ(online.NumLeaves(), reference.NumLeaves());
+    CHECK_EQ(online.Roots(), reference.Roots());
+    CHECK_EQ(online.Usage().live_nodes, reference.Usage().live_nodes);
+    CHECK_EQ(online.Usage().index_entries, reference.Usage().index_entries);
+    CHECK_EQ(online.Usage().index_tombstones, 0U);
+    for (const auto& hash : live) {
+        CHECK(reference.Contains(hash));
+        CHECK(online.Contains(hash));
+    }
+
+    if (live.empty()) return;
+    std::vector<Hash256> targets;
+    targets.push_back(live.front());
+    if (live.size() > 2) targets.push_back(live[live.size() / 2]);
+    if (live.size() > 1) targets.push_back(live.back());
+    auto reference_proof{reference.Prove(targets)};
+    auto online_proof{online.Prove(targets)};
+    CHECK(reference_proof);
+    CHECK(online_proof);
+    CHECK_EQ(online_proof.Value().targets, reference_proof.Value().targets);
+    CHECK_EQ(online_proof.Value().hashes, reference_proof.Value().hashes);
+    auto verified{VerifyProof(online_proof.Value(), targets, ConcreteRoots(online),
+                              online.NumLeaves())};
+    CHECK(verified);
+    CHECK(verified.Value());
+}
+
+PackedForest ReopenOnline(const std::filesystem::path& path,
+                          std::span<const Hash256> expected_chain,
+                          const ChainPoint& expected_point,
+                          OnlineForestConfig config)
+{
+    std::vector<Hash256> recovered_chain;
+    ChainPoint recovered_point;
+    auto recovered{PackedForest::OpenOnline(path, recovered_chain, recovered_point, config)};
+    CHECK(recovered);
+    CHECK_EQ(recovered_chain,
+             std::vector<Hash256>(expected_chain.begin(), expected_chain.end()));
+    CHECK_EQ(recovered_point, expected_point);
+    return recovered.Take();
+}
+
+struct TestDelta {
+    std::vector<Hash256> additions;
+    std::vector<Hash256> deletions;
+    ChainPoint point;
+};
 
 } // namespace
 
@@ -205,5 +298,310 @@ TEST(online_forest_disconnect_is_durable_after_base_flush)
         CHECK(!recovered.Value().Contains(addition[0]));
         CHECK_EQ(recovered.Value().OnlineUsage().current_lsn, 2U);
     }
+    Cleanup(path);
+}
+
+TEST(online_forest_randomized_differential_reopen_flush_and_proofs)
+{
+    const auto path{OnlinePath("differential")};
+    Cleanup(path);
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 16 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 32,
+        .sync_wal = true,
+    };
+    const Hash256 genesis{OnlineHash64(1'000'000)};
+    std::vector<Hash256> chain{genesis};
+    std::vector<Hash256> live;
+    for (uint64_t value{1}; value <= 64; ++value) live.push_back(OnlineHash64(value));
+
+    PackedForest reference;
+    PackedForest online;
+    CHECK(reference.Modify(live, {}));
+    CHECK(online.Modify(live, {}));
+    CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+
+    std::mt19937 random{0x5eed1234U};
+    uint64_t next_hash{10'000};
+    uint64_t previous_base_lsn{0};
+    for (uint32_t height{1}; height <= 120; ++height) {
+        std::shuffle(live.begin(), live.end(), random);
+        const std::size_t maximum_deletions{std::min<std::size_t>(4, live.size() / 3)};
+        const std::size_t deletion_count{maximum_deletions == 0 ? 0 :
+            static_cast<std::size_t>(random()) % (maximum_deletions + 1)};
+        std::vector<Hash256> deletions{
+            live.begin(), live.begin() + static_cast<std::ptrdiff_t>(deletion_count)};
+        live.erase(live.begin(), live.begin() + static_cast<std::ptrdiff_t>(deletion_count));
+
+        const std::size_t addition_count{1 + static_cast<std::size_t>(random()) % 5};
+        std::vector<Hash256> additions;
+        additions.reserve(addition_count);
+        for (std::size_t i{0}; i < addition_count; ++i) {
+            additions.push_back(OnlineHash64(next_hash++));
+            live.push_back(additions.back());
+        }
+        const ChainPoint point{height, OnlineHash64(1'000'000 + height)};
+        chain.push_back(point.block_hash);
+        CHECK(reference.Modify(additions, deletions));
+        CHECK(online.ModifyBlock(additions, deletions, point));
+        CHECK_EQ(online.OnlineUsage().current_lsn, height);
+        CHECK(online.OnlineUsage().base_lsn >= previous_base_lsn);
+        previous_base_lsn = online.OnlineUsage().base_lsn;
+        CheckEquivalent(reference, online, live);
+
+        if (height % 10 == 0) {
+            if (height % 20 == 0) CHECK(online.FlushOnline());
+            online = PackedForest{};
+            online = ReopenOnline(path, chain, point, config);
+            CheckEquivalent(reference, online, live);
+        }
+    }
+    CHECK(online.FlushOnline());
+    CHECK_EQ(online.OnlineUsage().base_lsn, 120U);
+    online = PackedForest{};
+    online = ReopenOnline(path, chain, ChainPoint{120, chain.back()}, config);
+    CheckEquivalent(reference, online, live);
+    Cleanup(path);
+}
+
+TEST(online_forest_multiblock_reorg_reopen_and_alternate_branch)
+{
+    const auto path{OnlinePath("multireorg")};
+    Cleanup(path);
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 16,
+        .sync_wal = true,
+    };
+    const Hash256 genesis{OnlineHash64(2'000'000)};
+    std::vector<Hash256> chain{genesis};
+    std::vector<Hash256> initial;
+    for (uint64_t value{1}; value <= 32; ++value) initial.push_back(OnlineHash64(value));
+    std::vector<Hash256> live{initial};
+    std::vector<std::vector<Hash256>> live_at_height{live};
+    std::vector<std::vector<std::optional<Hash256>>> roots_at_height;
+    std::vector<TestDelta> original_blocks;
+
+    PackedForest reference;
+    PackedForest online;
+    CHECK(reference.Modify(initial, {}));
+    CHECK(online.Modify(initial, {}));
+    roots_at_height.push_back(reference.Roots());
+    CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+
+    uint64_t next_hash{50'000};
+    for (uint32_t height{1}; height <= 12; ++height) {
+        const std::size_t delete_index{(static_cast<std::size_t>(height) * 7) % live.size()};
+        std::vector<Hash256> deletions{live[delete_index]};
+        live.erase(live.begin() + static_cast<std::ptrdiff_t>(delete_index));
+        std::vector<Hash256> additions{OnlineHash64(next_hash++), OnlineHash64(next_hash++)};
+        live.insert(live.end(), additions.begin(), additions.end());
+        const ChainPoint point{height, OnlineHash64(2'000'000 + height)};
+        chain.push_back(point.block_hash);
+        original_blocks.push_back(TestDelta{additions, deletions, point});
+        CHECK(reference.Modify(additions, deletions));
+        CHECK(online.ModifyBlock(additions, deletions, point));
+        roots_at_height.push_back(reference.Roots());
+        live_at_height.push_back(live);
+    }
+    CHECK(online.FlushOnline());
+
+    for (uint32_t expected_height{11}; expected_height >= 7; --expected_height) {
+        const auto rolled_back{online.RollbackOnlineBlock()};
+        CHECK(rolled_back);
+        CHECK_EQ(rolled_back.Value(), ChainPoint(expected_height, chain[expected_height]));
+        CHECK_EQ(online.Roots(), roots_at_height[expected_height]);
+        chain.pop_back();
+        online = PackedForest{};
+        online = ReopenOnline(path, chain, ChainPoint{expected_height, chain.back()}, config);
+        CHECK_EQ(online.Roots(), roots_at_height[expected_height]);
+        if (expected_height == 7) break;
+    }
+
+    reference = PackedForest{};
+    CHECK(reference.Modify(initial, {}));
+    for (std::size_t i{0}; i < 7; ++i) {
+        CHECK(reference.Modify(original_blocks[i].additions, original_blocks[i].deletions));
+    }
+    live = live_at_height[7];
+    for (uint32_t height{8}; height <= 12; ++height) {
+        const std::size_t delete_index{(static_cast<std::size_t>(height) * 11) % live.size()};
+        std::vector<Hash256> deletions{live[delete_index]};
+        live.erase(live.begin() + static_cast<std::ptrdiff_t>(delete_index));
+        std::vector<Hash256> additions{
+            OnlineHash64(next_hash++), OnlineHash64(next_hash++), OnlineHash64(next_hash++)};
+        live.insert(live.end(), additions.begin(), additions.end());
+        const ChainPoint point{height, OnlineHash64(3'000'000 + height)};
+        chain.push_back(point.block_hash);
+        CHECK(reference.Modify(additions, deletions));
+        CHECK(online.ModifyBlock(additions, deletions, point));
+        CheckEquivalent(reference, online, live);
+    }
+    online = PackedForest{};
+    online = ReopenOnline(path, chain, ChainPoint{12, chain.back()}, config);
+    CheckEquivalent(reference, online, live);
+    Cleanup(path);
+}
+
+TEST(online_forest_recovers_from_corrupt_newest_superblock)
+{
+    const auto path{OnlinePath("superblock")};
+    Cleanup(path);
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = true,
+    };
+    const Hash256 genesis{OnlineHash64(4'000'000)};
+    const ChainPoint point_one{1, OnlineHash64(4'000'001)};
+    const ChainPoint point_two{2, OnlineHash64(4'000'002)};
+    std::vector<Hash256> chain{genesis};
+    std::vector<Hash256> initial;
+    for (uint64_t value{1}; value <= 8; ++value) initial.push_back(OnlineHash64(value));
+    const std::array<Hash256, 1> addition_one{OnlineHash64(60'001)};
+    const std::array<Hash256, 1> addition_two{OnlineHash64(60'002)};
+
+    PackedForest reference;
+    CHECK(reference.Modify(initial, {}));
+    CHECK(reference.Modify(addition_one, {}));
+    CHECK(reference.Modify(addition_two, {}));
+    {
+        PackedForest online;
+        CHECK(online.Modify(initial, {}));
+        CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+        CHECK(online.ModifyBlock(addition_one, {}, point_one));
+        chain.push_back(point_one.block_hash);
+        CHECK(online.FlushOnline());
+        CHECK_EQ(online.OnlineUsage().base_lsn, 1U);
+        CHECK(online.ModifyBlock(addition_two, {}, point_two));
+        chain.push_back(point_two.block_hash);
+        CHECK(online.FlushOnline());
+        CHECK_EQ(online.OnlineUsage().base_lsn, 2U);
+    }
+
+    // Generation 2 is state.0. Corrupt it so recovery must select generation
+    // 1 from state.1 and replay transaction 2 from the retained WAL.
+    FlipByte(path / "state.0", 24);
+    auto recovered{ReopenOnline(path, chain, point_two, config)};
+    CHECK_EQ(recovered.Roots(), reference.Roots());
+    CHECK_EQ(recovered.OnlineUsage().base_lsn, 1U);
+    CHECK_EQ(recovered.OnlineUsage().current_lsn, 2U);
+    CHECK(recovered.OnlineUsage().dirty_nodes > 0U);
+    Cleanup(path);
+}
+
+TEST(online_forest_rejects_corrupt_committed_wal)
+{
+    const auto path{OnlinePath("wal-corruption")};
+    Cleanup(path);
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = true,
+    };
+    const Hash256 genesis{OnlineHash64(5'000'000)};
+    const Hash256 block_one{OnlineHash64(5'000'001)};
+    const std::vector<Hash256> chain{genesis};
+    {
+        PackedForest online;
+        const std::array<Hash256, 4> initial{
+            OnlineHash64(1), OnlineHash64(2), OnlineHash64(3), OnlineHash64(4)};
+        const std::array<Hash256, 1> addition{OnlineHash64(70'000)};
+        CHECK(online.Modify(initial, {}));
+        CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+        CHECK(online.ModifyBlock(addition, {}, ChainPoint{1, block_one}));
+    }
+    const auto wal{WalPath(path)};
+    CHECK(!wal.empty());
+    const auto size{std::filesystem::file_size(wal)};
+    CHECK(size > 32U);
+    FlipByte(wal, static_cast<std::streamoff>(size - 17));
+
+    std::vector<Hash256> recovered_chain;
+    ChainPoint recovered_point;
+    auto recovered{PackedForest::OpenOnline(path, recovered_chain, recovered_point, config)};
+    CHECK(!recovered);
+    CHECK(recovered.Error().find("checksum") != std::string::npos);
+    Cleanup(path);
+}
+
+TEST(online_forest_discards_incomplete_first_wal_transaction)
+{
+    const auto path{OnlinePath("first-tail")};
+    Cleanup(path);
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = true,
+    };
+    const Hash256 genesis{OnlineHash64(6'000'000)};
+    const std::vector<Hash256> chain{genesis};
+    std::vector<std::optional<Hash256>> base_roots;
+    {
+        PackedForest online;
+        const std::array<Hash256, 4> initial{
+            OnlineHash64(1), OnlineHash64(2), OnlineHash64(3), OnlineHash64(4)};
+        const std::array<Hash256, 1> addition{OnlineHash64(80'000)};
+        CHECK(online.Modify(initial, {}));
+        base_roots = online.Roots();
+        CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+        CHECK(online.ModifyBlock(addition, {}, ChainPoint{1, OnlineHash64(6'000'001)}));
+    }
+    const auto wal{WalPath(path)};
+    CHECK(!wal.empty());
+    const auto committed_size{std::filesystem::file_size(wal)};
+    CHECK(committed_size > 1U);
+    std::filesystem::resize_file(wal, committed_size - 1);
+
+    auto recovered{ReopenOnline(path, chain, ChainPoint{0, genesis}, config)};
+    CHECK_EQ(recovered.Roots(), base_roots);
+    CHECK_EQ(recovered.OnlineUsage().current_lsn, 0U);
+    CHECK_EQ(std::filesystem::file_size(wal), 0U);
+    Cleanup(path);
+}
+
+TEST(online_forest_rotates_prunes_and_enforces_undo_window)
+{
+    const auto path{OnlinePath("retention")};
+    Cleanup(path);
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 64 * 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 1,
+        .sync_wal = true,
+    };
+    const Hash256 genesis{OnlineHash64(7'000'000)};
+    const std::vector<Hash256> chain{genesis};
+    std::vector<Hash256> initial;
+    initial.reserve(8'192);
+    for (uint64_t value{1}; value <= 8'192; ++value) initial.push_back(OnlineHash64(value));
+
+    PackedForest online;
+    CHECK(online.Modify(initial, {}));
+    CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+    uint64_t next_hash{100'000};
+    for (uint32_t height{1}; height <= 3; ++height) {
+        std::vector<Hash256> additions;
+        additions.reserve(8'192);
+        for (std::size_t i{0}; i < 8'192; ++i) additions.push_back(OnlineHash64(next_hash++));
+        CHECK(online.ModifyBlock(additions, {},
+                                 ChainPoint{height, OnlineHash64(7'000'000 + height)}));
+        CHECK(online.OnlineUsage().last_transaction_wal_bytes > config.wal_segment_bytes);
+        CHECK(online.FlushOnline());
+    }
+
+    // Segment 1 is older than the configured window after the third flush.
+    // The two newest connects remain available, while the third rollback must
+    // fail closed instead of synthesizing an invalid previous state.
+    CHECK(online.RollbackOnlineBlock());
+    CHECK(online.RollbackOnlineBlock());
+    const auto outside_window{online.RollbackOnlineBlock()};
+    CHECK(!outside_window);
+    CHECK(outside_window.Error().find("outside the retained WAL window") != std::string::npos);
     Cleanup(path);
 }

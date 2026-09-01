@@ -4,7 +4,9 @@
 The reference bridge supplies proof-bearing blocks to Floresta because the C++
 sidecar does not expose its P2P bridge endpoint yet. The C++ sidecar and the
 reference bridge independently reconstruct the same Core chain. Floresta then
-validates the reference proofs and must report the identical roots.
+validates the reference proofs and must report the identical roots. The C++
+sidecar is also switched to mmap/WAL storage, reopened, and advanced by a new
+block before the final comparison.
 """
 
 from __future__ import annotations
@@ -231,9 +233,11 @@ def run(args: argparse.Namespace) -> int:
         # the proof-consuming layer. Core stays online because the reference
         # bridge continuously polls it for new blocks while serving peers.
         state_path = work / "cpp-state.json"
+        online_dir = work / "cpp-online"
         sidecar_result = subprocess.run([
             str(sidecar), "--rpc-host=127.0.0.1", f"--rpc-port={core_rpc_port}",
             f"--rpc-auth={RPC_USER}:{RPC_PASSWORD}", f"--state-json={state_path}",
+            f"--online-state={online_dir}",
         ], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=args.timeout)
         (work / "cpp-sidecar.log").write_text(sidecar_result.stdout, encoding="utf-8")
         if sidecar_result.returncode != 0:
@@ -249,6 +253,46 @@ def run(args: argparse.Namespace) -> int:
                 f"leaf-count mismatch: C++={cpp_state['num_leaves']} reference={reference_state['leaves']}")
         if cpp_roots != reference_roots:
             raise AssertionError(f"root mismatch: C++={cpp_roots} reference={reference_roots}")
+
+        # Add one block after the storage switch. Reopening must rebuild and
+        # validate the reverse index, apply this block through the durable WAL,
+        # flush the mmap base on clean exit, and remain equal to the independent
+        # reference bridge.
+        rpc(wallet_url, "generatetoaddress", [1, mining_address], auth)
+        tip_height = rpc(core_url, "getblockcount", authorization=auth)
+        tip_hash = rpc(core_url, "getbestblockhash", authorization=auth)
+        wait_for("reference bridge post-switch tip",
+                 lambda: http_json(f"{reference_base}/roots/{tip_hash}").get("data"),
+                 processes, args.timeout)
+        reference_state = http_json(f"{reference_base}/acc")["data"]
+
+        reopen_state_path = work / "cpp-reopen-state.json"
+        reopen_result = subprocess.run([
+            str(sidecar), "--rpc-host=127.0.0.1", f"--rpc-port={core_rpc_port}",
+            f"--rpc-auth={RPC_USER}:{RPC_PASSWORD}",
+            f"--state-json={reopen_state_path}", f"--online-state={online_dir}",
+        ], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=args.timeout)
+        (work / "cpp-sidecar-reopen.log").write_text(reopen_result.stdout, encoding="utf-8")
+        if reopen_result.returncode != 0:
+            raise RuntimeError(
+                f"C++ sidecar reopen failed with {reopen_result.returncode}; "
+                f"see {work / 'cpp-sidecar-reopen.log'}")
+        if "event=online_state_loaded" not in reopen_result.stdout:
+            raise AssertionError("C++ sidecar did not report online-state recovery")
+        if "event=online_base_flushed" not in reopen_result.stdout:
+            raise AssertionError("C++ sidecar did not report the post-switch base flush")
+        cpp_state = json.loads(reopen_state_path.read_text(encoding="utf-8"))
+        cpp_roots = normalize_roots(cpp_state["roots"])
+        reference_roots = normalize_roots(reference_state["roots"])
+        if cpp_state["height"] != tip_height or cpp_state["block_hash"] != tip_hash:
+            raise AssertionError(f"reopened C++ sidecar tip mismatch: {cpp_state}")
+        if cpp_state["num_leaves"] != reference_state["leaves"]:
+            raise AssertionError(
+                f"post-switch leaf-count mismatch: C++={cpp_state['num_leaves']} "
+                f"reference={reference_state['leaves']}")
+        if cpp_roots != reference_roots:
+            raise AssertionError(
+                f"post-switch root mismatch: C++={cpp_roots} reference={reference_roots}")
 
         floresta_process = ManagedProcess("florestad", [
             str(florestad), "--network=regtest", f"--data-dir={floresta_dir}",
