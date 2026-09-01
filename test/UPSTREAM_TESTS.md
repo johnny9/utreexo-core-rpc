@@ -45,6 +45,17 @@ wtxid, maximum `vout`, mixed prior-block and same-block inputs, empty scripts,
 the 10,000/10,001-byte script boundary, and OP_RETURN only when it is the first
 opcode.
 
+The v1 proof-peer format is pinned to the same Floresta commit's
+`crates/floresta-wire/src/p2p_wire/block_proof.rs` and utreexod commit
+`25deba281b612f8b87f734b0ac169d8a46ede988` in `wire/msggetutreexoproof.go` and
+`wire/msgutreexoproof.go`. `p2p_tests.cpp` checks Bitcoin envelope checksums,
+network separation, strict request decoding, full and selective proof responses,
+bounded/reorg-aware caching, fragmented socket delivery, the `NODE_UTREEXO` service
+bit, version/verack, sendaddrv2/getaddr, ping/pong, and a complete Floresta-shaped
+`getuproof` exchange. `sync_tests.cpp` separately proves that the served proof is
+captured and verified before its block mutates the forest. The P2P envelope and request
+decoders also have a sanitizer-backed libFuzzer target.
+
 ## Differential regtest
 
 `integration/floresta_regtest.py` uses:

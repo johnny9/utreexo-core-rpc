@@ -32,12 +32,15 @@ the sidecar transport with it.
   durable superblocks.
 - Automatic shallow-reorg rollback from retained WAL before-images. Reorgs older
   than the configured window fail closed to the preserved validated checkpoint.
+- An optional inbound Bitcoin-v1 `NODE_UTREEXO` proof peer with bounded recent-proof
+  caching, Floresta-compatible `getuproof`/`uproof`, handshake, ping/pong, and safe
+  handling of unsupported messages.
 
 The executable constructs the tip forest and compact spent-leaf records but
 does not generate historical proofs during bootstrap because they are neither retained
-nor served. The accumulator retains its on-demand batch-proof API for future tip UTXO,
-block, and transaction requests. The executable does not yet publish the Bitcoin P2P
-bridge protocol.
+nor served. When P2P is enabled, it generates one proof against the pre-mutation forest
+for each newly followed block and keeps only a bounded, disposable recent cache. It does
+not advertise or provide archive service.
 
 ## Build and test
 
@@ -126,6 +129,46 @@ The native directory contains `forest.hashes`, `forest.meta`, `chain.hashes`, tw
 alternating `state.*` superblocks, and `wal-*.log` segments. Do not copy it as a shared
 checkpoint while unapplied WAL exists; use the preserved format-3 checkpoint until an
 explicit online export command is added.
+
+## Serve recent proofs to Floresta
+
+P2P service is deliberately available only in durable follow mode. It advertises
+`NODE_UTREEXO` but not `NODE_NETWORK` or `NODE_UTREEXO_ARCHIVE`: Floresta downloads
+ordinary headers and blocks from another Bitcoin peer and selects this sidecar for
+`getuproof` requests.
+
+```sh
+./build/utreexo-bridge \
+  --rpc-cookie=/path/to/bitcoin/.cookie \
+  --online-state=/nvme/utreexo-online \
+  --follow \
+  --p2p-port=8338 \
+  --p2p-bind=127.0.0.1 \
+  --p2p-network=mainnet
+```
+
+The default cache retains at most 288 proofs and 256 MiB. Both limits apply, and can
+be changed with `--p2p-proof-cache-blocks` and `--p2p-proof-cache-mib`. Proofs are
+captured only for blocks arriving after this process starts. The cache is disposable:
+restart begins empty, while reorganization rollback immediately removes proofs above
+the recovered active-chain height. A request that races the sidecar's Core poll waits up
+to 15 seconds for publication, avoiding Floresta's much longer request retry. This is tip
+service, not a historical proof index.
+
+The first implementation supports the Bitcoin v1 transport. Current Floresta must be
+configured with `--allow-v1-fallback`. When using Floresta's fixed-peer mode, include
+both a normal `NODE_NETWORK` peer (the local Core node is suitable) and the sidecar:
+
+```sh
+florestad \
+  --connect 127.0.0.1:8333 \
+  --connect 127.0.0.1:8338 \
+  --allow-v1-fallback
+```
+
+Keep the listener on loopback while testing; binding `0.0.0.0` is an explicit operator
+choice. BIP 324 transport, peer discovery, transaction relay, standard block service,
+and archive proofs remain out of scope.
 
 ## Offline arena compaction
 
@@ -320,9 +363,11 @@ ctest --test-dir build-tsan --output-on-failure
 
 CC=clang CXX=clang++ cmake -S . -B build-fuzz \
   -DUTREEXO_BUILD_FUZZERS=ON -DBUILD_TESTING=OFF
-cmake --build build-fuzz -j2 --target utreexo_fuzz_forest utreexo_fuzz_rpc_json
+cmake --build build-fuzz -j2 --target \
+  utreexo_fuzz_forest utreexo_fuzz_rpc_json utreexo_fuzz_p2p
 ./build-fuzz/utreexo_fuzz_forest -runs=10000 -max_len=65536
 ./build-fuzz/utreexo_fuzz_rpc_json -runs=10000 -max_len=65536
+./build-fuzz/utreexo_fuzz_p2p -runs=10000 -max_len=131072
 ```
 
 Sanitizers supported by the CMake option are `address`, `undefined`, `thread`,

@@ -157,11 +157,15 @@ jobs:
           -DUTREEXO_BUILD_FUZZERS=ON
           -DBUILD_TESTING=OFF
       - name: Build fuzz targets
-        run: cmake --build build --parallel 2 --target utreexo_fuzz_forest utreexo_fuzz_rpc_json
+        run: >-
+          cmake --build build --parallel 2 --target
+          utreexo_fuzz_forest utreexo_fuzz_rpc_json utreexo_fuzz_p2p
       - name: Fuzz forest deserialization
         run: ./build/utreexo_fuzz_forest -runs=10000 -max_len=65536
       - name: Fuzz verbose RPC JSON parsing
         run: ./build/utreexo_fuzz_rpc_json -runs=10000 -max_len=65536
+      - name: Fuzz P2P envelopes and getuproof requests
+        run: ./build/utreexo_fuzz_p2p -runs=10000 -max_len=131072
 
   differential-regtest:
     name: Bitcoin Core / reference bridge / Floresta regtest
@@ -206,3 +210,25 @@ jobs:
           --reference-bridge="${RUNNER_TEMP}/reference-bridge/target/release/bridge"
           --florestad="${RUNNER_TEMP}/floresta/target/release/florestad"
           --timeout=300
+
+  current-floresta-wire:
+    name: Current Floresta getuproof/uproof compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      FLORESTA_COMMIT: 81eaf6a39773a10307c8555d06460b227739682e
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Clone pinned current Floresta
+        working-directory: ${{ runner.temp }}
+        run: |
+          git clone --filter=blob:none https://github.com/getfloresta/Floresta floresta-current
+          git -C floresta-current checkout --detach "${FLORESTA_COMMIT}"
+      - name: Install sidecar wire compatibility test
+        run: >-
+          cp test/integration/floresta_wire_compat.rs
+          "${RUNNER_TEMP}/floresta-current/crates/floresta-wire/tests/sidecar_compat.rs"
+      - name: Decode sidecar vectors with current Floresta
+        working-directory: ${{ runner.temp }}/floresta-current
+        run: cargo test --release --locked -p floresta-wire --test sidecar_compat
