@@ -3,6 +3,7 @@
 #include <utreexo/checkpoint.h>
 #include <utreexo/core_rpc.h>
 #include <utreexo/log.h>
+#include <utreexo/p2p.h>
 #include <utreexo/sync.h>
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <new>
 #include <optional>
 #include <sstream>
@@ -44,6 +46,12 @@ struct Options {
     uint64_t online_wal_segment_mib{256};
     uint32_t online_undo_depth{1'008};
     uint32_t poll_interval_ms{5'000};
+    std::string p2p_bind{"127.0.0.1"};
+    std::optional<uint16_t> p2p_port;
+    utreexo::BitcoinNetwork p2p_network{utreexo::BitcoinNetwork::MAINNET};
+    uint32_t p2p_max_peers{16};
+    uint32_t p2p_proof_cache_blocks{288};
+    uint64_t p2p_proof_cache_mib{256};
     utreexo::LogLevel log_level{utreexo::LogLevel::INFO};
     bool follow{false};
     bool show_version{false};
@@ -98,6 +106,12 @@ void Usage()
         << "  --online-undo-depth=N       Retained WAL before-image window (default 1008)\n"
         << "  --follow                    Poll Core and remain online after the initial sync\n"
         << "  --poll-interval-ms=N        Follow-mode Core tip poll interval (default 5000)\n"
+        << "  --p2p-port=N                Serve recent getuproof requests over Bitcoin v1 P2P\n"
+        << "  --p2p-bind=IP               P2P IPv4 bind address: 127.0.0.1 or 0.0.0.0\n"
+        << "  --p2p-network=NETWORK       mainnet, testnet3, signet, or regtest\n"
+        << "  --p2p-max-peers=N           Maximum inbound proof peers (default 16)\n"
+        << "  --p2p-proof-cache-blocks=N  Recent in-memory proof window (default 288)\n"
+        << "  --p2p-proof-cache-mib=N     Proof-cache memory ceiling (default 256)\n"
         << "  --state-json=PATH           Write final height, leaf count, and roots as JSON\n"
         << "  --stop-height=N             Stop before the current Core tip\n"
         << "  --log-level=LEVEL           error, warn, info, debug, or trace (default info)\n"
@@ -154,6 +168,34 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
             if (!ParseInteger(*poll, options.poll_interval_ms) || options.poll_interval_ms == 0) {
                 return utreexo::Result<Options>::Err("invalid --poll-interval-ms");
             }
+        } else if (auto bind{value("--p2p-bind")}) {
+            options.p2p_bind = *bind;
+        } else if (auto p2p_port{value("--p2p-port")}) {
+            uint16_t parsed_port{0};
+            if (!ParseInteger(*p2p_port, parsed_port) || parsed_port == 0) {
+                return utreexo::Result<Options>::Err("invalid --p2p-port");
+            }
+            options.p2p_port = parsed_port;
+        } else if (auto network{value("--p2p-network")}) {
+            auto parsed_network{utreexo::ParseBitcoinNetwork(*network)};
+            if (!parsed_network) return utreexo::Result<Options>::Err(parsed_network.Error());
+            options.p2p_network = parsed_network.Value();
+        } else if (auto peers{value("--p2p-max-peers")}) {
+            if (!ParseInteger(*peers, options.p2p_max_peers) || options.p2p_max_peers == 0 ||
+                options.p2p_max_peers > 1'024) {
+                return utreexo::Result<Options>::Err("invalid --p2p-max-peers");
+            }
+        } else if (auto blocks{value("--p2p-proof-cache-blocks")}) {
+            if (!ParseInteger(*blocks, options.p2p_proof_cache_blocks) ||
+                options.p2p_proof_cache_blocks == 0) {
+                return utreexo::Result<Options>::Err("invalid --p2p-proof-cache-blocks");
+            }
+        } else if (auto proof_cache{value("--p2p-proof-cache-mib")}) {
+            if (!ParseInteger(*proof_cache, options.p2p_proof_cache_mib) ||
+                options.p2p_proof_cache_mib == 0 ||
+                options.p2p_proof_cache_mib > std::numeric_limits<uint64_t>::max() / (1024ULL * 1024)) {
+                return utreexo::Result<Options>::Err("invalid --p2p-proof-cache-mib");
+            }
         } else if (argument == "--follow") {
             options.follow = true;
         } else if (auto stop_height{value("--stop-height")}) {
@@ -176,6 +218,9 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
     }
     if (options.follow && options.stop_height) {
         return utreexo::Result<Options>::Err("--follow cannot be combined with --stop-height");
+    }
+    if (options.p2p_port && !options.follow) {
+        return utreexo::Result<Options>::Err("--p2p-port requires --follow");
     }
     return utreexo::Result<Options>::Ok(std::move(options));
 }
@@ -643,6 +688,41 @@ int main(int argc, char** argv)
             " slowest_total_us=" + std::to_string(overall.slowest_us));
     }
 
+    std::shared_ptr<utreexo::RecentProofCache> proof_cache;
+    std::unique_ptr<utreexo::P2PServer> p2p_server;
+    if (options.p2p_port) {
+        constexpr uint64_t MIB{1024ULL * 1024};
+        proof_cache = std::make_shared<utreexo::RecentProofCache>(
+            options.p2p_proof_cache_blocks, options.p2p_proof_cache_mib * MIB);
+        proof_cache->SetTip(sync.CurrentPoint()->height);
+        sync.SetProofGeneration(true);
+        auto started{utreexo::P2PServer::Start(utreexo::P2PServerConfig{
+            .network = options.p2p_network,
+            .bind_address = options.p2p_bind,
+            .port = *options.p2p_port,
+            .max_peers = options.p2p_max_peers,
+            .max_payload_bytes = 32U * 1024U * 1024U,
+            .idle_timeout_seconds = 120,
+            .user_agent = "/utreexo-bridge:" UTREEXO_BRIDGE_VERSION "/",
+        }, proof_cache)};
+        if (!started) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "p2p_listen_failed",
+                "bind=" + StringField(options.p2p_bind) +
+                " port=" + std::to_string(*options.p2p_port) +
+                " error=" + StringField(started.Error()));
+            return 1;
+        }
+        p2p_server = started.Take();
+        utreexo::Log(utreexo::LogLevel::INFO, "p2p_listening",
+            "bind=" + StringField(options.p2p_bind) +
+            " port=" + std::to_string(p2p_server->BoundPort()) +
+            " services=NODE_UTREEXO transport=v1 archive=false"
+            " cache_blocks=" + std::to_string(options.p2p_proof_cache_blocks) +
+            " cache_bytes=" + std::to_string(options.p2p_proof_cache_mib * MIB) +
+            " cached_proofs=0 cache_persistence=disposable"
+            " note=proofs_become_available_as_new_blocks_are_followed");
+    }
+
     if (options.follow) {
         if (!forest.IsOnline()) {
             utreexo::Log(utreexo::LogLevel::ERROR, "online_follow_failed",
@@ -665,6 +745,7 @@ int main(int argc, char** argv)
                 return 1;
             }
             if (reconciled.Value() != 0) {
+                if (proof_cache) proof_cache->DiscardAfter(sync.CurrentPoint()->height);
                 utreexo::Log(utreexo::LogLevel::WARN, "online_reorg_rolled_back",
                     "disconnected_blocks=" + std::to_string(reconciled.Value()) +
                     " recovered_height=" + std::to_string(sync.CurrentPoint()->height));
@@ -708,7 +789,27 @@ int main(int argc, char** argv)
                             " error=" + StringField(block.Error()));
                         return 1;
                     }
+                    if (proof_cache) {
+                        if (!block.Value().proof) {
+                            sync.StopPrefetch();
+                            utreexo::Log(utreexo::LogLevel::ERROR, "p2p_proof_capture_failed",
+                                "height=" + std::to_string(block.Value().delta.point.height) +
+                                " reason=missing_generated_proof action=stop");
+                            return 1;
+                        }
+                        auto published{proof_cache->Publish(block.Value().delta,
+                                                           std::move(*block.Value().proof))};
+                        if (!published) {
+                            sync.StopPrefetch();
+                            utreexo::Log(utreexo::LogLevel::ERROR, "p2p_proof_capture_failed",
+                                "height=" + std::to_string(block.Value().delta.point.height) +
+                                " error=" + StringField(published.Error()) + " action=stop");
+                            return 1;
+                        }
+                    }
                     const auto storage{forest.OnlineUsage()};
+                    const auto cache_stats{proof_cache ? proof_cache->Stats() :
+                        utreexo::ProofCacheStats{}};
                     utreexo::Log(utreexo::LogLevel::INFO, "online_block_committed",
                         "height=" + std::to_string(block.Value().delta.point.height) +
                         " block_hash=" + block.Value().delta.point.block_hash.ToBitcoinHex() +
@@ -722,7 +823,9 @@ int main(int argc, char** argv)
                         " redo_wal_bytes=" + std::to_string(storage.redo_wal_bytes) +
                         " transaction_nodes=" + std::to_string(storage.last_transaction_nodes) +
                         " transaction_wal_bytes=" + std::to_string(storage.last_transaction_wal_bytes) +
-                        " lsn=" + std::to_string(storage.current_lsn));
+                        " lsn=" + std::to_string(storage.current_lsn) +
+                        (proof_cache ? " proof_cache_entries=" + std::to_string(cache_stats.entries) +
+                                       " proof_cache_bytes=" + std::to_string(cache_stats.bytes) : ""));
                 }
                 sync.StopPrefetch();
                 const auto validated{sync.ValidateCurrentPoint()};

@@ -26,6 +26,8 @@ struct BlockProcessingMetrics {
 struct ProcessedBlock {
     BlockDelta delta;
     BlockProcessingMetrics metrics;
+    /** Present only when tip-proof capture was enabled before processing. */
+    std::optional<Proof> proof;
 };
 
 /** Sequential adapter. It owns no Core internals and can later consume an IPC BlockSource. */
@@ -43,6 +45,8 @@ public:
     Result<void> ValidateCurrentPoint();
     /** Roll back an online forest until its point is on Core's active chain. */
     Result<uint32_t> ReconcileCurrentPoint();
+    /** Generate and verify deletion proofs against each block's pre-mutation forest. */
+    void SetProofGeneration(bool enabled) { m_generate_proofs = enabled; }
 
     const std::vector<Hash256>& ChainHashes() const { return m_chain_hashes; }
     std::optional<ChainPoint> CurrentPoint() const;
@@ -55,6 +59,7 @@ private:
     PackedForest& m_forest;
     std::vector<Hash256> m_chain_hashes;
     std::unique_ptr<PrefetchState> m_prefetch;
+    bool m_generate_proofs{false};
 };
 
 } // namespace utreexo

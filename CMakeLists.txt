@@ -75,6 +75,12 @@ target_include_directories(utreexo_accumulator PUBLIC include)
 target_compile_features(utreexo_accumulator PUBLIC cxx_std_20)
 utreexo_configure_target(utreexo_accumulator)
 
+add_library(utreexo_p2p src/p2p.cpp)
+target_include_directories(utreexo_p2p PUBLIC include)
+target_compile_features(utreexo_p2p PUBLIC cxx_std_20)
+target_link_libraries(utreexo_p2p PUBLIC utreexo_accumulator utreexo_logging Threads::Threads)
+utreexo_configure_target(utreexo_p2p)
+
 add_library(utreexo_checkpoint src/checkpoint.cpp)
 target_include_directories(utreexo_checkpoint PUBLIC include)
 target_compile_features(utreexo_checkpoint PUBLIC cxx_std_20)
@@ -119,7 +125,7 @@ if(UTREEXO_BUILD_RPC)
     utreexo_configure_target(utreexo_core_rpc)
 
     add_executable(utreexo-bridge src/main.cpp)
-    target_link_libraries(utreexo-bridge PRIVATE utreexo_core_rpc utreexo_checkpoint)
+    target_link_libraries(utreexo-bridge PRIVATE utreexo_core_rpc utreexo_checkpoint utreexo_p2p)
     target_compile_definitions(utreexo-bridge PRIVATE
         UTREEXO_BRIDGE_VERSION="${PROJECT_VERSION}")
     utreexo_configure_target(utreexo-bridge)
@@ -139,7 +145,10 @@ if(UTREEXO_BUILD_FUZZERS)
     add_executable(utreexo_fuzz_rpc_json test/fuzz/rpc_json.cpp)
     target_link_libraries(utreexo_fuzz_rpc_json PRIVATE utreexo_core_rpc)
 
-    foreach(fuzz_target IN ITEMS utreexo_fuzz_forest utreexo_fuzz_rpc_json)
+    add_executable(utreexo_fuzz_p2p test/fuzz/p2p.cpp)
+    target_link_libraries(utreexo_fuzz_p2p PRIVATE utreexo_p2p)
+
+    foreach(fuzz_target IN ITEMS utreexo_fuzz_forest utreexo_fuzz_rpc_json utreexo_fuzz_p2p)
         target_compile_features(${fuzz_target} PRIVATE cxx_std_20)
         target_compile_options(${fuzz_target} PRIVATE
             -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined)
@@ -160,9 +169,10 @@ if(BUILD_TESTING)
         test/rustreexo_vector_tests.cpp
         test/checkpoint_tests.cpp
         test/bridge_wire_tests.cpp
+        test/p2p_tests.cpp
         test/log_tests.cpp
     )
-    target_link_libraries(utreexo_tests PRIVATE utreexo_accumulator utreexo_checkpoint utreexo_logging)
+    target_link_libraries(utreexo_tests PRIVATE utreexo_accumulator utreexo_checkpoint utreexo_logging utreexo_p2p)
     target_include_directories(utreexo_tests PRIVATE test)
     target_compile_features(utreexo_tests PRIVATE cxx_std_20)
     utreexo_configure_target(utreexo_tests)

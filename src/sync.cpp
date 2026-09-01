@@ -207,6 +207,29 @@ Result<ProcessedBlock> SequentialSync::ProcessNext()
         return Result<ProcessedBlock>::Err("block does not connect to the sidecar chain tip");
     }
 
+    std::optional<Proof> proof;
+    if (m_generate_proofs) {
+        auto generated{m_forest.Prove(delta.Value().deletions)};
+        if (!generated) {
+            return Result<ProcessedBlock>::Err("could not generate pre-block proof: " + generated.Error());
+        }
+        std::vector<Hash256> roots;
+        for (const auto& root : m_forest.Roots()) {
+            if (!root) return Result<ProcessedBlock>::Err("pre-block forest contains a missing root");
+            roots.push_back(*root);
+        }
+        auto verified{VerifyProof(generated.Value(), delta.Value().deletions, roots,
+                                  m_forest.NumLeaves())};
+        if (!verified) {
+            return Result<ProcessedBlock>::Err("could not verify generated pre-block proof: " +
+                                               verified.Error());
+        }
+        if (!verified.Value()) {
+            return Result<ProcessedBlock>::Err("generated pre-block proof does not match forest roots");
+        }
+        proof = generated.Take();
+    }
+
     const auto modify_start{Clock::now()};
     const auto modified{m_forest.ModifyBlock(delta.Value().additions,
                                              delta.Value().deletions,
@@ -215,7 +238,7 @@ Result<ProcessedBlock> SequentialSync::ProcessNext()
     metrics.modify_us = micros(modify_start);
     m_chain_hashes.push_back(fetched.Value().hash);
     metrics.total_us = micros(total_start);
-    return Result<ProcessedBlock>::Ok(ProcessedBlock{delta.Take(), metrics});
+    return Result<ProcessedBlock>::Ok(ProcessedBlock{delta.Take(), metrics, std::move(proof)});
 }
 
 } // namespace utreexo

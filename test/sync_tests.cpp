@@ -136,6 +136,36 @@ TEST(sequential_sync_detects_reorg)
     CHECK(active.Error().find("reorganization") != std::string::npos);
 }
 
+TEST(sequential_sync_captures_proof_before_block_mutation)
+{
+    FakeBlockSource source;
+    const Hash256 third_hash{Hash256::FromBitcoinHex(std::string(64, '4')).Value()};
+    source.hashes.push_back(third_hash);
+    source.blocks.push_back(Json(
+        "{\"hash\":\"" + third_hash.ToBitcoinHex() + "\",\"height\":2,\"previousblockhash\":\"" +
+        source.hashes[1].ToBitcoinHex() + "\",\"tx\":["
+        "{\"txid\":\"" + std::string(64, '6') +
+        "\",\"vin\":[{\"coinbase\":\"00\"}],\"vout\":[]},"
+        "{\"txid\":\"" + std::string(64, '5') +
+        "\",\"vin\":[{\"txid\":\"" + std::string(64, '3') +
+        "\",\"vout\":0,\"prevout\":{\"generated\":true,\"height\":1,"
+        "\"value\":50.0,\"scriptPubKey\":{\"hex\":\"51\"}}}],\"vout\":[]}]}"));
+
+    PackedForest forest;
+    SequentialSync sync{source, forest};
+    CHECK(sync.ProcessNext());
+    CHECK(sync.ProcessNext());
+    CHECK_EQ(forest.NumLeaves(), 1U);
+    sync.SetProofGeneration(true);
+    auto spent{sync.ProcessNext()};
+    CHECK(spent);
+    CHECK(spent.Value().proof.has_value());
+    CHECK_EQ(spent.Value().delta.deletions.size(), 1U);
+    CHECK_EQ(spent.Value().delta.proof_leaves.size(), 1U);
+    CHECK_EQ(spent.Value().proof->targets, (std::vector<uint64_t>{0}));
+    CHECK(spent.Value().proof->hashes.empty());
+}
+
 TEST(sequential_sync_prefetches_at_most_two_complete_blocks)
 {
     using namespace std::chrono_literals;
