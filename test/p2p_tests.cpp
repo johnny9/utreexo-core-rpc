@@ -1,5 +1,6 @@
 #include <test_framework.h>
 #include <utreexo/p2p.h>
+#include <utreexo/proof_store.h>
 
 #include <array>
 #include <arpa/inet.h>
@@ -7,6 +8,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <netinet/in.h>
 #include <span>
 #include <string>
@@ -196,6 +198,22 @@ TEST(uproof_serialization_matches_utreexod_field_order)
         "0104000000060000000000000002");
 }
 
+TEST(full_uproof_archive_roundtrip_is_strict)
+{
+    const auto proof{ExampleProof()};
+    auto serialized{SerializeUtreexoProof(proof, EntireRequest(proof.point.block_hash))};
+    CHECK(serialized);
+    auto parsed{ParseFullUtreexoProof(proof.point.height, serialized.Value())};
+    CHECK(parsed);
+    CHECK_EQ(parsed.Value().point, proof.point);
+    CHECK_EQ(parsed.Value().proof.targets, proof.proof.targets);
+    CHECK_EQ(parsed.Value().proof.hashes, proof.proof.hashes);
+    CHECK_EQ(parsed.Value().leaves, proof.leaves);
+    auto trailing{serialized.Value()};
+    trailing.push_back(std::byte{0});
+    CHECK(!ParseFullUtreexoProof(proof.point.height, trailing));
+}
+
 TEST(recent_proof_cache_bounds_memory_and_discards_reorgs)
 {
     RecentProofCache cache{2, 1024 * 1024};
@@ -328,4 +346,85 @@ TEST(p2p_server_handshakes_and_serves_floresta_proof_request)
 
     ::shutdown(socket, SHUT_RDWR);
     ::close(socket);
+}
+
+TEST(p2p_server_serves_archived_proof_when_ram_cache_is_empty)
+{
+    const auto path{std::filesystem::temp_directory_path() /
+        ("utreexo-p2p-proof-store-" + std::to_string(::getpid()))};
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(path, cleanup_error);
+    auto proof{ExampleProof(0x61, 42)};
+    const ChainPoint base{41, Hash256::FromHex(
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20").Value()};
+    BlockDelta delta{
+        .point = proof.point,
+        .previous_block_hash = base.block_hash,
+        .additions = {},
+        .deletions = {Hash256{}, Hash256{}},
+        .proof_leaves = proof.leaves,
+    };
+    auto opened{ProofStore::Open(ProofStoreConfig{
+        .directory = path,
+        .create_base = base,
+        .serializer_threads = 2,
+        .group_commit_blocks = 1,
+        .group_commit_delay_ms = 0,
+        .max_queued_blocks = 4,
+        .max_queued_bytes = 1024 * 1024,
+        .max_record_bytes = 1024 * 1024,
+    })};
+    CHECK(opened);
+    auto store{opened.Take()};
+    CHECK(store->Enqueue(delta, proof.proof));
+    CHECK(store->Drain());
+
+    auto cache{std::make_shared<RecentProofCache>(2, 1024 * 1024)};
+    cache->SetTip(proof.point.height);
+    auto started{P2PServer::Start(P2PServerConfig{
+        .network = BitcoinNetwork::REGTEST,
+        .bind_address = "127.0.0.1",
+        .port = 0,
+        .max_peers = 1,
+        .max_payload_bytes = 1024 * 1024,
+        .idle_timeout_seconds = 2,
+        .proof_wait_seconds = 0,
+        .user_agent = "/utreexo-archive-test:1/",
+    }, cache, store)};
+    if (!started && (started.Error().find("Operation not permitted") != std::string::npos ||
+                     started.Error().find("Permission denied") != std::string::npos)) {
+        store.reset();
+        std::filesystem::remove_all(path, cleanup_error);
+        return;
+    }
+    CHECK(started);
+    auto server{started.Take()};
+    const int socket{Connect(server->BoundPort())};
+    auto version{EncodeP2PMessage(BitcoinNetwork::REGTEST, "version", ClientVersion())};
+    CHECK(version);
+    SendBytes(socket, version.Value());
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "version");
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "verack");
+    auto verack{EncodeP2PMessage(BitcoinNetwork::REGTEST, "verack", {})};
+    CHECK(verack);
+    SendBytes(socket, verack.Value());
+
+    std::vector<std::byte> request_payload{
+        proof.point.block_hash.Bytes().begin(), proof.point.block_hash.Bytes().end()};
+    request_payload.insert(request_payload.end(), {std::byte{0x07}, std::byte{0}, std::byte{0}});
+    auto request{EncodeP2PMessage(BitcoinNetwork::REGTEST, "getuproof", request_payload)};
+    CHECK(request);
+    SendBytes(socket, request.Value());
+    auto response{ReadWireMessage(socket, BitcoinNetwork::REGTEST)};
+    CHECK_EQ(response.command, "uproof");
+    auto expected{SerializeUtreexoProof(proof, EntireRequest(proof.point.block_hash))};
+    CHECK(expected);
+    CHECK_EQ(response.payload, expected.Value());
+    CHECK_EQ(store->Stats().hits, 1U);
+
+    ::shutdown(socket, SHUT_RDWR);
+    ::close(socket);
+    server.reset();
+    store.reset();
+    std::filesystem::remove_all(path, cleanup_error);
 }

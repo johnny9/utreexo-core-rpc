@@ -8,6 +8,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, std::size_t size)
 {
     const auto bytes{std::span{reinterpret_cast<const std::byte*>(data), size}};
     static_cast<void>(utreexo::ParseGetUtreexoProof(bytes));
+    static_cast<void>(utreexo::ParseFullUtreexoProof(0, bytes));
     for (const auto network : {
              utreexo::BitcoinNetwork::MAINNET,
              utreexo::BitcoinNetwork::TESTNET3,

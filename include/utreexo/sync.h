@@ -8,8 +8,10 @@
 #include <utreexo/result.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace utreexo {
@@ -45,8 +47,15 @@ public:
     Result<void> ValidateCurrentPoint();
     /** Roll back an online forest until its point is on Core's active chain. */
     Result<uint32_t> ReconcileCurrentPoint();
+    /** Roll back an online forest to one exact retained chain point. */
+    Result<uint32_t> RollbackTo(const ChainPoint& point);
     /** Generate and verify deletion proofs against each block's pre-mutation forest. */
     void SetProofGeneration(bool enabled) { m_generate_proofs = enabled; }
+    /** Decide proof capture after parsing a block but before mutating the forest. */
+    void SetProofGenerationPolicy(std::function<Result<bool>(const BlockDelta&)> policy)
+    {
+        m_proof_policy = std::move(policy);
+    }
 
     const std::vector<Hash256>& ChainHashes() const { return m_chain_hashes; }
     std::optional<ChainPoint> CurrentPoint() const;
@@ -60,6 +69,7 @@ private:
     std::vector<Hash256> m_chain_hashes;
     std::unique_ptr<PrefetchState> m_prefetch;
     bool m_generate_proofs{false};
+    std::function<Result<bool>(const BlockDelta&)> m_proof_policy;
 };
 
 } // namespace utreexo

@@ -4,6 +4,7 @@
 
 #include <utreexo/hash.h>
 #include <utreexo/log.h>
+#include <utreexo/proof_store.h>
 
 #include <algorithm>
 #include <arpa/inet.h>
@@ -14,10 +15,12 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <iomanip>
 #include <limits>
 #include <mutex>
 #include <netinet/in.h>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -467,6 +470,80 @@ Result<std::vector<std::byte>> SerializeUtreexoProof(
     return Result<std::vector<std::byte>>::Ok(std::move(output));
 }
 
+Result<CachedBlockProof> ParseFullUtreexoProof(uint32_t height,
+                                              std::span<const std::byte> payload)
+{
+    ByteReader reader{payload};
+    auto block_bytes{reader.ReadBytes(Hash256::SIZE)};
+    if (!block_bytes) return Result<CachedBlockProof>::Err("truncated uproof block hash");
+    Hash256::Storage block_hash{};
+    std::copy(block_bytes.Value().begin(), block_bytes.Value().end(), block_hash.begin());
+
+    auto hash_count{reader.ReadCompactSize()};
+    if (!hash_count || hash_count.Value() > reader.Remaining() / Hash256::SIZE) {
+        return Result<CachedBlockProof>::Err("invalid uproof hash count");
+    }
+    std::vector<Hash256> hashes;
+    hashes.reserve(static_cast<std::size_t>(hash_count.Value()));
+    for (uint64_t i{0}; i < hash_count.Value(); ++i) {
+        auto bytes{reader.ReadBytes(Hash256::SIZE)};
+        if (!bytes) return Result<CachedBlockProof>::Err("truncated uproof hash");
+        Hash256::Storage hash{};
+        std::copy(bytes.Value().begin(), bytes.Value().end(), hash.begin());
+        hashes.emplace_back(hash);
+    }
+
+    auto target_count{reader.ReadCompactSize()};
+    if (!target_count || target_count.Value() > MAX_INPUTS_PER_BLOCK) {
+        return Result<CachedBlockProof>::Err("invalid uproof target count");
+    }
+    std::vector<uint64_t> targets;
+    targets.reserve(static_cast<std::size_t>(target_count.Value()));
+    for (uint64_t i{0}; i < target_count.Value(); ++i) {
+        auto target{reader.ReadCompactSize()};
+        if (!target) return Result<CachedBlockProof>::Err("invalid uproof target");
+        targets.push_back(target.Value());
+    }
+
+    auto leaf_count{reader.ReadCompactSize()};
+    if (!leaf_count || leaf_count.Value() != target_count.Value()) {
+        return Result<CachedBlockProof>::Err("uproof leaf count does not match targets");
+    }
+    std::vector<CompactLeafData> leaves;
+    leaves.reserve(static_cast<std::size_t>(leaf_count.Value()));
+    for (uint64_t i{0}; i < leaf_count.Value(); ++i) {
+        auto header_code{reader.ReadLE<uint32_t>()};
+        auto amount{reader.ReadLE<uint64_t>()};
+        auto type{reader.ReadLE<uint8_t>()};
+        if (!header_code || !amount || !type ||
+            type.Value() > static_cast<uint8_t>(ScriptPubkeyType::WITNESS_V0_SCRIPT_HASH)) {
+            return Result<CachedBlockProof>::Err("invalid compact leaf in uproof");
+        }
+        CompactLeafData leaf{
+            .header_code = header_code.Value(),
+            .amount = amount.Value(),
+            .script_type = static_cast<ScriptPubkeyType>(type.Value()),
+            .script = {},
+        };
+        if (leaf.script_type == ScriptPubkeyType::OTHER) {
+            auto script_size{reader.ReadCompactSize()};
+            if (!script_size || script_size.Value() > MAX_SCRIPT_BYTES) {
+                return Result<CachedBlockProof>::Err("invalid compact leaf script size");
+            }
+            auto script{reader.ReadBytes(static_cast<std::size_t>(script_size.Value()))};
+            if (!script) return Result<CachedBlockProof>::Err("truncated compact leaf script");
+            leaf.script = script.Take();
+        }
+        leaves.push_back(std::move(leaf));
+    }
+    if (reader.Remaining() != 0) return Result<CachedBlockProof>::Err("trailing uproof bytes");
+    return Result<CachedBlockProof>::Ok(CachedBlockProof{
+        .point = ChainPoint{height, Hash256{block_hash}},
+        .proof = Proof{std::move(targets), std::move(hashes)},
+        .leaves = std::move(leaves),
+    });
+}
+
 class RecentProofCache::Impl
 {
 public:
@@ -496,43 +573,64 @@ RecentProofCache::~RecentProofCache() = default;
 
 Result<void> RecentProofCache::Publish(const BlockDelta& delta, Proof proof)
 {
-    if (proof.targets.size() != delta.deletions.size() ||
-        delta.proof_leaves.size() != delta.deletions.size()) {
-        return Result<void>::Err("block proof does not align with its deletion leaves");
+    try {
+        if (proof.targets.size() != delta.deletions.size() ||
+            delta.proof_leaves.size() != delta.deletions.size()) {
+            return Result<void>::Err("block proof does not align with its deletion leaves");
+        }
+        auto record{std::make_shared<CachedBlockProof>(CachedBlockProof{
+            .point = delta.point,
+            .proof = std::move(proof),
+            .leaves = delta.proof_leaves,
+        })};
+        const uint64_t record_bytes{ProofBytes(*record)};
+        {
+            std::lock_guard lock{m_impl->mutex};
+            if (record_bytes > m_impl->max_bytes) {
+                return Result<void>::Err("one block proof exceeds the proof-cache byte limit");
+            }
+            if (const auto existing{m_impl->entries.find(delta.point.block_hash)};
+                existing != m_impl->entries.end()) {
+                m_impl->order.push_back(delta.point.block_hash);
+                auto newest{m_impl->order.end()};
+                --newest;
+                const auto old_order{std::find(m_impl->order.begin(), newest,
+                                               delta.point.block_hash)};
+                if (old_order != newest) m_impl->order.erase(old_order);
+                m_impl->bytes -= ProofBytes(*existing->second);
+                existing->second = std::move(record);
+                m_impl->bytes += record_bytes;
+            } else {
+                const auto [inserted, was_inserted]{
+                    m_impl->entries.emplace(delta.point.block_hash, record)};
+                if (!was_inserted) return Result<void>::Err("proof-cache insertion conflict");
+                try {
+                    m_impl->order.push_back(delta.point.block_hash);
+                } catch (...) {
+                    m_impl->entries.erase(inserted);
+                    throw;
+                }
+                m_impl->bytes += record_bytes;
+            }
+            m_impl->tip_height = delta.point.height;
+            while (!m_impl->order.empty() &&
+                   (m_impl->entries.size() > m_impl->max_blocks ||
+                    m_impl->bytes > m_impl->max_bytes)) {
+                const auto oldest{m_impl->order.front()};
+                m_impl->order.pop_front();
+                const auto entry{m_impl->entries.find(oldest)};
+                if (entry == m_impl->entries.end()) continue;
+                m_impl->bytes -= ProofBytes(*entry->second);
+                m_impl->entries.erase(entry);
+            }
+        }
+        m_impl->published.notify_all();
+        return Result<void>::Ok();
+    } catch (const std::bad_alloc&) {
+        return Result<void>::Err("proof cache allocation failed");
+    } catch (const std::exception& exception) {
+        return Result<void>::Err("proof cache update failed: " + std::string{exception.what()});
     }
-    auto record{std::make_shared<CachedBlockProof>(CachedBlockProof{
-        .point = delta.point,
-        .proof = std::move(proof),
-        .leaves = delta.proof_leaves,
-    })};
-    const uint64_t record_bytes{ProofBytes(*record)};
-    {
-        std::lock_guard lock{m_impl->mutex};
-        if (record_bytes > m_impl->max_bytes) {
-            return Result<void>::Err("one block proof exceeds the proof-cache byte limit");
-        }
-        if (const auto existing{m_impl->entries.find(delta.point.block_hash)};
-            existing != m_impl->entries.end()) {
-            m_impl->bytes -= ProofBytes(*existing->second);
-            m_impl->entries.erase(existing);
-            std::erase(m_impl->order, delta.point.block_hash);
-        }
-        m_impl->bytes += record_bytes;
-        m_impl->entries.emplace(delta.point.block_hash, std::move(record));
-        m_impl->order.push_back(delta.point.block_hash);
-        m_impl->tip_height = delta.point.height;
-        while (!m_impl->order.empty() &&
-               (m_impl->entries.size() > m_impl->max_blocks || m_impl->bytes > m_impl->max_bytes)) {
-            const auto oldest{m_impl->order.front()};
-            m_impl->order.pop_front();
-            const auto entry{m_impl->entries.find(oldest)};
-            if (entry == m_impl->entries.end()) continue;
-            m_impl->bytes -= ProofBytes(*entry->second);
-            m_impl->entries.erase(entry);
-        }
-    }
-    m_impl->published.notify_all();
-    return Result<void>::Ok();
 }
 
 std::shared_ptr<const CachedBlockProof> RecentProofCache::Find(const Hash256& block_hash) const
@@ -603,9 +701,9 @@ public:
     };
 
     Impl(P2PServerConfig server_config, std::shared_ptr<RecentProofCache> proof_cache,
-         int listener_socket, uint16_t actual_port)
+         std::shared_ptr<ProofStore> proof_store, int listener_socket, uint16_t actual_port)
         : config{std::move(server_config)}, cache{std::move(proof_cache)},
-          listener{listener_socket}, bound_port{actual_port}
+          store{std::move(proof_store)}, listener{listener_socket}, bound_port{actual_port}
     {
     }
 
@@ -656,7 +754,17 @@ public:
                 auto done{std::make_shared<std::atomic<bool>>(false)};
                 client_workers.push_back(ClientWorker{
                     .thread = std::thread{[this, socket, address, done] {
-                        ClientLoop(socket, address);
+                        try {
+                            ClientLoop(socket, address);
+                        } catch (const std::bad_alloc&) {
+                            Log(LogLevel::ERROR, "p2p_peer_allocation_failed",
+                                "action=disconnect");
+                            RemoveClient(socket);
+                        } catch (const std::exception& exception) {
+                            Log(LogLevel::ERROR, "p2p_peer_exception",
+                                "error=" + Quoted(exception.what()) + " action=disconnect");
+                            RemoveClient(socket);
+                        }
                         done->store(true);
                     }},
                     .done = std::move(done),
@@ -801,9 +909,30 @@ public:
                 disconnect_reason = request.Error();
                 break;
             }
-            const auto proof{cache->WaitFor(
-                request.Value().block_hash,
-                std::chrono::seconds(config.proof_wait_seconds))};
+            auto proof{cache->Find(request.Value().block_hash)};
+            if (!proof && store) {
+                auto archived{store->Read(request.Value().block_hash)};
+                if (!archived) {
+                    disconnect_reason = "proof archive read failed: " + archived.Error();
+                    Log(LogLevel::ERROR, "p2p_proof_store_read_failed",
+                        "block_hash=" + request.Value().block_hash.ToBitcoinHex() +
+                        " error=" + Quoted(archived.Error()));
+                    break;
+                }
+                proof = archived.Take();
+            }
+            if (!proof) {
+                proof = cache->WaitFor(request.Value().block_hash,
+                                       std::chrono::seconds(config.proof_wait_seconds));
+            }
+            if (!proof && store) {
+                auto archived{store->Read(request.Value().block_hash)};
+                if (!archived) {
+                    disconnect_reason = "proof archive read failed: " + archived.Error();
+                    break;
+                }
+                proof = archived.Take();
+            }
             if (!proof) {
                 Log(LogLevel::DEBUG, "p2p_proof_miss",
                     "block_hash=" + request.Value().block_hash.ToBitcoinHex());
@@ -837,6 +966,7 @@ public:
 
     P2PServerConfig config;
     std::shared_ptr<RecentProofCache> cache;
+    std::shared_ptr<ProofStore> store;
     int listener{-1};
     uint16_t bound_port{0};
     std::atomic<bool> stopping{false};
@@ -852,7 +982,8 @@ P2PServer::P2PServer(std::unique_ptr<Impl> impl) : m_impl{std::move(impl)} {}
 P2PServer::~P2PServer() = default;
 
 Result<std::unique_ptr<P2PServer>> P2PServer::Start(
-    P2PServerConfig config, std::shared_ptr<RecentProofCache> cache)
+    P2PServerConfig config, std::shared_ptr<RecentProofCache> cache,
+    std::shared_ptr<ProofStore> store)
 {
     if (!cache) return Result<std::unique_ptr<P2PServer>>::Err("P2P proof cache is null");
     if (config.max_peers == 0 || config.max_peers > 1'024) {
@@ -893,7 +1024,8 @@ Result<std::unique_ptr<P2PServer>> P2PServer::Start(
     }
     const uint16_t bound_port{PeerPort(address)};
     config.port = bound_port;
-    auto impl{std::make_unique<Impl>(std::move(config), std::move(cache), listener, bound_port)};
+    auto impl{std::make_unique<Impl>(std::move(config), std::move(cache), std::move(store),
+                                     listener, bound_port)};
     impl->Start();
     auto server{std::unique_ptr<P2PServer>{new P2PServer{std::move(impl)}}};
     return Result<std::unique_ptr<P2PServer>>::Ok(std::move(server));

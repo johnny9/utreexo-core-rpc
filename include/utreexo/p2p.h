@@ -18,6 +18,8 @@
 
 namespace utreexo {
 
+class ProofStore;
+
 enum class BitcoinNetwork : uint8_t { MAINNET, TESTNET3, SIGNET, REGTEST };
 
 Result<BitcoinNetwork> ParseBitcoinNetwork(std::string_view value);
@@ -52,6 +54,9 @@ Result<P2PMessage> DecodeP2PMessage(BitcoinNetwork network,
 Result<GetUtreexoProofRequest> ParseGetUtreexoProof(std::span<const std::byte> payload);
 Result<std::vector<std::byte>> SerializeUtreexoProof(
     const CachedBlockProof& proof, const GetUtreexoProofRequest& request);
+/** Decode the full (bitmap 0x07) uproof representation used by the proof archive. */
+Result<CachedBlockProof> ParseFullUtreexoProof(uint32_t height,
+                                              std::span<const std::byte> payload);
 
 struct ProofCacheStats {
     uint64_t entries{0};
@@ -99,7 +104,8 @@ class P2PServer
 {
 public:
     static Result<std::unique_ptr<P2PServer>> Start(
-        P2PServerConfig config, std::shared_ptr<RecentProofCache> cache);
+        P2PServerConfig config, std::shared_ptr<RecentProofCache> cache,
+        std::shared_ptr<ProofStore> store = {});
     ~P2PServer();
     P2PServer(const P2PServer&) = delete;
     P2PServer& operator=(const P2PServer&) = delete;

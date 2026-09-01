@@ -166,6 +166,56 @@ TEST(sequential_sync_captures_proof_before_block_mutation)
     CHECK(spent.Value().proof->hashes.empty());
 }
 
+TEST(sequential_sync_proof_policy_runs_before_forest_mutation)
+{
+    FakeBlockSource source;
+    const Hash256 third_hash{Hash256::FromBitcoinHex(std::string(64, '4')).Value()};
+    source.hashes.push_back(third_hash);
+    source.blocks.push_back(Json(
+        "{\"hash\":\"" + third_hash.ToBitcoinHex() + "\",\"height\":2,\"previousblockhash\":\"" +
+        source.hashes[1].ToBitcoinHex() + "\",\"tx\":["
+        "{\"txid\":\"" + std::string(64, '6') +
+        "\",\"vin\":[{\"coinbase\":\"00\"}],\"vout\":[]},"
+        "{\"txid\":\"" + std::string(64, '5') +
+        "\",\"vin\":[{\"txid\":\"" + std::string(64, '3') +
+        "\",\"vout\":0,\"prevout\":{\"generated\":true,\"height\":1,"
+        "\"value\":50.0,\"scriptPubKey\":{\"hex\":\"51\"}}}],\"vout\":[]}]}"));
+
+    PackedForest forest;
+    SequentialSync sync{source, forest};
+    CHECK(sync.ProcessNext());
+    CHECK(sync.ProcessNext());
+    bool policy_called{false};
+    sync.SetProofGenerationPolicy([&](const BlockDelta& delta) -> Result<bool> {
+        policy_called = true;
+        CHECK_EQ(delta.point.height, 2U);
+        CHECK_EQ(forest.NumLeaves(), 1U);
+        return Result<bool>::Ok(true);
+    });
+    auto processed{sync.ProcessNext()};
+    CHECK(processed);
+    CHECK(policy_called);
+    CHECK(processed.Value().proof.has_value());
+    CHECK_EQ(forest.NumLeaves(), 1U);
+}
+
+TEST(sequential_sync_proof_policy_error_leaves_forest_unchanged)
+{
+    FakeBlockSource source;
+    PackedForest forest;
+    SequentialSync sync{source, forest};
+    CHECK(sync.ProcessNext());
+    const auto before{sync.CurrentPoint()};
+    sync.SetProofGenerationPolicy([](const BlockDelta&) {
+        return Result<bool>::Err("archive unavailable");
+    });
+    auto failed{sync.ProcessNext()};
+    CHECK(!failed);
+    CHECK(failed.Error().find("archive unavailable") != std::string::npos);
+    CHECK_EQ(sync.CurrentPoint(), before);
+    CHECK_EQ(forest.NumLeaves(), 0U);
+}
+
 TEST(sequential_sync_prefetches_at_most_two_complete_blocks)
 {
     using namespace std::chrono_literals;
@@ -206,6 +256,13 @@ TEST(sequential_sync_reconciles_online_reorg_from_wal)
         CHECK(sync.ProcessNext());
         CHECK_EQ(sync.CurrentPoint()->height, 1U);
         CHECK_EQ(forest.NumLeaves(), 1U);
+
+        auto explicitly_rolled_back{sync.RollbackTo(ChainPoint{0, source.hashes[0]})};
+        CHECK(explicitly_rolled_back);
+        CHECK_EQ(explicitly_rolled_back.Value(), 1U);
+        CHECK_EQ(sync.CurrentPoint()->height, 0U);
+        CHECK_EQ(forest.NumLeaves(), 0U);
+        CHECK(sync.ProcessNext());
 
         source.hashes[1] = Hash256::FromBitcoinHex(std::string(64, 'f')).Value();
         const auto reconciled{sync.ReconcileCurrentPoint()};

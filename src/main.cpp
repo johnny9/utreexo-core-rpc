@@ -4,6 +4,7 @@
 #include <utreexo/core_rpc.h>
 #include <utreexo/log.h>
 #include <utreexo/p2p.h>
+#include <utreexo/proof_store.h>
 #include <utreexo/sync.h>
 
 #include <algorithm>
@@ -39,12 +40,18 @@ struct Options {
     std::filesystem::path cookie;
     std::optional<std::filesystem::path> checkpoint;
     std::optional<std::filesystem::path> online_state;
+    std::optional<std::filesystem::path> proof_store;
     std::optional<std::filesystem::path> state_json;
     std::optional<uint32_t> stop_height;
     uint32_t checkpoint_interval{0};
     uint64_t online_cache_mib{0};
     uint64_t online_wal_segment_mib{256};
     uint32_t online_undo_depth{1'008};
+    uint32_t proof_store_threads{2};
+    uint32_t proof_store_group_blocks{32};
+    uint32_t proof_store_group_delay_ms{0};
+    uint32_t proof_store_queue_blocks{1'008};
+    uint64_t proof_store_queue_mib{256};
     uint32_t poll_interval_ms{5'000};
     std::string p2p_bind{"127.0.0.1"};
     std::optional<uint16_t> p2p_port;
@@ -104,9 +111,15 @@ void Usage()
         << "  --online-cache-mib=N        Dirty-node cache (default: 128 on <=20GiB, else 512)\n"
         << "  --online-wal-segment-mib=N  WAL segment size (default 256)\n"
         << "  --online-undo-depth=N       Retained WAL before-image window (default 1008)\n"
+        << "  --proof-store=DIR           Durable checkpoint-to-tip AssumeUtreexo proofs\n"
+        << "  --proof-store-threads=N     Parallel proof serializers (default 2)\n"
+        << "  --proof-store-group-blocks=N  Maximum proofs per fsync group (default 32)\n"
+        << "  --proof-store-group-delay-ms=N  Timed partial-group flush (default 0: disabled)\n"
+        << "  --proof-store-queue-blocks=N  Pipeline/recovery window (default 1008)\n"
+        << "  --proof-store-queue-mib=N   Pipeline memory ceiling (default 256)\n"
         << "  --follow                    Poll Core and remain online after the initial sync\n"
         << "  --poll-interval-ms=N        Follow-mode Core tip poll interval (default 5000)\n"
-        << "  --p2p-port=N                Serve recent getuproof requests over Bitcoin v1 P2P\n"
+        << "  --p2p-port=N                Serve cached/archived getuproof over Bitcoin v1 P2P\n"
         << "  --p2p-bind=IP               P2P IPv4 bind address: 127.0.0.1 or 0.0.0.0\n"
         << "  --p2p-network=NETWORK       mainnet, testnet3, signet, or regtest\n"
         << "  --p2p-max-peers=N           Maximum inbound proof peers (default 16)\n"
@@ -146,6 +159,8 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
             options.checkpoint = std::filesystem::path{*checkpoint};
         } else if (auto online_state{value("--online-state")}) {
             options.online_state = std::filesystem::path{*online_state};
+        } else if (auto proof_store{value("--proof-store")}) {
+            options.proof_store = std::filesystem::path{*proof_store};
         } else if (auto interval{value("--checkpoint-interval")}) {
             if (!ParseInteger(*interval, options.checkpoint_interval)) {
                 return utreexo::Result<Options>::Err("invalid --checkpoint-interval");
@@ -163,6 +178,33 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
         } else if (auto depth{value("--online-undo-depth")}) {
             if (!ParseInteger(*depth, options.online_undo_depth) || options.online_undo_depth == 0) {
                 return utreexo::Result<Options>::Err("invalid --online-undo-depth");
+            }
+        } else if (auto threads{value("--proof-store-threads")}) {
+            if (!ParseInteger(*threads, options.proof_store_threads) ||
+                options.proof_store_threads == 0 || options.proof_store_threads > 64) {
+                return utreexo::Result<Options>::Err("invalid --proof-store-threads");
+            }
+        } else if (auto group_blocks{value("--proof-store-group-blocks")}) {
+            if (!ParseInteger(*group_blocks, options.proof_store_group_blocks) ||
+                options.proof_store_group_blocks == 0 || options.proof_store_group_blocks > 4'096) {
+                return utreexo::Result<Options>::Err("invalid --proof-store-group-blocks");
+            }
+        } else if (auto delay{value("--proof-store-group-delay-ms")}) {
+            if (!ParseInteger(*delay, options.proof_store_group_delay_ms) ||
+                options.proof_store_group_delay_ms > 10'000) {
+                return utreexo::Result<Options>::Err("invalid --proof-store-group-delay-ms");
+            }
+        } else if (auto queue_blocks{value("--proof-store-queue-blocks")}) {
+            if (!ParseInteger(*queue_blocks, options.proof_store_queue_blocks) ||
+                options.proof_store_queue_blocks == 0) {
+                return utreexo::Result<Options>::Err("invalid --proof-store-queue-blocks");
+            }
+        } else if (auto queue{value("--proof-store-queue-mib")}) {
+            if (!ParseInteger(*queue, options.proof_store_queue_mib) ||
+                options.proof_store_queue_mib == 0 ||
+                options.proof_store_queue_mib > std::numeric_limits<uint64_t>::max() /
+                                                     (1024ULL * 1024)) {
+                return utreexo::Result<Options>::Err("invalid --proof-store-queue-mib");
             }
         } else if (auto poll{value("--poll-interval-ms")}) {
             if (!ParseInteger(*poll, options.poll_interval_ms) || options.poll_interval_ms == 0) {
@@ -185,8 +227,8 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
                 options.p2p_max_peers > 1'024) {
                 return utreexo::Result<Options>::Err("invalid --p2p-max-peers");
             }
-        } else if (auto blocks{value("--p2p-proof-cache-blocks")}) {
-            if (!ParseInteger(*blocks, options.p2p_proof_cache_blocks) ||
+        } else if (auto cache_blocks{value("--p2p-proof-cache-blocks")}) {
+            if (!ParseInteger(*cache_blocks, options.p2p_proof_cache_blocks) ||
                 options.p2p_proof_cache_blocks == 0) {
                 return utreexo::Result<Options>::Err("invalid --p2p-proof-cache-blocks");
             }
@@ -314,6 +356,36 @@ void LogOnlineBreakdown(std::string_view phase, uint32_t height,
         " last_transaction_wal_bytes=" + std::to_string(usage.last_transaction_wal_bytes));
 }
 
+void LogProofStoreBreakdown(std::string_view phase, const utreexo::ProofStore& store)
+{
+    if (!utreexo::LogEnabled(utreexo::LogLevel::DEBUG)) return;
+    const auto stats{store.Stats()};
+    utreexo::Log(utreexo::LogLevel::DEBUG, "proof_store",
+        "phase=" + std::string{phase} +
+        " base_height=" + std::to_string(stats.base_height) +
+        " durable_height=" + std::to_string(stats.durable_height) +
+        " enqueued_height=" + std::to_string(stats.enqueued_height) +
+        " active_proofs=" + std::to_string(stats.active_proofs) +
+        " queued_blocks=" + std::to_string(stats.queued_blocks) +
+        " queued_bytes=" + std::to_string(stats.queued_bytes) +
+        " peak_queued_blocks=" + std::to_string(stats.peak_queued_blocks) +
+        " peak_queued_bytes=" + std::to_string(stats.peak_queued_bytes) +
+        " data_bytes=" + std::to_string(stats.data_bytes) +
+        " wal_bytes=" + std::to_string(stats.wal_bytes) +
+        " mmap_index_bytes=" + std::to_string(stats.index_bytes) +
+        " serialized_proofs=" + std::to_string(stats.serialized_proofs) +
+        " serialized_bytes=" + std::to_string(stats.serialized_bytes) +
+        " largest_record_bytes=" + std::to_string(stats.largest_record_bytes) +
+        " enqueue_wait_us=" + std::to_string(stats.enqueue_wait_us) +
+        " serialization_us=" + std::to_string(stats.serialization_us) +
+        " committed_batches=" + std::to_string(stats.committed_batches) +
+        " commit_us=" + std::to_string(stats.commit_us) +
+        " data_syncs=" + std::to_string(stats.data_syncs) +
+        " data_sync_us=" + std::to_string(stats.data_sync_us) +
+        " wal_syncs=" + std::to_string(stats.wal_syncs) +
+        " wal_sync_us=" + std::to_string(stats.wal_sync_us));
+}
+
 utreexo::Result<void> WriteStateJson(const std::filesystem::path& path,
                                      const utreexo::ChainPoint& point,
                                      const utreexo::PackedForest& forest)
@@ -348,7 +420,8 @@ int main(int argc, char** argv)
         std::cout << "utreexo-bridge " << UTREEXO_BRIDGE_VERSION
                   << " checkpoint_format=" << utreexo::CHECKPOINT_FORMAT_VERSION
                   << " forest_format="
-                  << utreexo::PackedForest::FORMAT_VERSION << '\n';
+                  << utreexo::PackedForest::FORMAT_VERSION
+                  << " proof_store_format=" << utreexo::ProofStore::FORMAT_VERSION << '\n';
         return 0;
     }
     utreexo::SetLogLevel(options.log_level);
@@ -357,6 +430,7 @@ int main(int argc, char** argv)
         " checkpoint_format=" + std::to_string(utreexo::CHECKPOINT_FORMAT_VERSION) +
         " forest_format=" +
         std::to_string(utreexo::PackedForest::FORMAT_VERSION) +
+        " proof_store_format=" + std::to_string(utreexo::ProofStore::FORMAT_VERSION) +
         " log_level=" + std::string{utreexo::LogLevelName(options.log_level)});
     if (options.authorization.empty()) {
         auto cookie{utreexo::ReadCookieAuthorization(options.cookie)};
@@ -455,11 +529,232 @@ int main(int argc, char** argv)
                 " recovered_height=" + std::to_string(sync.CurrentPoint()->height));
         }
     }
+
+    std::shared_ptr<utreexo::ProofStore> proof_store;
+    if (options.proof_store) {
+        constexpr uint64_t MIB{1024ULL * 1024};
+        utreexo::Log(utreexo::LogLevel::INFO, "proof_store_open_started",
+            "path=" + PathField(*options.proof_store) +
+            " serializer_threads=" + std::to_string(options.proof_store_threads) +
+            " queue_blocks=" + std::to_string(options.proof_store_queue_blocks) +
+            " queue_bytes=" + std::to_string(options.proof_store_queue_mib * MIB) +
+            " group_commit_blocks=" + std::to_string(options.proof_store_group_blocks) +
+            " group_commit_delay_ms=" + std::to_string(options.proof_store_group_delay_ms));
+        auto opened{utreexo::ProofStore::Open(utreexo::ProofStoreConfig{
+            .directory = *options.proof_store,
+            .create_base = sync.CurrentPoint(),
+            .serializer_threads = options.proof_store_threads,
+            .group_commit_blocks = options.proof_store_group_blocks,
+            .group_commit_delay_ms = options.proof_store_group_delay_ms,
+            .max_queued_blocks = options.proof_store_queue_blocks,
+            .max_queued_bytes = options.proof_store_queue_mib * MIB,
+            .max_record_bytes = 64ULL * MIB,
+        })};
+        if (!opened) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_open_failed",
+                "path=" + PathField(*options.proof_store) +
+                " error=" + StringField(opened.Error()) + " action=fail_closed");
+            return 1;
+        }
+        proof_store = opened.Take();
+        const auto base{proof_store->BasePoint()};
+        auto archive_tip{proof_store->DurablePoint()};
+        auto forest_point{sync.CurrentPoint()};
+        if (!forest_point) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_alignment_failed",
+                "reason=no_forest_chain_point action=load_assumeutreexo_checkpoint");
+            return 1;
+        }
+        if (forest_point->height >= base.height) {
+            const uint32_t overlap_height{std::min(forest_point->height, archive_tip.height)};
+            auto overlap_hash{proof_store->HashAt(overlap_height)};
+            if (!overlap_hash || !overlap_hash.Value()) {
+                utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_alignment_failed",
+                    "height=" + std::to_string(overlap_height) +
+                    " reason=missing_archive_height error=" +
+                    StringField(overlap_hash ? std::string{"none"} : overlap_hash.Error()));
+                return 1;
+            }
+            const bool overlap_matches{
+                sync.ChainHashes()[overlap_height] == *overlap_hash.Value()};
+            utreexo::ChainPoint common{overlap_height, sync.ChainHashes()[overlap_height]};
+            if (!overlap_matches) {
+                bool found_common{false};
+                uint32_t candidate{overlap_height};
+                while (true) {
+                    auto stored{proof_store->HashAt(candidate)};
+                    if (!stored || !stored.Value()) {
+                        utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_alignment_failed",
+                            "height=" + std::to_string(candidate) +
+                            " reason=archive_index_gap");
+                        return 1;
+                    }
+                    if (sync.ChainHashes()[candidate] == *stored.Value()) {
+                        common = utreexo::ChainPoint{candidate, *stored.Value()};
+                        found_common = true;
+                        break;
+                    }
+                    if (candidate == base.height) break;
+                    --candidate;
+                }
+                if (!found_common) {
+                    utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_alignment_failed",
+                        "base_height=" + std::to_string(base.height) +
+                        " reason=archive_base_not_in_forest_chain action=use_matching_checkpoint");
+                    return 1;
+                }
+                if (!forest.IsOnline() && forest_point->height != common.height) {
+                    utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_alignment_failed",
+                        "forest_height=" + std::to_string(forest_point->height) +
+                        " common_height=" + std::to_string(common.height) +
+                        " reason=ram_checkpoint_cannot_rollback action=use_matching_checkpoint");
+                    return 1;
+                }
+                auto truncated{proof_store->Truncate(common)};
+                if (!truncated) {
+                    utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_truncate_failed",
+                        "height=" + std::to_string(common.height) +
+                        " error=" + StringField(truncated.Error()));
+                    return 1;
+                }
+                if (forest_point->height > common.height) {
+                    auto rolled_back{sync.RollbackTo(common)};
+                    if (!rolled_back) {
+                        utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_alignment_failed",
+                            "height=" + std::to_string(common.height) +
+                            " error=" + StringField(rolled_back.Error()) +
+                            " action=restore_checkpoint_within_online_undo_window");
+                        return 1;
+                    }
+                    utreexo::Log(utreexo::LogLevel::WARN, "proof_store_forest_rolled_back",
+                        "disconnected_blocks=" + std::to_string(rolled_back.Value()) +
+                        " recovered_height=" + std::to_string(common.height) +
+                        " reason=archive_chain_mismatch");
+                }
+                archive_tip = common;
+                forest_point = sync.CurrentPoint();
+            } else if (forest_point->height > archive_tip.height) {
+                if (!forest.IsOnline()) {
+                    utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_alignment_failed",
+                        "forest_height=" + std::to_string(forest_point->height) +
+                        " archive_height=" + std::to_string(archive_tip.height) +
+                        " reason=checkpoint_ahead_of_durable_proofs action=use_earlier_checkpoint");
+                    return 1;
+                }
+                auto rolled_back{sync.RollbackTo(archive_tip)};
+                if (!rolled_back) {
+                    utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_alignment_failed",
+                        "archive_height=" + std::to_string(archive_tip.height) +
+                        " error=" + StringField(rolled_back.Error()) +
+                        " action=restore_checkpoint_within_online_undo_window");
+                    return 1;
+                }
+                forest_point = sync.CurrentPoint();
+                utreexo::Log(utreexo::LogLevel::WARN, "proof_store_forest_rolled_back",
+                    "disconnected_blocks=" + std::to_string(rolled_back.Value()) +
+                    " recovered_height=" + std::to_string(forest_point->height) +
+                    " reason=forest_ahead_of_durable_proof_wal");
+            }
+        }
+        utreexo::Log(utreexo::LogLevel::INFO, "proof_store_opened",
+            "path=" + PathField(*options.proof_store) +
+            " base_height=" + std::to_string(base.height) +
+            " durable_height=" + std::to_string(proof_store->DurablePoint().height) +
+            " forest_height=" + std::to_string(sync.CurrentPoint()->height) +
+            " data_wal_order=proofs_dat_then_index_wal"
+            " mmap_index=rebuildable wal_sync=group_commit");
+        LogProofStoreBreakdown("open", *proof_store);
+
+        sync.SetProofGenerationPolicy([proof_store, &forest](const utreexo::BlockDelta& delta)
+            -> utreexo::Result<bool> {
+            const auto base_point{proof_store->BasePoint()};
+            if (delta.point.height < base_point.height) {
+                return utreexo::Result<bool>::Ok(false);
+            }
+            if (delta.point.height == base_point.height) {
+                if (delta.point != base_point) {
+                    return utreexo::Result<bool>::Err(
+                        "active block does not match the proof-store AssumeUtreexo base");
+                }
+                return utreexo::Result<bool>::Ok(false);
+            }
+            const auto durable{proof_store->DurablePoint()};
+            if (delta.point.height <= durable.height) {
+                auto archived{proof_store->HashAt(delta.point.height)};
+                if (!archived || !archived.Value()) {
+                    return utreexo::Result<bool>::Err(
+                        archived ? "proof archive has a height gap" : archived.Error());
+                }
+                if (*archived.Value() == delta.point.block_hash) {
+                    auto record{proof_store->Read(delta.point.block_hash)};
+                    if (!record || !record.Value()) {
+                        return utreexo::Result<bool>::Err(record ?
+                            "proof archive hash index has no corresponding record" : record.Error());
+                    }
+                    std::vector<utreexo::Hash256> roots;
+                    roots.reserve(forest.Roots().size());
+                    for (const auto& root : forest.Roots()) {
+                        if (!root) {
+                            return utreexo::Result<bool>::Err(
+                                "pre-block forest contains a missing root");
+                        }
+                        roots.push_back(*root);
+                    }
+                    auto verified{utreexo::VerifyProof(record.Value()->proof, delta.deletions,
+                                                       roots, forest.NumLeaves())};
+                    const bool leaves_match{record.Value()->leaves == delta.proof_leaves};
+                    if (verified && verified.Value() && leaves_match) {
+                        return utreexo::Result<bool>::Ok(false);
+                    }
+                    const utreexo::ChainPoint previous{
+                        delta.point.height - 1, delta.previous_block_hash};
+                    auto truncated{proof_store->Truncate(previous)};
+                    if (!truncated) return utreexo::Result<bool>::Err(truncated.Error());
+                    utreexo::Log(utreexo::LogLevel::WARN, "proof_store_proof_rejected",
+                        "height=" + std::to_string(delta.point.height) +
+                        " proof_valid=" + std::string{verified && verified.Value() ? "true" : "false"} +
+                        " leaves_match=" + std::string{leaves_match ? "true" : "false"} +
+                        " action=truncate_and_regenerate");
+                    return utreexo::Result<bool>::Ok(true);
+                }
+                const utreexo::ChainPoint previous{
+                    delta.point.height - 1, delta.previous_block_hash};
+                auto truncated{proof_store->Truncate(previous)};
+                if (!truncated) return utreexo::Result<bool>::Err(truncated.Error());
+                utreexo::Log(utreexo::LogLevel::WARN, "proof_store_branch_truncated",
+                    "new_tip_height=" + std::to_string(previous.height) +
+                    " conflicting_height=" + std::to_string(delta.point.height) +
+                    " action=regenerate_active_branch");
+            }
+            return utreexo::Result<bool>::Ok(true);
+        });
+    }
     auto tip{sync.TipHeight()};
     if (!tip) {
         utreexo::Log(utreexo::LogLevel::ERROR, "core_tip_failed",
                      "error=" + StringField(tip.Error()));
         return 1;
+    }
+    if (proof_store) {
+        const auto base{proof_store->BasePoint()};
+        if (base.height > tip.Value() || proof_store->DurablePoint().height > tip.Value()) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_alignment_failed",
+                "core_tip_height=" + std::to_string(tip.Value()) +
+                " proof_base_height=" + std::to_string(base.height) +
+                " proof_tip_height=" + std::to_string(proof_store->DurablePoint().height) +
+                " reason=proof_store_ahead_of_core");
+            return 1;
+        }
+        auto active_base{source.BlockHash(base.height)};
+        if (!active_base || active_base.Value() != base.block_hash) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_alignment_failed",
+                "base_height=" + std::to_string(base.height) +
+                " base_hash=" + base.block_hash.ToBitcoinHex() +
+                " reason=assumeutreexo_base_not_on_core_active_chain" +
+                (active_base ? " active_hash=" + active_base.Value().ToBitcoinHex() :
+                               " error=" + StringField(active_base.Error())));
+            return 1;
+        }
     }
     const uint32_t target{options.stop_height ? std::min(*options.stop_height, tip.Value()) : tip.Value()};
     utreexo::Log(utreexo::LogLevel::INFO, "sync_started",
@@ -467,7 +762,9 @@ int main(int argc, char** argv)
         " target_height=" + std::to_string(target) +
         " core_tip_height=" + std::to_string(tip.Value()) +
         " storage_mode=" + std::string{loaded_online ? "mmap_wal" : "ram_bootstrap"} +
-        " prefetch_blocks=2 rpc_transport=persistent json_parser=streaming_projection");
+        " prefetch_blocks=2 rpc_transport=persistent json_parser=streaming_projection" +
+        std::string{proof_store ? " proof_pipeline=ordered_parallel proof_wal=group_commit" :
+                                  " proof_pipeline=disabled"});
     const auto prefetch_started{sync.StartPrefetch(target)};
     if (!prefetch_started) {
         utreexo::Log(utreexo::LogLevel::ERROR, "prefetch_start_failed",
@@ -478,6 +775,18 @@ int main(int argc, char** argv)
     const auto save_checkpoint = [&](const utreexo::ChainPoint& point,
                                      std::string_view reason) -> utreexo::Result<void> {
         if (!options.checkpoint) return utreexo::Result<void>::Ok();
+        if (proof_store) {
+            auto drained{proof_store->Drain()};
+            if (!drained) {
+                return utreexo::Result<void>::Err(
+                    "proof store could not reach the checkpoint height: " + drained.Error());
+            }
+            if (proof_store->DurablePoint().height < point.height &&
+                point.height > proof_store->BasePoint().height) {
+                return utreexo::Result<void>::Err(
+                    "proof store is behind the requested checkpoint height");
+            }
+        }
         std::error_code space_error;
         const auto space{std::filesystem::space(options.checkpoint->parent_path().empty() ?
                                                     std::filesystem::path{"."} :
@@ -572,6 +881,40 @@ int main(int argc, char** argv)
                 " error=" + StringField(block.Error()));
             return 1;
         }
+        if (proof_store && block.Value().proof) {
+            utreexo::Result<void> queued{utreexo::Result<void>::Err("uninitialized proof enqueue")};
+            try {
+                queued = proof_store->Enqueue(block.Value().delta,
+                                              std::move(*block.Value().proof));
+            } catch (const std::bad_alloc&) {
+                sync.StopPrefetch();
+                utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
+                    "phase=proof_pipeline_enqueue safe_forest_height=" +
+                    std::to_string(block.Value().delta.point.height) +
+                    " durable_proof_height=" +
+                    std::to_string(proof_store->DurablePoint().height) +
+                    " action=stop recovery=restart_from_checkpoint_and_reuse_proof_store");
+                return 2;
+            }
+            if (!queued) {
+                sync.StopPrefetch();
+                utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_enqueue_failed",
+                    "height=" + std::to_string(block.Value().delta.point.height) +
+                    " error=" + StringField(queued.Error()) + " action=stop");
+                return 1;
+            }
+            if (forest.IsOnline()) {
+                auto durable{proof_store->WaitDurable(block.Value().delta.point.height)};
+                if (!durable) {
+                    sync.StopPrefetch();
+                    utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_commit_failed",
+                        "height=" + std::to_string(block.Value().delta.point.height) +
+                        " error=" + StringField(durable.Error()) +
+                        " action=stop_recover_by_online_wal_rollback");
+                    return 1;
+                }
+            }
+        }
         const uint32_t height{block.Value().delta.point.height};
         interval.Add(height, block.Value().metrics);
         overall.Add(height, block.Value().metrics);
@@ -603,6 +946,7 @@ int main(int argc, char** argv)
                 " blocks_per_second_milli=" + std::to_string(blocks_per_second_milli));
             LogMemoryBreakdown("sync_progress", height, forest);
             LogOnlineBreakdown("sync_progress", height, forest);
+            if (proof_store) LogProofStoreBreakdown("sync_progress", *proof_store);
             if (utreexo::LogEnabled(utreexo::LogLevel::DEBUG) && interval.blocks != 0) {
                 utreexo::Log(utreexo::LogLevel::DEBUG, "block_timing_window",
                     "height=" + std::to_string(height) +
@@ -634,6 +978,20 @@ int main(int argc, char** argv)
     }
 
     sync.StopPrefetch();
+    if (proof_store) {
+        auto drained{proof_store->Drain()};
+        if (!drained) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_drain_failed",
+                "height=" + std::to_string(sync.CurrentPoint() ? sync.CurrentPoint()->height : 0) +
+                " error=" + StringField(drained.Error()) + " action=stop");
+            return 1;
+        }
+        utreexo::Log(utreexo::LogLevel::INFO, "proof_store_durable",
+            "height=" + std::to_string(proof_store->DurablePoint().height) +
+            " forest_height=" + std::to_string(sync.CurrentPoint()->height) +
+            " reason=before_validation_and_online_switch");
+        LogProofStoreBreakdown("initial_sync_drain", *proof_store);
+    }
     const auto active_point{sync.ValidateCurrentPoint()};
     if (!active_point) {
         utreexo::Log(utreexo::LogLevel::ERROR, "sync_failed",
@@ -695,7 +1053,7 @@ int main(int argc, char** argv)
         proof_cache = std::make_shared<utreexo::RecentProofCache>(
             options.p2p_proof_cache_blocks, options.p2p_proof_cache_mib * MIB);
         proof_cache->SetTip(sync.CurrentPoint()->height);
-        sync.SetProofGeneration(true);
+        if (!proof_store) sync.SetProofGeneration(true);
         auto started{utreexo::P2PServer::Start(utreexo::P2PServerConfig{
             .network = options.p2p_network,
             .bind_address = options.p2p_bind,
@@ -704,7 +1062,7 @@ int main(int argc, char** argv)
             .max_payload_bytes = 32U * 1024U * 1024U,
             .idle_timeout_seconds = 120,
             .user_agent = "/utreexo-bridge:" UTREEXO_BRIDGE_VERSION "/",
-        }, proof_cache)};
+        }, proof_cache, proof_store)};
         if (!started) {
             utreexo::Log(utreexo::LogLevel::ERROR, "p2p_listen_failed",
                 "bind=" + StringField(options.p2p_bind) +
@@ -719,8 +1077,12 @@ int main(int argc, char** argv)
             " services=NODE_UTREEXO transport=v1 archive=false"
             " cache_blocks=" + std::to_string(options.p2p_proof_cache_blocks) +
             " cache_bytes=" + std::to_string(options.p2p_proof_cache_mib * MIB) +
-            " cached_proofs=0 cache_persistence=disposable"
-            " note=proofs_become_available_as_new_blocks_are_followed");
+            " cached_proofs=0 cache_persistence=disposable" +
+            (proof_store ?
+                " proof_store=true proof_base_height=" +
+                    std::to_string(proof_store->BasePoint().height) +
+                    " proof_tip_height=" + std::to_string(proof_store->DurablePoint().height) :
+                " proof_store=false note=proofs_become_available_as_new_blocks_are_followed"));
     }
 
     if (options.follow) {
@@ -732,7 +1094,9 @@ int main(int argc, char** argv)
         utreexo::Log(utreexo::LogLevel::INFO, "online_follow_started",
             "height=" + std::to_string(sync.CurrentPoint()->height) +
             " poll_interval_ms=" + std::to_string(options.poll_interval_ms) +
-            " wal_sync=per_block");
+            " forest_wal_sync=per_block" +
+            std::string{proof_store ? " proof_wal_sync=before_tip_publication" :
+                                      " proof_wal_sync=disabled"});
         auto last_base_flush{Clock::now()};
         while (true) {
             const auto reconciled{sync.ReconcileCurrentPoint()};
@@ -745,6 +1109,15 @@ int main(int argc, char** argv)
                 return 1;
             }
             if (reconciled.Value() != 0) {
+                if (proof_store) {
+                    auto truncated{proof_store->Truncate(*sync.CurrentPoint())};
+                    if (!truncated) {
+                        utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_truncate_failed",
+                            "height=" + std::to_string(sync.CurrentPoint()->height) +
+                            " error=" + StringField(truncated.Error()) + " action=stop");
+                        return 1;
+                    }
+                }
                 if (proof_cache) proof_cache->DiscardAfter(sync.CurrentPoint()->height);
                 utreexo::Log(utreexo::LogLevel::WARN, "online_reorg_rolled_back",
                     "disconnected_blocks=" + std::to_string(reconciled.Value()) +
@@ -789,6 +1162,54 @@ int main(int argc, char** argv)
                             " error=" + StringField(block.Error()));
                         return 1;
                     }
+                    uint64_t proof_commit_us{0};
+                    if (proof_store) {
+                        const auto proof_commit_start{Clock::now()};
+                        if (!block.Value().proof) {
+                            sync.StopPrefetch();
+                            utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_capture_failed",
+                                "height=" + std::to_string(block.Value().delta.point.height) +
+                                " reason=missing_generated_proof action=stop");
+                            return 1;
+                        }
+                        utreexo::Result<void> queued{
+                            utreexo::Result<void>::Err("uninitialized online proof enqueue")};
+                        try {
+                            queued = proof_store->Enqueue(
+                                block.Value().delta,
+                                proof_cache ? *block.Value().proof :
+                                              std::move(*block.Value().proof));
+                        } catch (const std::bad_alloc&) {
+                            sync.StopPrefetch();
+                            utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
+                                "phase=online_proof_pipeline safe_forest_height=" +
+                                std::to_string(block.Value().delta.point.height) +
+                                " durable_proof_height=" +
+                                std::to_string(proof_store->DurablePoint().height) +
+                                " action=stop recovery=rollback_forest_wal_to_proof_tip");
+                            return 2;
+                        }
+                        if (!queued) {
+                            sync.StopPrefetch();
+                            utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_enqueue_failed",
+                                "height=" + std::to_string(block.Value().delta.point.height) +
+                                " error=" + StringField(queued.Error()) +
+                                " action=stop_recover_by_online_wal_rollback");
+                            return 1;
+                        }
+                        auto durable{proof_store->WaitDurable(block.Value().delta.point.height)};
+                        if (!durable) {
+                            sync.StopPrefetch();
+                            utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_commit_failed",
+                                "height=" + std::to_string(block.Value().delta.point.height) +
+                                " error=" + StringField(durable.Error()) +
+                                " action=stop_recover_by_online_wal_rollback");
+                            return 1;
+                        }
+                        proof_commit_us = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                Clock::now() - proof_commit_start).count());
+                    }
                     if (proof_cache) {
                         if (!block.Value().proof) {
                             sync.StopPrefetch();
@@ -810,6 +1231,8 @@ int main(int argc, char** argv)
                     const auto storage{forest.OnlineUsage()};
                     const auto cache_stats{proof_cache ? proof_cache->Stats() :
                         utreexo::ProofCacheStats{}};
+                    const auto proof_stats{proof_store ? proof_store->Stats() :
+                        utreexo::ProofStoreStats{}};
                     utreexo::Log(utreexo::LogLevel::INFO, "online_block_committed",
                         "height=" + std::to_string(block.Value().delta.point.height) +
                         " block_hash=" + block.Value().delta.point.block_hash.ToBitcoinHex() +
@@ -824,6 +1247,14 @@ int main(int argc, char** argv)
                         " transaction_nodes=" + std::to_string(storage.last_transaction_nodes) +
                         " transaction_wal_bytes=" + std::to_string(storage.last_transaction_wal_bytes) +
                         " lsn=" + std::to_string(storage.current_lsn) +
+                        (proof_store ? " proof_durable_height=" +
+                                           std::to_string(proof_stats.durable_height) +
+                                       " proof_commit_us=" +
+                                           std::to_string(proof_commit_us) +
+                                       " proof_data_bytes=" +
+                                           std::to_string(proof_stats.data_bytes) +
+                                       " proof_wal_bytes=" +
+                                           std::to_string(proof_stats.wal_bytes) : "") +
                         (proof_cache ? " proof_cache_entries=" + std::to_string(cache_stats.entries) +
                                        " proof_cache_bytes=" + std::to_string(cache_stats.bytes) : ""));
                 }
@@ -923,6 +1354,7 @@ int main(int argc, char** argv)
             " checkpoint_format=" + std::to_string(utreexo::CHECKPOINT_FORMAT_VERSION) +
             " forest_format=" +
             std::to_string(utreexo::PackedForest::FORMAT_VERSION) +
+            " proof_store_format=" + std::to_string(utreexo::ProofStore::FORMAT_VERSION) +
             " height=" + std::to_string(sync.CurrentPoint()->height) +
             " block_hash=" + sync.CurrentPoint()->block_hash.ToBitcoinHex() +
             " num_leaves=" + std::to_string(forest.NumLeaves()) +
@@ -931,7 +1363,16 @@ int main(int argc, char** argv)
             " storage_mode=" + std::string{forest.IsOnline() ? "mmap_wal" : "ram_checkpoint"} +
             " online_base_bytes=" + std::to_string(forest.OnlineUsage().base_bytes) +
             " online_wal_bytes=" + std::to_string(forest.OnlineUsage().wal_bytes) +
-            " online_base_lsn=" + std::to_string(forest.OnlineUsage().base_lsn));
+            " online_base_lsn=" + std::to_string(forest.OnlineUsage().base_lsn) +
+            (proof_store ? " proof_base_height=" +
+                               std::to_string(proof_store->BasePoint().height) +
+                           " proof_durable_height=" +
+                               std::to_string(proof_store->DurablePoint().height) +
+                           " proof_data_bytes=" +
+                               std::to_string(proof_store->Stats().data_bytes) +
+                           " proof_wal_bytes=" +
+                               std::to_string(proof_store->Stats().wal_bytes) :
+                           " proof_store=disabled"));
     }
     utreexo::Log(utreexo::LogLevel::INFO, "sync_complete",
                  "height=" + std::to_string(sync.CurrentPoint() ? sync.CurrentPoint()->height : 0));

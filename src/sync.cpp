@@ -163,6 +163,36 @@ Result<uint32_t> SequentialSync::ReconcileCurrentPoint()
     }
 }
 
+Result<uint32_t> SequentialSync::RollbackTo(const ChainPoint& target)
+{
+    const auto current{CurrentPoint()};
+    if (!current) return Result<uint32_t>::Err("cannot roll back an empty chain point");
+    if (target.height > current->height) {
+        return Result<uint32_t>::Err("rollback target is above the current point");
+    }
+    if (!m_forest.IsOnline() && target != *current) {
+        return Result<uint32_t>::Err("explicit rollback requires online WAL before-images");
+    }
+    uint32_t disconnected{0};
+    while (m_chain_hashes.size() - 1 > target.height) {
+        const auto previous{CurrentPoint()};
+        auto rolled_back{m_forest.RollbackOnlineBlock()};
+        if (!rolled_back) return Result<uint32_t>::Err(rolled_back.Error());
+        if (!previous || m_chain_hashes.size() < 2 ||
+            rolled_back.Value().height + 1 != previous->height ||
+            m_chain_hashes[rolled_back.Value().height] != rolled_back.Value().block_hash) {
+            return Result<uint32_t>::Err("online rollback returned a non-contiguous chain point");
+        }
+        m_chain_hashes.pop_back();
+        ++disconnected;
+    }
+    const auto recovered{CurrentPoint()};
+    if (!recovered || *recovered != target) {
+        return Result<uint32_t>::Err("rollback target hash is not in the retained online chain");
+    }
+    return Result<uint32_t>::Ok(disconnected);
+}
+
 std::optional<ChainPoint> SequentialSync::CurrentPoint() const
 {
     if (m_chain_hashes.empty()) return std::nullopt;
@@ -207,8 +237,16 @@ Result<ProcessedBlock> SequentialSync::ProcessNext()
         return Result<ProcessedBlock>::Err("block does not connect to the sidecar chain tip");
     }
 
+    bool generate_proof{m_generate_proofs};
+    if (m_proof_policy) {
+        auto decision{m_proof_policy(delta.Value())};
+        if (!decision) {
+            return Result<ProcessedBlock>::Err("proof-generation policy failed: " + decision.Error());
+        }
+        generate_proof = decision.Value();
+    }
     std::optional<Proof> proof;
-    if (m_generate_proofs) {
+    if (generate_proof) {
         auto generated{m_forest.Prove(delta.Value().deletions)};
         if (!generated) {
             return Result<ProcessedBlock>::Err("could not generate pre-block proof: " + generated.Error());

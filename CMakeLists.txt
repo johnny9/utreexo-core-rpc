@@ -75,7 +75,7 @@ target_include_directories(utreexo_accumulator PUBLIC include)
 target_compile_features(utreexo_accumulator PUBLIC cxx_std_20)
 utreexo_configure_target(utreexo_accumulator)
 
-add_library(utreexo_p2p src/p2p.cpp)
+add_library(utreexo_p2p src/p2p.cpp src/proof_store.cpp)
 target_include_directories(utreexo_p2p PUBLIC include)
 target_compile_features(utreexo_p2p PUBLIC cxx_std_20)
 target_link_libraries(utreexo_p2p PUBLIC utreexo_accumulator utreexo_logging Threads::Threads)
@@ -170,6 +170,7 @@ if(BUILD_TESTING)
         test/checkpoint_tests.cpp
         test/bridge_wire_tests.cpp
         test/p2p_tests.cpp
+        test/proof_store_tests.cpp
         test/log_tests.cpp
     )
     target_link_libraries(utreexo_tests PRIVATE utreexo_accumulator utreexo_checkpoint utreexo_logging utreexo_p2p)
