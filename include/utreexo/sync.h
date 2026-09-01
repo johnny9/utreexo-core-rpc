@@ -17,12 +17,23 @@
 namespace utreexo {
 
 struct BlockProcessingMetrics {
+    /** Time ProcessNext waited for the prefetched block (or fetched synchronously). */
+    uint64_t fetch_wait_us{0};
     uint64_t chain_check_us{0};
     uint64_t block_hash_us{0};
     uint64_t block_fetch_us{0};
     uint64_t parse_us{0};
+    uint64_t proof_policy_us{0};
+    uint64_t prove_us{0};
+    uint64_t verify_us{0};
     uint64_t modify_us{0};
+    /** Filled by the bridge executable after ProcessNext returns. */
+    uint64_t proof_enqueue_us{0};
+    uint64_t proof_durable_wait_us{0};
+    /** SequentialSync work through the durable forest mutation. */
     uint64_t total_us{0};
+    /** Full caller iteration; initially equal to total_us. */
+    uint64_t end_to_end_us{0};
 };
 
 struct ProcessedBlock {

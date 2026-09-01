@@ -109,9 +109,16 @@ TEST(proof_store_pipeline_commits_in_height_order_and_reopens)
         CHECK(store->Drain());
         CHECK_EQ(store->BasePoint(), base);
         CHECK_EQ(store->DurablePoint(), blocks.back().delta.point);
-        CHECK_EQ(store->Stats().active_proofs, blocks.size());
-        CHECK_EQ(store->Stats().queued_blocks, 0U);
-        CHECK(store->Stats().committed_batches >= 1U);
+        const auto stats{store->Stats()};
+        CHECK_EQ(stats.active_proofs, blocks.size());
+        CHECK_EQ(stats.queued_blocks, 0U);
+        CHECK_EQ(stats.committed_proofs, blocks.size());
+        CHECK_EQ(stats.full_batches + stats.partial_batches, stats.committed_batches);
+        CHECK(stats.committed_batches >= 1U);
+        CHECK(stats.largest_batch_proofs >= 1U);
+        CHECK(stats.largest_batch_proofs <= 4U);
+        CHECK(stats.peak_input_blocks >= 1U);
+        CHECK(stats.peak_ready_blocks >= 1U);
         for (const auto& block : blocks) {
             auto read{store->Read(block.delta.point.block_hash)};
             CHECK(read);
@@ -159,8 +166,14 @@ TEST(proof_store_zero_delay_flushes_on_queue_backpressure)
     CHECK(store->Drain());
     const ChainPoint expected{205, previous};
     CHECK_EQ(store->DurablePoint(), expected);
-    CHECK_EQ(store->Stats().queued_blocks, 0U);
-    CHECK(store->Stats().committed_batches >= 2U);
+    const auto stats{store->Stats()};
+    CHECK_EQ(stats.queued_blocks, 0U);
+    CHECK_EQ(stats.committed_proofs, 5U);
+    CHECK(stats.committed_batches >= 2U);
+    CHECK(stats.enqueue_blocked >= 1U);
+    CHECK(stats.backpressure_flushes >= 1U);
+    CHECK(stats.durability_waits >= 1U);
+    CHECK(stats.partial_batches >= 1U);
     Cleanup(path);
 }
 

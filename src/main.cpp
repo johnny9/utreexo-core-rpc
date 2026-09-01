@@ -22,7 +22,9 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <sys/resource.h>
 #include <thread>
+#include <type_traits>
 #include <unistd.h>
 
 namespace {
@@ -66,30 +68,157 @@ struct Options {
 
 struct IntervalMetrics {
     uint64_t blocks{0};
+    uint64_t generated_proofs{0};
+    uint64_t fetch_wait_us{0};
     uint64_t chain_check_us{0};
     uint64_t block_hash_us{0};
     uint64_t block_fetch_us{0};
     uint64_t parse_us{0};
+    uint64_t proof_policy_us{0};
+    uint64_t prove_us{0};
+    uint64_t verify_us{0};
     uint64_t modify_us{0};
+    uint64_t proof_enqueue_us{0};
+    uint64_t proof_durable_wait_us{0};
     uint64_t total_us{0};
-    uint64_t slowest_us{0};
-    uint32_t slowest_height{0};
+    uint64_t end_to_end_us{0};
+    uint64_t slowest_total_us{0};
+    uint32_t slowest_total_height{0};
+    uint64_t slowest_end_to_end_us{0};
+    uint32_t slowest_end_to_end_height{0};
 
-    void Add(uint32_t height, const utreexo::BlockProcessingMetrics& metrics)
+    void Add(uint32_t height, const utreexo::BlockProcessingMetrics& metrics,
+             bool generated_proof)
     {
         ++blocks;
+        if (generated_proof) ++generated_proofs;
+        fetch_wait_us += metrics.fetch_wait_us;
         chain_check_us += metrics.chain_check_us;
         block_hash_us += metrics.block_hash_us;
         block_fetch_us += metrics.block_fetch_us;
         parse_us += metrics.parse_us;
+        proof_policy_us += metrics.proof_policy_us;
+        prove_us += metrics.prove_us;
+        verify_us += metrics.verify_us;
         modify_us += metrics.modify_us;
+        proof_enqueue_us += metrics.proof_enqueue_us;
+        proof_durable_wait_us += metrics.proof_durable_wait_us;
         total_us += metrics.total_us;
-        if (metrics.total_us > slowest_us) {
-            slowest_us = metrics.total_us;
-            slowest_height = height;
+        end_to_end_us += metrics.end_to_end_us;
+        if (metrics.total_us > slowest_total_us) {
+            slowest_total_us = metrics.total_us;
+            slowest_total_height = height;
+        }
+        if (metrics.end_to_end_us > slowest_end_to_end_us) {
+            slowest_end_to_end_us = metrics.end_to_end_us;
+            slowest_end_to_end_height = height;
         }
     }
 };
+
+struct ProcessResources {
+    bool rusage_available{false};
+    bool proc_status_available{false};
+    bool proc_io_available{false};
+    uint64_t rss_bytes{0};
+    uint64_t peak_rss_bytes{0};
+    uint64_t rss_anon_bytes{0};
+    uint64_t rss_file_bytes{0};
+    uint64_t rss_shmem_bytes{0};
+    uint64_t minor_faults{0};
+    uint64_t major_faults{0};
+    uint64_t user_cpu_us{0};
+    uint64_t system_cpu_us{0};
+    uint64_t voluntary_context_switches{0};
+    uint64_t involuntary_context_switches{0};
+    uint64_t io_read_chars{0};
+    uint64_t io_write_chars{0};
+    uint64_t io_read_syscalls{0};
+    uint64_t io_write_syscalls{0};
+    uint64_t io_read_bytes{0};
+    uint64_t io_write_bytes{0};
+    uint64_t io_cancelled_write_bytes{0};
+};
+
+template <typename T>
+uint64_t NonNegative(T value)
+{
+    if constexpr (std::is_signed_v<T>) {
+        if (value <= 0) return 0;
+    }
+    return static_cast<uint64_t>(value);
+}
+
+uint64_t SaturatingMultiply(uint64_t value, uint64_t factor)
+{
+    return factor != 0 && value > std::numeric_limits<uint64_t>::max() / factor ?
+        std::numeric_limits<uint64_t>::max() : value * factor;
+}
+
+uint64_t TimevalMicros(const timeval& value)
+{
+    const uint64_t seconds{NonNegative(value.tv_sec)};
+    const uint64_t micros{NonNegative(value.tv_usec)};
+    const uint64_t scaled{SaturatingMultiply(seconds, 1'000'000)};
+    return micros > std::numeric_limits<uint64_t>::max() - scaled ?
+        std::numeric_limits<uint64_t>::max() : scaled + micros;
+}
+
+ProcessResources ReadProcessResources()
+{
+    ProcessResources result;
+    rusage usage{};
+    if (::getrusage(RUSAGE_SELF, &usage) == 0) {
+        result.rusage_available = true;
+        result.minor_faults = NonNegative(usage.ru_minflt);
+        result.major_faults = NonNegative(usage.ru_majflt);
+        result.user_cpu_us = TimevalMicros(usage.ru_utime);
+        result.system_cpu_us = TimevalMicros(usage.ru_stime);
+        result.voluntary_context_switches = NonNegative(usage.ru_nvcsw);
+        result.involuntary_context_switches = NonNegative(usage.ru_nivcsw);
+#if defined(__APPLE__)
+        result.peak_rss_bytes = NonNegative(usage.ru_maxrss);
+#else
+        result.peak_rss_bytes = SaturatingMultiply(NonNegative(usage.ru_maxrss), 1'024);
+#endif
+    }
+#if defined(__linux__)
+    {
+        std::ifstream status{"/proc/self/status"};
+        std::string line;
+        while (std::getline(status, line)) {
+            std::istringstream fields{line};
+            std::string name;
+            uint64_t value{0};
+            std::string unit;
+            if (!(fields >> name >> value >> unit) || unit != "kB") continue;
+            const uint64_t bytes{SaturatingMultiply(value, 1'024)};
+            if (name == "VmRSS:") result.rss_bytes = bytes;
+            else if (name == "VmHWM:") result.peak_rss_bytes = std::max(result.peak_rss_bytes, bytes);
+            else if (name == "RssAnon:") result.rss_anon_bytes = bytes;
+            else if (name == "RssFile:") result.rss_file_bytes = bytes;
+            else if (name == "RssShmem:") result.rss_shmem_bytes = bytes;
+        }
+        result.proc_status_available = static_cast<bool>(status) || status.eof();
+    }
+    {
+        std::ifstream io{"/proc/self/io"};
+        std::string name;
+        uint64_t value{0};
+        while (io >> name >> value) {
+            if (name == "rchar:") result.io_read_chars = value;
+            else if (name == "wchar:") result.io_write_chars = value;
+            else if (name == "syscr:") result.io_read_syscalls = value;
+            else if (name == "syscw:") result.io_write_syscalls = value;
+            else if (name == "read_bytes:") result.io_read_bytes = value;
+            else if (name == "write_bytes:") result.io_write_bytes = value;
+            else if (name == "cancelled_write_bytes:") result.io_cancelled_write_bytes = value;
+        }
+        result.proc_io_available = io.eof();
+    }
+#endif
+    return result;
+}
 
 template <typename T>
 bool ParseInteger(std::string_view text, T& output)
@@ -314,6 +443,39 @@ std::string StringField(std::string_view value)
     return output.str();
 }
 
+void LogProcessResources(std::string_view phase, uint32_t height)
+{
+    if (!utreexo::LogEnabled(utreexo::LogLevel::DEBUG)) return;
+    const auto usage{ReadProcessResources()};
+    utreexo::Log(utreexo::LogLevel::DEBUG, "process_resources",
+        "phase=" + std::string{phase} +
+        " height=" + std::to_string(height) +
+        " rusage_available=" + std::string{usage.rusage_available ? "true" : "false"} +
+        " proc_status_available=" +
+            std::string{usage.proc_status_available ? "true" : "false"} +
+        " proc_io_available=" + std::string{usage.proc_io_available ? "true" : "false"} +
+        " rss_bytes=" + std::to_string(usage.rss_bytes) +
+        " peak_rss_bytes=" + std::to_string(usage.peak_rss_bytes) +
+        " rss_anon_bytes=" + std::to_string(usage.rss_anon_bytes) +
+        " rss_file_bytes=" + std::to_string(usage.rss_file_bytes) +
+        " rss_shmem_bytes=" + std::to_string(usage.rss_shmem_bytes) +
+        " minor_faults=" + std::to_string(usage.minor_faults) +
+        " major_faults=" + std::to_string(usage.major_faults) +
+        " user_cpu_us=" + std::to_string(usage.user_cpu_us) +
+        " system_cpu_us=" + std::to_string(usage.system_cpu_us) +
+        " voluntary_context_switches=" +
+            std::to_string(usage.voluntary_context_switches) +
+        " involuntary_context_switches=" +
+            std::to_string(usage.involuntary_context_switches) +
+        " io_read_chars=" + std::to_string(usage.io_read_chars) +
+        " io_write_chars=" + std::to_string(usage.io_write_chars) +
+        " io_read_syscalls=" + std::to_string(usage.io_read_syscalls) +
+        " io_write_syscalls=" + std::to_string(usage.io_write_syscalls) +
+        " io_read_bytes=" + std::to_string(usage.io_read_bytes) +
+        " io_write_bytes=" + std::to_string(usage.io_write_bytes) +
+        " io_cancelled_write_bytes=" + std::to_string(usage.io_cancelled_write_bytes));
+}
+
 void LogMemoryBreakdown(std::string_view phase, uint32_t height,
                         const utreexo::PackedForest& forest)
 {
@@ -353,13 +515,24 @@ void LogOnlineBreakdown(std::string_view phase, uint32_t height,
         " base_lsn=" + std::to_string(usage.base_lsn) +
         " current_lsn=" + std::to_string(usage.current_lsn) +
         " last_transaction_nodes=" + std::to_string(usage.last_transaction_nodes) +
-        " last_transaction_wal_bytes=" + std::to_string(usage.last_transaction_wal_bytes));
+        " last_transaction_wal_bytes=" + std::to_string(usage.last_transaction_wal_bytes) +
+        " last_transaction_serialize_us=" +
+            std::to_string(usage.last_transaction_serialize_us) +
+        " last_transaction_segment_us=" +
+            std::to_string(usage.last_transaction_segment_us) +
+        " last_transaction_write_us=" + std::to_string(usage.last_transaction_write_us) +
+        " last_transaction_sync_us=" + std::to_string(usage.last_transaction_sync_us) +
+        " last_transaction_publish_us=" +
+            std::to_string(usage.last_transaction_publish_us) +
+        " last_transaction_total_us=" + std::to_string(usage.last_transaction_total_us));
 }
 
 void LogProofStoreBreakdown(std::string_view phase, const utreexo::ProofStore& store)
 {
     if (!utreexo::LogEnabled(utreexo::LogLevel::DEBUG)) return;
     const auto stats{store.Stats()};
+    const uint64_t average_batch_milli{stats.committed_batches == 0 ? 0 :
+        stats.committed_proofs * 1'000 / stats.committed_batches};
     utreexo::Log(utreexo::LogLevel::DEBUG, "proof_store",
         "phase=" + std::string{phase} +
         " base_height=" + std::to_string(stats.base_height) +
@@ -368,8 +541,15 @@ void LogProofStoreBreakdown(std::string_view phase, const utreexo::ProofStore& s
         " active_proofs=" + std::to_string(stats.active_proofs) +
         " queued_blocks=" + std::to_string(stats.queued_blocks) +
         " queued_bytes=" + std::to_string(stats.queued_bytes) +
+        " input_blocks=" + std::to_string(stats.input_blocks) +
+        " ready_blocks=" + std::to_string(stats.ready_blocks) +
         " peak_queued_blocks=" + std::to_string(stats.peak_queued_blocks) +
         " peak_queued_bytes=" + std::to_string(stats.peak_queued_bytes) +
+        " peak_input_blocks=" + std::to_string(stats.peak_input_blocks) +
+        " peak_ready_blocks=" + std::to_string(stats.peak_ready_blocks) +
+        " enqueue_blocked=" + std::to_string(stats.enqueue_blocked) +
+        " backpressure_flushes=" + std::to_string(stats.backpressure_flushes) +
+        " durability_waits=" + std::to_string(stats.durability_waits) +
         " data_bytes=" + std::to_string(stats.data_bytes) +
         " wal_bytes=" + std::to_string(stats.wal_bytes) +
         " mmap_index_bytes=" + std::to_string(stats.index_bytes) +
@@ -378,12 +558,22 @@ void LogProofStoreBreakdown(std::string_view phase, const utreexo::ProofStore& s
         " largest_record_bytes=" + std::to_string(stats.largest_record_bytes) +
         " enqueue_wait_us=" + std::to_string(stats.enqueue_wait_us) +
         " serialization_us=" + std::to_string(stats.serialization_us) +
+        " committed_proofs=" + std::to_string(stats.committed_proofs) +
         " committed_batches=" + std::to_string(stats.committed_batches) +
+        " full_batches=" + std::to_string(stats.full_batches) +
+        " partial_batches=" + std::to_string(stats.partial_batches) +
+        " largest_batch_proofs=" + std::to_string(stats.largest_batch_proofs) +
+        " average_batch_milli=" + std::to_string(average_batch_milli) +
         " commit_us=" + std::to_string(stats.commit_us) +
+        " data_write_us=" + std::to_string(stats.data_write_us) +
         " data_syncs=" + std::to_string(stats.data_syncs) +
         " data_sync_us=" + std::to_string(stats.data_sync_us) +
+        " wal_write_us=" + std::to_string(stats.wal_write_us) +
         " wal_syncs=" + std::to_string(stats.wal_syncs) +
-        " wal_sync_us=" + std::to_string(stats.wal_sync_us));
+        " wal_sync_us=" + std::to_string(stats.wal_sync_us) +
+        " index_publish_us=" + std::to_string(stats.index_publish_us) +
+        " hits=" + std::to_string(stats.hits) +
+        " misses=" + std::to_string(stats.misses));
 }
 
 utreexo::Result<void> WriteStateJson(const std::filesystem::path& path,
@@ -432,6 +622,7 @@ int main(int argc, char** argv)
         std::to_string(utreexo::PackedForest::FORMAT_VERSION) +
         " proof_store_format=" + std::to_string(utreexo::ProofStore::FORMAT_VERSION) +
         " log_level=" + std::string{utreexo::LogLevelName(options.log_level)});
+    LogProcessResources("sidecar_start", 0);
     if (options.authorization.empty()) {
         auto cookie{utreexo::ReadCookieAuthorization(options.cookie)};
         if (!cookie) {
@@ -470,6 +661,7 @@ int main(int argc, char** argv)
             " path=" + PathField(*options.online_state));
         LogMemoryBreakdown("online_state_loaded", recovered_point.height, forest);
         LogOnlineBreakdown("online_state_loaded", recovered_point.height, forest);
+        LogProcessResources("online_state_loaded", recovered_point.height);
     } else if (options.checkpoint && std::filesystem::exists(*options.checkpoint)) {
         utreexo::Log(utreexo::LogLevel::INFO, "checkpoint_load_started",
                      "path=" + PathField(*options.checkpoint));
@@ -503,6 +695,7 @@ int main(int argc, char** argv)
                 " total_us=" + std::to_string(checkpoint_metrics.total_us));
         }
         LogMemoryBreakdown("checkpoint_loaded", loaded_height, forest);
+        LogProcessResources("checkpoint_loaded", loaded_height);
     }
 
     utreexo::HttpRpcConfig rpc_config{
@@ -664,6 +857,7 @@ int main(int argc, char** argv)
             " data_wal_order=proofs_dat_then_index_wal"
             " mmap_index=rebuildable wal_sync=group_commit");
         LogProofStoreBreakdown("open", *proof_store);
+        LogProcessResources("proof_store_opened", sync.CurrentPoint()->height);
 
         sync.SetProofGenerationPolicy([proof_store, &forest](const utreexo::BlockDelta& delta)
             -> utreexo::Result<bool> {
@@ -808,6 +1002,7 @@ int main(int argc, char** argv)
             " path=" + PathField(*options.checkpoint) +
             " bytes=" + std::to_string(metrics.final_bytes) +
             " total_us=" + std::to_string(metrics.total_us));
+        LogProcessResources("checkpoint_saved", point.height);
         if (utreexo::LogEnabled(utreexo::LogLevel::DEBUG)) {
             std::error_code after_error;
             const auto after{std::filesystem::space(options.checkpoint->parent_path().empty() ?
@@ -835,6 +1030,7 @@ int main(int argc, char** argv)
     const auto sync_wall_start{Clock::now()};
 
     while (sync.ChainHashes().size() <= target) {
+        const auto block_iteration_start{Clock::now()};
         utreexo::Result<utreexo::ProcessedBlock> block{utreexo::Result<utreexo::ProcessedBlock>::Err("uninitialized")};
         try {
             block = sync.ProcessNext();
@@ -881,8 +1077,10 @@ int main(int argc, char** argv)
                 " error=" + StringField(block.Error()));
             return 1;
         }
+        const bool generated_proof{block.Value().proof.has_value()};
         if (proof_store && block.Value().proof) {
             utreexo::Result<void> queued{utreexo::Result<void>::Err("uninitialized proof enqueue")};
+            const auto enqueue_start{Clock::now()};
             try {
                 queued = proof_store->Enqueue(block.Value().delta,
                                               std::move(*block.Value().proof));
@@ -896,6 +1094,9 @@ int main(int argc, char** argv)
                     " action=stop recovery=restart_from_checkpoint_and_reuse_proof_store");
                 return 2;
             }
+            block.Value().metrics.proof_enqueue_us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    Clock::now() - enqueue_start).count());
             if (!queued) {
                 sync.StopPrefetch();
                 utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_enqueue_failed",
@@ -904,7 +1105,11 @@ int main(int argc, char** argv)
                 return 1;
             }
             if (forest.IsOnline()) {
+                const auto durable_wait_start{Clock::now()};
                 auto durable{proof_store->WaitDurable(block.Value().delta.point.height)};
+                block.Value().metrics.proof_durable_wait_us = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        Clock::now() - durable_wait_start).count());
                 if (!durable) {
                     sync.StopPrefetch();
                     utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_commit_failed",
@@ -915,21 +1120,33 @@ int main(int argc, char** argv)
                 }
             }
         }
+        block.Value().metrics.end_to_end_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                Clock::now() - block_iteration_start).count());
         const uint32_t height{block.Value().delta.point.height};
-        interval.Add(height, block.Value().metrics);
-        overall.Add(height, block.Value().metrics);
+        interval.Add(height, block.Value().metrics, generated_proof);
+        overall.Add(height, block.Value().metrics, generated_proof);
         if (utreexo::LogEnabled(utreexo::LogLevel::TRACE)) {
             utreexo::Log(utreexo::LogLevel::TRACE, "block_processed",
                 "height=" + std::to_string(height) +
                 " block_hash=" + block.Value().delta.point.block_hash.ToBitcoinHex() +
                 " additions=" + std::to_string(block.Value().delta.additions.size()) +
                 " deletions=" + std::to_string(block.Value().delta.deletions.size()) +
+                " generated_proof=" + std::string{generated_proof ? "true" : "false"} +
+                " fetch_wait_us=" + std::to_string(block.Value().metrics.fetch_wait_us) +
                 " chain_check_us=" + std::to_string(block.Value().metrics.chain_check_us) +
                 " block_hash_us=" + std::to_string(block.Value().metrics.block_hash_us) +
                 " block_fetch_us=" + std::to_string(block.Value().metrics.block_fetch_us) +
                 " parse_us=" + std::to_string(block.Value().metrics.parse_us) +
+                " proof_policy_us=" + std::to_string(block.Value().metrics.proof_policy_us) +
+                " prove_us=" + std::to_string(block.Value().metrics.prove_us) +
+                " verify_us=" + std::to_string(block.Value().metrics.verify_us) +
                 " modify_us=" + std::to_string(block.Value().metrics.modify_us) +
-                " total_us=" + std::to_string(block.Value().metrics.total_us));
+                " proof_enqueue_us=" + std::to_string(block.Value().metrics.proof_enqueue_us) +
+                " proof_durable_wait_us=" +
+                    std::to_string(block.Value().metrics.proof_durable_wait_us) +
+                " total_us=" + std::to_string(block.Value().metrics.total_us) +
+                " end_to_end_us=" + std::to_string(block.Value().metrics.end_to_end_us));
         }
         if (height % 1'000 == 0 || height == target) {
             const auto usage{forest.Usage()};
@@ -947,19 +1164,37 @@ int main(int argc, char** argv)
             LogMemoryBreakdown("sync_progress", height, forest);
             LogOnlineBreakdown("sync_progress", height, forest);
             if (proof_store) LogProofStoreBreakdown("sync_progress", *proof_store);
+            LogProcessResources("sync_progress", height);
             if (utreexo::LogEnabled(utreexo::LogLevel::DEBUG) && interval.blocks != 0) {
                 utreexo::Log(utreexo::LogLevel::DEBUG, "block_timing_window",
                     "height=" + std::to_string(height) +
                     " blocks=" + std::to_string(interval.blocks) +
+                    " generated_proofs=" + std::to_string(interval.generated_proofs) +
                     " wall_us=" + std::to_string(interval_us) +
+                    " avg_fetch_wait_us=" + std::to_string(interval.fetch_wait_us / interval.blocks) +
                     " avg_chain_check_us=" + std::to_string(interval.chain_check_us / interval.blocks) +
                     " avg_block_hash_us=" + std::to_string(interval.block_hash_us / interval.blocks) +
                     " avg_block_fetch_us=" + std::to_string(interval.block_fetch_us / interval.blocks) +
                     " avg_parse_us=" + std::to_string(interval.parse_us / interval.blocks) +
+                    " avg_proof_policy_us=" +
+                        std::to_string(interval.proof_policy_us / interval.blocks) +
+                    " avg_prove_us=" + std::to_string(interval.prove_us / interval.blocks) +
+                    " avg_verify_us=" + std::to_string(interval.verify_us / interval.blocks) +
                     " avg_modify_us=" + std::to_string(interval.modify_us / interval.blocks) +
+                    " avg_proof_enqueue_us=" +
+                        std::to_string(interval.proof_enqueue_us / interval.blocks) +
+                    " avg_proof_durable_wait_us=" +
+                        std::to_string(interval.proof_durable_wait_us / interval.blocks) +
                     " avg_total_us=" + std::to_string(interval.total_us / interval.blocks) +
-                    " slowest_height=" + std::to_string(interval.slowest_height) +
-                    " slowest_total_us=" + std::to_string(interval.slowest_us));
+                    " avg_end_to_end_us=" +
+                        std::to_string(interval.end_to_end_us / interval.blocks) +
+                    " slowest_total_height=" +
+                        std::to_string(interval.slowest_total_height) +
+                    " slowest_total_us=" + std::to_string(interval.slowest_total_us) +
+                    " slowest_end_to_end_height=" +
+                        std::to_string(interval.slowest_end_to_end_height) +
+                    " slowest_end_to_end_us=" +
+                        std::to_string(interval.slowest_end_to_end_us));
             }
             interval = {};
             interval_start = Clock::now();
@@ -991,6 +1226,7 @@ int main(int argc, char** argv)
             " forest_height=" + std::to_string(sync.CurrentPoint()->height) +
             " reason=before_validation_and_online_switch");
         LogProofStoreBreakdown("initial_sync_drain", *proof_store);
+        LogProcessResources("initial_sync_drain", sync.CurrentPoint()->height);
     }
     const auto active_point{sync.ValidateCurrentPoint()};
     if (!active_point) {
@@ -1032,6 +1268,7 @@ int main(int argc, char** argv)
                 " storage_mode=mmap_wal");
             LogMemoryBreakdown("online_switch_complete", sync.CurrentPoint()->height, forest);
             LogOnlineBreakdown("online_switch_complete", sync.CurrentPoint()->height, forest);
+            LogProcessResources("online_switch_complete", sync.CurrentPoint()->height);
         }
     }
 
@@ -1040,10 +1277,28 @@ int main(int argc, char** argv)
     if (overall.blocks != 0) {
         utreexo::Log(utreexo::LogLevel::INFO, "sync_timing_summary",
             "blocks=" + std::to_string(overall.blocks) +
+            " generated_proofs=" + std::to_string(overall.generated_proofs) +
             " wall_us=" + std::to_string(sync_wall_us) +
+            " avg_fetch_wait_us=" + std::to_string(overall.fetch_wait_us / overall.blocks) +
+            " avg_chain_check_us=" + std::to_string(overall.chain_check_us / overall.blocks) +
+            " avg_block_hash_us=" + std::to_string(overall.block_hash_us / overall.blocks) +
+            " avg_block_fetch_us=" + std::to_string(overall.block_fetch_us / overall.blocks) +
+            " avg_parse_us=" + std::to_string(overall.parse_us / overall.blocks) +
+            " avg_proof_policy_us=" + std::to_string(overall.proof_policy_us / overall.blocks) +
+            " avg_prove_us=" + std::to_string(overall.prove_us / overall.blocks) +
+            " avg_verify_us=" + std::to_string(overall.verify_us / overall.blocks) +
+            " avg_modify_us=" + std::to_string(overall.modify_us / overall.blocks) +
+            " avg_proof_enqueue_us=" +
+                std::to_string(overall.proof_enqueue_us / overall.blocks) +
+            " avg_proof_durable_wait_us=" +
+                std::to_string(overall.proof_durable_wait_us / overall.blocks) +
             " avg_total_us=" + std::to_string(overall.total_us / overall.blocks) +
-            " slowest_height=" + std::to_string(overall.slowest_height) +
-            " slowest_total_us=" + std::to_string(overall.slowest_us));
+            " avg_end_to_end_us=" + std::to_string(overall.end_to_end_us / overall.blocks) +
+            " slowest_total_height=" + std::to_string(overall.slowest_total_height) +
+            " slowest_total_us=" + std::to_string(overall.slowest_total_us) +
+            " slowest_end_to_end_height=" +
+                std::to_string(overall.slowest_end_to_end_height) +
+            " slowest_end_to_end_us=" + std::to_string(overall.slowest_end_to_end_us));
     }
 
     std::shared_ptr<utreexo::RecentProofCache> proof_cache;
@@ -1138,6 +1393,7 @@ int main(int argc, char** argv)
                     return 1;
                 }
                 while (sync.ChainHashes().size() <= current_tip.Value()) {
+                    const auto block_iteration_start{Clock::now()};
                     utreexo::Result<utreexo::ProcessedBlock> block{
                         utreexo::Result<utreexo::ProcessedBlock>::Err("uninitialized online block")};
                     try {
@@ -1174,6 +1430,7 @@ int main(int argc, char** argv)
                         }
                         utreexo::Result<void> queued{
                             utreexo::Result<void>::Err("uninitialized online proof enqueue")};
+                        const auto enqueue_start{Clock::now()};
                         try {
                             queued = proof_store->Enqueue(
                                 block.Value().delta,
@@ -1189,6 +1446,9 @@ int main(int argc, char** argv)
                                 " action=stop recovery=rollback_forest_wal_to_proof_tip");
                             return 2;
                         }
+                        block.Value().metrics.proof_enqueue_us = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                Clock::now() - enqueue_start).count());
                         if (!queued) {
                             sync.StopPrefetch();
                             utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_enqueue_failed",
@@ -1197,7 +1457,11 @@ int main(int argc, char** argv)
                                 " action=stop_recover_by_online_wal_rollback");
                             return 1;
                         }
+                        const auto durable_wait_start{Clock::now()};
                         auto durable{proof_store->WaitDurable(block.Value().delta.point.height)};
+                        block.Value().metrics.proof_durable_wait_us = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                Clock::now() - durable_wait_start).count());
                         if (!durable) {
                             sync.StopPrefetch();
                             utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_commit_failed",
@@ -1228,6 +1492,9 @@ int main(int argc, char** argv)
                             return 1;
                         }
                     }
+                    block.Value().metrics.end_to_end_us = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            Clock::now() - block_iteration_start).count());
                     const auto storage{forest.OnlineUsage()};
                     const auto cache_stats{proof_cache ? proof_cache->Stats() :
                         utreexo::ProofCacheStats{}};
@@ -1238,14 +1505,41 @@ int main(int argc, char** argv)
                         " block_hash=" + block.Value().delta.point.block_hash.ToBitcoinHex() +
                         " additions=" + std::to_string(block.Value().delta.additions.size()) +
                         " deletions=" + std::to_string(block.Value().delta.deletions.size()) +
+                        " fetch_wait_us=" + std::to_string(block.Value().metrics.fetch_wait_us) +
+                        " chain_check_us=" + std::to_string(block.Value().metrics.chain_check_us) +
+                        " block_hash_us=" + std::to_string(block.Value().metrics.block_hash_us) +
+                        " block_fetch_us=" + std::to_string(block.Value().metrics.block_fetch_us) +
+                        " parse_us=" + std::to_string(block.Value().metrics.parse_us) +
+                        " proof_policy_us=" +
+                            std::to_string(block.Value().metrics.proof_policy_us) +
+                        " prove_us=" + std::to_string(block.Value().metrics.prove_us) +
+                        " verify_us=" + std::to_string(block.Value().metrics.verify_us) +
                         " modify_us=" + std::to_string(block.Value().metrics.modify_us) +
+                        " proof_enqueue_us=" +
+                            std::to_string(block.Value().metrics.proof_enqueue_us) +
+                        " proof_durable_wait_us=" +
+                            std::to_string(block.Value().metrics.proof_durable_wait_us) +
                         " total_us=" + std::to_string(block.Value().metrics.total_us) +
+                        " end_to_end_us=" +
+                            std::to_string(block.Value().metrics.end_to_end_us) +
                         " dirty_nodes=" + std::to_string(storage.dirty_nodes) +
                         " dirty_bytes=" + std::to_string(storage.dirty_bytes) +
                         " wal_bytes=" + std::to_string(storage.wal_bytes) +
                         " redo_wal_bytes=" + std::to_string(storage.redo_wal_bytes) +
                         " transaction_nodes=" + std::to_string(storage.last_transaction_nodes) +
                         " transaction_wal_bytes=" + std::to_string(storage.last_transaction_wal_bytes) +
+                        " forest_wal_serialize_us=" +
+                            std::to_string(storage.last_transaction_serialize_us) +
+                        " forest_wal_segment_us=" +
+                            std::to_string(storage.last_transaction_segment_us) +
+                        " forest_wal_write_us=" +
+                            std::to_string(storage.last_transaction_write_us) +
+                        " forest_wal_sync_us=" +
+                            std::to_string(storage.last_transaction_sync_us) +
+                        " forest_wal_publish_us=" +
+                            std::to_string(storage.last_transaction_publish_us) +
+                        " forest_wal_total_us=" +
+                            std::to_string(storage.last_transaction_total_us) +
                         " lsn=" + std::to_string(storage.current_lsn) +
                         (proof_store ? " proof_durable_height=" +
                                            std::to_string(proof_stats.durable_height) +
@@ -1257,6 +1551,8 @@ int main(int argc, char** argv)
                                            std::to_string(proof_stats.wal_bytes) : "") +
                         (proof_cache ? " proof_cache_entries=" + std::to_string(cache_stats.entries) +
                                        " proof_cache_bytes=" + std::to_string(cache_stats.bytes) : ""));
+                    LogProcessResources("online_block_committed",
+                                        block.Value().delta.point.height);
                 }
                 sync.StopPrefetch();
                 const auto validated{sync.ValidateCurrentPoint()};
@@ -1373,6 +1669,7 @@ int main(int argc, char** argv)
                            " proof_wal_bytes=" +
                                std::to_string(proof_store->Stats().wal_bytes) :
                            " proof_store=disabled"));
+        LogProcessResources("sync_complete", sync.CurrentPoint()->height);
     }
     utreexo::Log(utreexo::LogLevel::INFO, "sync_complete",
                  "height=" + std::to_string(sync.CurrentPoint() ? sync.CurrentPoint()->height : 0));

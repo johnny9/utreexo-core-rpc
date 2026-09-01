@@ -591,7 +591,13 @@ TEST(online_forest_rotates_prunes_and_enforces_undo_window)
         for (std::size_t i{0}; i < 8'192; ++i) additions.push_back(OnlineHash64(next_hash++));
         CHECK(online.ModifyBlock(additions, {},
                                  ChainPoint{height, OnlineHash64(7'000'000 + height)}));
-        CHECK(online.OnlineUsage().last_transaction_wal_bytes > config.wal_segment_bytes);
+        const auto transaction{online.OnlineUsage()};
+        CHECK(transaction.last_transaction_wal_bytes > config.wal_segment_bytes);
+        CHECK(transaction.last_transaction_total_us >= transaction.last_transaction_serialize_us);
+        CHECK(transaction.last_transaction_total_us >= transaction.last_transaction_segment_us);
+        CHECK(transaction.last_transaction_total_us >= transaction.last_transaction_write_us);
+        CHECK(transaction.last_transaction_total_us >= transaction.last_transaction_sync_us);
+        CHECK(transaction.last_transaction_total_us >= transaction.last_transaction_publish_us);
         CHECK(online.FlushOnline());
     }
 

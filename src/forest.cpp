@@ -8,6 +8,7 @@
 #include <array>
 #include <bit>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -64,6 +65,12 @@ Result<void> SyncDescriptor(int descriptor, std::string_view description)
         return Result<void>::Err(ErrnoMessage(std::string{"fdatasync "} + std::string{description}));
     }
     return Result<void>::Ok();
+}
+
+uint64_t ElapsedMicros(std::chrono::steady_clock::time_point start)
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count());
 }
 
 Result<void> PwriteAll(int descriptor, std::span<const std::byte> bytes, uint64_t file_offset);
@@ -1231,9 +1238,16 @@ public:
     uint64_t RedoWalBytes() const { return m_redo_wal_bytes; }
     uint64_t LastTransactionNodes() const { return m_last_transaction_nodes; }
     uint64_t LastTransactionWalBytes() const { return m_last_transaction_wal_bytes; }
+    uint64_t LastTransactionSerializeUs() const { return m_last_transaction_serialize_us; }
+    uint64_t LastTransactionSegmentUs() const { return m_last_transaction_segment_us; }
+    uint64_t LastTransactionWriteUs() const { return m_last_transaction_write_us; }
+    uint64_t LastTransactionSyncUs() const { return m_last_transaction_sync_us; }
+    uint64_t LastTransactionPublishUs() const { return m_last_transaction_publish_us; }
+    uint64_t LastTransactionTotalUs() const { return m_last_transaction_total_us; }
 
     Result<void> Append(WalTransaction& transaction)
     {
+        const auto total_start{std::chrono::steady_clock::now()};
         const bool chain_valid{transaction.previous == m_point &&
             ((transaction.kind == WalKind::CONNECT &&
               transaction.point.height == m_chain_hashes.size() &&
@@ -1247,15 +1261,25 @@ public:
             return Result<void>::Err("WAL transaction does not extend the online chain");
         }
         transaction.lsn = m_current_lsn + 1;
+        const auto serialize_start{std::chrono::steady_clock::now()};
         const auto bytes{SerializeWal(transaction)};
+        const uint64_t serialize_us{ElapsedMicros(serialize_start)};
+        const auto segment_start{std::chrono::steady_clock::now()};
         auto opened{OpenAppendSegment(bytes.size())};
         if (!opened) return opened;
+        const uint64_t segment_us{ElapsedMicros(segment_start)};
+        const auto write_start{std::chrono::steady_clock::now()};
         auto written{WriteAll(m_wal_fd, bytes)};
         if (!written) return written;
+        const uint64_t write_us{ElapsedMicros(write_start)};
+        uint64_t sync_us{0};
         if (m_config.sync_wal) {
+            const auto sync_start{std::chrono::steady_clock::now()};
             auto synced{SyncDescriptor(m_wal_fd, "forest WAL")};
             if (!synced) return synced;
+            sync_us = ElapsedMicros(sync_start);
         }
+        const auto publish_start{std::chrono::steady_clock::now()};
         m_wal_segment_size += bytes.size();
         m_wal_bytes += bytes.size();
         m_redo_wal_bytes += bytes.size();
@@ -1265,6 +1289,12 @@ public:
         m_point = transaction.point;
         if (transaction.kind == WalKind::CONNECT) m_chain_hashes.push_back(transaction.point.block_hash);
         else m_chain_hashes.pop_back();
+        m_last_transaction_serialize_us = serialize_us;
+        m_last_transaction_segment_us = segment_us;
+        m_last_transaction_write_us = write_us;
+        m_last_transaction_sync_us = sync_us;
+        m_last_transaction_publish_us = ElapsedMicros(publish_start);
+        m_last_transaction_total_us = ElapsedMicros(total_start);
         return Result<void>::Ok();
     }
 
@@ -1552,6 +1582,12 @@ private:
     uint64_t m_wal_segment_size{0};
     uint64_t m_last_transaction_nodes{0};
     uint64_t m_last_transaction_wal_bytes{0};
+    uint64_t m_last_transaction_serialize_us{0};
+    uint64_t m_last_transaction_segment_us{0};
+    uint64_t m_last_transaction_write_us{0};
+    uint64_t m_last_transaction_sync_us{0};
+    uint64_t m_last_transaction_publish_us{0};
+    uint64_t m_last_transaction_total_us{0};
 };
 
 } // namespace
@@ -2236,6 +2272,12 @@ OnlineForestUsage PackedForest::OnlineUsage() const
         .current_lsn = m_impl->online->CurrentLsn(),
         .last_transaction_nodes = m_impl->online->LastTransactionNodes(),
         .last_transaction_wal_bytes = m_impl->online->LastTransactionWalBytes(),
+        .last_transaction_serialize_us = m_impl->online->LastTransactionSerializeUs(),
+        .last_transaction_segment_us = m_impl->online->LastTransactionSegmentUs(),
+        .last_transaction_write_us = m_impl->online->LastTransactionWriteUs(),
+        .last_transaction_sync_us = m_impl->online->LastTransactionSyncUs(),
+        .last_transaction_publish_us = m_impl->online->LastTransactionPublishUs(),
+        .last_transaction_total_us = m_impl->online->LastTransactionTotalUs(),
     };
 }
 

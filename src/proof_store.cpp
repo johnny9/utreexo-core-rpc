@@ -480,9 +480,13 @@ public:
         };
         if (!failure && !stopping && !has_capacity() &&
             enqueued_point.height > durable_point.height) {
+            ++enqueue_blocked;
+            ++backpressure_flushes;
             flush_height = !flush_height ? enqueued_point.height :
                            std::max(*flush_height, enqueued_point.height);
             output_ready.notify_one();
+        } else if (!failure && !stopping && !has_capacity()) {
+            ++enqueue_blocked;
         }
         space_available.wait(lock, [&] {
             return failure.has_value() || stopping || has_capacity();
@@ -518,6 +522,8 @@ public:
         queued_bytes += accounted;
         peak_queued_blocks = std::max(peak_queued_blocks, queued_blocks);
         peak_queued_bytes = std::max(peak_queued_bytes, queued_bytes);
+        peak_input_blocks = std::max(peak_input_blocks,
+            static_cast<uint64_t>(input.size()));
         enqueue_wait_us += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - wait_start).count());
         enqueued_point = delta.point;
@@ -533,6 +539,7 @@ public:
             return Result<void>::Err("cannot wait beyond the enqueued proof tip");
         }
         if (height <= durable_point.height) return Result<void>::Ok();
+        ++durability_waits;
         flush_height = !flush_height ? height : std::max(*flush_height, height);
         output_ready.notify_one();
         durable_changed.wait(lock, [&] {
@@ -672,19 +679,33 @@ public:
             .index_bytes = index_bytes,
             .queued_blocks = queued_blocks,
             .queued_bytes = queued_bytes,
+            .input_blocks = static_cast<uint64_t>(input.size()),
+            .ready_blocks = static_cast<uint64_t>(ready.size()),
             .peak_queued_blocks = peak_queued_blocks,
             .peak_queued_bytes = peak_queued_bytes,
+            .peak_input_blocks = peak_input_blocks,
+            .peak_ready_blocks = peak_ready_blocks,
+            .enqueue_blocked = enqueue_blocked,
+            .backpressure_flushes = backpressure_flushes,
+            .durability_waits = durability_waits,
             .serialized_proofs = serialized_proofs,
             .serialized_bytes = serialized_bytes,
             .largest_record_bytes = largest_record_bytes,
             .enqueue_wait_us = enqueue_wait_us,
             .serialization_us = serialization_us,
+            .committed_proofs = committed_proofs,
             .committed_batches = committed_batches,
+            .full_batches = full_batches,
+            .partial_batches = partial_batches,
+            .largest_batch_proofs = largest_batch_proofs,
             .commit_us = commit_us,
+            .data_write_us = data_write_us,
             .data_syncs = data_syncs,
             .data_sync_us = data_sync_us,
+            .wal_write_us = wal_write_us,
             .wal_syncs = wal_syncs,
             .wal_sync_us = wal_sync_us,
+            .index_publish_us = index_publish_us,
             .hits = hits,
             .misses = misses,
         };
@@ -974,6 +995,8 @@ private:
                         std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - serialization_start).count());
                     ready.emplace(prepared.Value().point.height, prepared.Take());
+                    peak_ready_blocks = std::max(peak_ready_blocks,
+                        static_cast<uint64_t>(ready.size()));
                 }
                 output_ready.notify_one();
             } catch (const std::bad_alloc&) {
@@ -1058,6 +1081,7 @@ private:
             next_data_offset = data_end;
             next_wal_offset = wal_end;
         }
+        const auto data_write_start{std::chrono::steady_clock::now()};
         for (const auto& proof : batch) {
             auto written{PwriteAll(data_fd, proof.record, next_data_offset)};
             if (!written) return written;
@@ -1071,6 +1095,9 @@ private:
             });
             next_data_offset += proof.record.size();
         }
+        const uint64_t batch_data_write_us{static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - data_write_start).count())};
         const auto data_sync_start{std::chrono::steady_clock::now()};
         auto data_synced{SyncFile(data_fd, "proof data")};
         if (!data_synced) return data_synced;
@@ -1078,6 +1105,7 @@ private:
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - data_sync_start).count())};
 
+        const auto wal_write_start{std::chrono::steady_clock::now()};
         std::vector<std::byte> wal_bytes;
         wal_bytes.reserve(events.size() * WAL_RECORD_SIZE);
         for (const auto& event : events) {
@@ -1086,12 +1114,16 @@ private:
         }
         auto wal_written{PwriteAll(wal_fd, wal_bytes, next_wal_offset)};
         if (!wal_written) return wal_written;
+        const uint64_t batch_wal_write_us{static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wal_write_start).count())};
         const auto wal_sync_start{std::chrono::steady_clock::now()};
         auto wal_synced{SyncFile(wal_fd, "proof index WAL")};
         if (!wal_synced) return wal_synced;
         const uint64_t batch_wal_sync_us{static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - wal_sync_start).count())};
+        const auto index_publish_start{std::chrono::steady_clock::now()};
         {
             std::lock_guard lock{mutex};
             const uint64_t required{events.back().point.height - base_point.height};
@@ -1110,12 +1142,25 @@ private:
                 --queued_blocks;
                 queued_bytes -= batch[i].accounted_bytes;
             }
+            committed_proofs += static_cast<uint64_t>(events.size());
             ++committed_batches;
+            if (events.size() >= config.group_commit_blocks) {
+                ++full_batches;
+            } else {
+                ++partial_batches;
+            }
+            largest_batch_proofs = std::max(largest_batch_proofs,
+                static_cast<uint64_t>(events.size()));
             commit_us += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - commit_start).count());
             if (flush_height && durable_point.height >= *flush_height) flush_height.reset();
+            data_write_us += batch_data_write_us;
             data_sync_us += batch_data_sync_us;
+            wal_write_us += batch_wal_write_us;
             wal_sync_us += batch_wal_sync_us;
+            index_publish_us += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - index_publish_start).count());
         }
         durable_changed.notify_all();
         space_available.notify_all();
@@ -1153,17 +1198,29 @@ private:
     uint64_t queued_bytes{0};
     uint64_t peak_queued_blocks{0};
     uint64_t peak_queued_bytes{0};
+    uint64_t peak_input_blocks{0};
+    uint64_t peak_ready_blocks{0};
+    uint64_t enqueue_blocked{0};
+    uint64_t backpressure_flushes{0};
+    uint64_t durability_waits{0};
     uint64_t serialized_proofs{0};
     uint64_t serialized_bytes{0};
     uint64_t largest_record_bytes{0};
     uint64_t enqueue_wait_us{0};
     uint64_t serialization_us{0};
+    uint64_t committed_proofs{0};
     uint64_t committed_batches{0};
+    uint64_t full_batches{0};
+    uint64_t partial_batches{0};
+    uint64_t largest_batch_proofs{0};
     uint64_t commit_us{0};
+    uint64_t data_write_us{0};
     uint64_t data_syncs{0};
     uint64_t data_sync_us{0};
+    uint64_t wal_write_us{0};
     uint64_t wal_syncs{0};
     uint64_t wal_sync_us{0};
+    uint64_t index_publish_us{0};
     mutable uint64_t hits{0};
     mutable uint64_t misses{0};
 };

@@ -263,10 +263,19 @@ The sidecar emits UTC, single-line key/value records in the form
   sync/RPC timing, checkpoint boundaries, and the final height/hash/leaves/roots
   manifest.
 - `warn` records RPC failures and host memory pressure from the supervisor.
-- `debug` adds forest arena/index capacity and tombstones, timing by processing
-  phase, checkpoint write/checksum/fsync/rename timing, and largest RPC responses.
-- `trace` adds one record per processed block and successful RPC call. It is useful
-  for short investigations but produces substantial output during a full sync.
+- `debug` adds forest arena/index capacity and tombstones; 1,000-block timing windows
+  split into prefetch wait, RPC, parse, archive policy, prove, verify, modify, proof
+  enqueue, and durability wait; proof queue/backpressure/batch/write/fsync statistics;
+  mmap-forest WAL serialization/rotation/write/fsync timing; checkpoint timing; and
+  process RSS/HWM, CPU, faults, context switches, and I/O.
+- `trace` adds the same phase timings for every processed block plus every successful
+  RPC call. It is useful for short investigations but produces substantial output
+  during a full sync.
+
+The `process_resources` fields are cumulative so adjacent debug samples can be
+subtracted to obtain interval CPU, fault, and I/O rates. Linux additionally reports
+current anonymous/file RSS and `/proc/self/io`; availability flags distinguish zeros
+from unsupported counters on other platforms.
 
 For long mainnet runs, `tools/mainnet-sync.sh` defaults to debug logging and samples
 process/kernel telemetry once per second. Its resource TSV includes RSS, HWM, PSS,

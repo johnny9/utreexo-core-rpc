@@ -65,6 +65,12 @@ struct OnlineForestUsage {
     uint64_t current_lsn{0};
     uint64_t last_transaction_nodes{0};
     uint64_t last_transaction_wal_bytes{0};
+    uint64_t last_transaction_serialize_us{0};
+    uint64_t last_transaction_segment_us{0};
+    uint64_t last_transaction_write_us{0};
+    uint64_t last_transaction_sync_us{0};
+    uint64_t last_transaction_publish_us{0};
+    uint64_t last_transaction_total_us{0};
 };
 
 class PackedForest

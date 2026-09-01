@@ -212,7 +212,9 @@ Result<ProcessedBlock> SequentialSync::ProcessNext()
         return Result<ProcessedBlock>::Err("chain height exceeds the sidecar format");
     }
     const uint32_t height{static_cast<uint32_t>(m_chain_hashes.size())};
+    const auto fetch_wait_start{Clock::now()};
     auto fetched{NextFetchedBlock(height)};
+    metrics.fetch_wait_us = micros(fetch_wait_start);
     if (!fetched) return Result<ProcessedBlock>::Err(fetched.Error());
     if (fetched.Value().height != height) {
         return Result<ProcessedBlock>::Err("fetched block height does not match the requested height");
@@ -230,16 +232,20 @@ Result<ProcessedBlock> SequentialSync::ProcessNext()
     auto delta{ParseVerboseBlockJson(fetched.Value().json.Value(), resolver)};
     if (!delta) return Result<ProcessedBlock>::Err(delta.Error());
     metrics.parse_us = micros(parse_start);
+    const auto chain_check_start{Clock::now()};
     if (delta.Value().point.height != height || delta.Value().point.block_hash != fetched.Value().hash) {
         return Result<ProcessedBlock>::Err("getblock result does not match the requested active-chain block");
     }
     if (height > 0 && delta.Value().previous_block_hash != m_chain_hashes.back()) {
         return Result<ProcessedBlock>::Err("block does not connect to the sidecar chain tip");
     }
+    metrics.chain_check_us = micros(chain_check_start);
 
     bool generate_proof{m_generate_proofs};
     if (m_proof_policy) {
+        const auto proof_policy_start{Clock::now()};
         auto decision{m_proof_policy(delta.Value())};
+        metrics.proof_policy_us = micros(proof_policy_start);
         if (!decision) {
             return Result<ProcessedBlock>::Err("proof-generation policy failed: " + decision.Error());
         }
@@ -247,10 +253,13 @@ Result<ProcessedBlock> SequentialSync::ProcessNext()
     }
     std::optional<Proof> proof;
     if (generate_proof) {
+        const auto prove_start{Clock::now()};
         auto generated{m_forest.Prove(delta.Value().deletions)};
+        metrics.prove_us = micros(prove_start);
         if (!generated) {
             return Result<ProcessedBlock>::Err("could not generate pre-block proof: " + generated.Error());
         }
+        const auto verify_start{Clock::now()};
         std::vector<Hash256> roots;
         for (const auto& root : m_forest.Roots()) {
             if (!root) return Result<ProcessedBlock>::Err("pre-block forest contains a missing root");
@@ -266,6 +275,7 @@ Result<ProcessedBlock> SequentialSync::ProcessNext()
             return Result<ProcessedBlock>::Err("generated pre-block proof does not match forest roots");
         }
         proof = generated.Take();
+        metrics.verify_us = micros(verify_start);
     }
 
     const auto modify_start{Clock::now()};
@@ -276,6 +286,7 @@ Result<ProcessedBlock> SequentialSync::ProcessNext()
     metrics.modify_us = micros(modify_start);
     m_chain_hashes.push_back(fetched.Value().hash);
     metrics.total_us = micros(total_start);
+    metrics.end_to_end_us = metrics.total_us;
     return Result<ProcessedBlock>::Ok(ProcessedBlock{delta.Take(), metrics, std::move(proof)});
 }
 

@@ -164,6 +164,9 @@ TEST(sequential_sync_captures_proof_before_block_mutation)
     CHECK_EQ(spent.Value().delta.proof_leaves.size(), 1U);
     CHECK_EQ(spent.Value().proof->targets, (std::vector<uint64_t>{0}));
     CHECK(spent.Value().proof->hashes.empty());
+    CHECK(spent.Value().metrics.total_us >= spent.Value().metrics.prove_us);
+    CHECK(spent.Value().metrics.total_us >= spent.Value().metrics.verify_us);
+    CHECK_EQ(spent.Value().metrics.end_to_end_us, spent.Value().metrics.total_us);
 }
 
 TEST(sequential_sync_proof_policy_runs_before_forest_mutation)
@@ -190,6 +193,7 @@ TEST(sequential_sync_proof_policy_runs_before_forest_mutation)
         policy_called = true;
         CHECK_EQ(delta.point.height, 2U);
         CHECK_EQ(forest.NumLeaves(), 1U);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
         return Result<bool>::Ok(true);
     });
     auto processed{sync.ProcessNext()};
@@ -197,6 +201,7 @@ TEST(sequential_sync_proof_policy_runs_before_forest_mutation)
     CHECK(policy_called);
     CHECK(processed.Value().proof.has_value());
     CHECK_EQ(forest.NumLeaves(), 1U);
+    CHECK(processed.Value().metrics.proof_policy_us >= 1'000U);
 }
 
 TEST(sequential_sync_proof_policy_error_leaves_forest_unchanged)
