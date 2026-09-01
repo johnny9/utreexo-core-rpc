@@ -3,7 +3,9 @@
 This is a C++20, Bitcoin Core-compatible implementation of the low-write bridge
 bootstrap design. It reads sequential active-chain blocks from an unpruned Bitcoin
 Core node using `getblock(hash, 3)`, derives the exact Utreexo leaf hashes, and keeps
-the full proving forest in RAM.
+the full proving forest in RAM during bulk bootstrap. At the validated Core tip it
+can atomically publish a native mmap generation and continue through a block-atomic
+write-ahead log with bounded coalesced RAM deltas.
 
 The accumulator library has no RPC, JSON, filesystem, or P2P dependency. Its value
 types and component boundaries are deliberately close to Bitcoin Core conventions so
@@ -25,13 +27,17 @@ the sidecar transport with it.
 - Bridge-compatible compact leaf classification and UData serialization.
 - Optional sparse, atomic, fsync-and-rename checkpoints. Checkpoints include the
   32-byte-per-height block-hash index needed to derive future deletion leaves.
+- Native 48-byte-per-slot mmap online storage, a RAM-only rebuildable keyless index,
+  per-block redo/undo WAL records, bounded write-back deltas, and double-buffered
+  durable superblocks.
+- Automatic shallow-reorg rollback from retained WAL before-images. Reorgs older
+  than the configured window fail closed to the preserved validated checkpoint.
 
-The executable currently constructs the tip forest and compact spent-leaf records but
+The executable constructs the tip forest and compact spent-leaf records but
 does not generate historical proofs during bootstrap because they are neither retained
 nor served. The accumulator retains its on-demand batch-proof API for future tip UTXO,
 block, and transaction requests. The executable does not yet publish the Bitcoin P2P
-bridge protocol. Reorganizations are detected and fail closed; automatic near-tip
-rollback/overlay storage is also a follow-up module.
+bridge protocol.
 
 ## Build and test
 
@@ -83,6 +89,43 @@ independently validated format-3 proving-forest checkpoint.
 `--checkpoint-interval=N` is intentionally opt-in because every checkpoint streams the
 full forest. Large intervals reduce restart cost while avoiding the per-block rewrite
 pattern this project is meant to eliminate.
+
+## Switch to post-sync mmap/WAL operation
+
+Pass `--online-state` on the final bootstrap invocation. The sidecar continues using
+the RAM forest while it is behind, revalidates its final chain point against Core, then
+writes one native generation and releases the RAM arena. It does not overwrite the
+bootstrap checkpoint, which remains the recovery source for a reorg deeper than the
+online undo window.
+
+```sh
+./build/utreexo-bridge \
+  --rpc-cookie=/path/to/bitcoin/.cookie \
+  --checkpoint=/checkpoint-disk/validated-mainnet.chk \
+  --online-state=/nvme/utreexo-online \
+  --follow \
+  --log-level=debug
+```
+
+On later starts, the existing online directory takes precedence over `--checkpoint`.
+The sidecar selects the newest valid superblock, replays committed WAL records newer
+than the mapped base, rebuilds the free list and RAM-only reverse index, verifies all
+branch hashes and roots, reconciles shallow reorgs with Core, and then follows the tip.
+
+Online defaults:
+
+- dirty delta ceiling: 128 MiB on hosts with at most 20 GiB RAM, otherwise 512 MiB;
+- WAL segments: 256 MiB;
+- before-image/reorg retention: 1,008 blocks;
+- WAL synchronization: every block before its state is published;
+- base flush: at the delta ceiling, 1 GiB of unapplied redo WAL, after 24 hours in
+  follow mode, or at clean non-follow shutdown; and
+- full-forest compaction/checkpoint rewrites: never during normal tip following.
+
+The native directory contains `forest.hashes`, `forest.meta`, `chain.hashes`, two
+alternating `state.*` superblocks, and `wal-*.log` segments. Do not copy it as a shared
+checkpoint while unapplied WAL exists; use the preserved format-3 checkpoint until an
+explicit online export command is added.
 
 ## Offline arena compaction
 
@@ -189,8 +232,11 @@ forest or temporarily require a second arena.
 `ForestUsage` reports live and allocated arena slots, arena capacity/free slots,
 reverse-index entries/capacity/tombstones, and separate deterministic arena/index byte
 estimates. Actual RSS also includes allocator, RPC JSON, block, and executable overhead.
-The intended 32 GiB operating profile processes one verbosity-3 block at a time and
-checkpoints only sparsely.
+The intended 32 GiB bootstrap profile processes one verbosity-3 block at a time and
+checkpoints only sparsely. Online mode maps the 48-byte native arena without populating
+or locking it, so the operating system can evict cold forest pages. Its explicit RAM
+cost is primarily the keyless reverse index, free-node bookkeeping, and the bounded
+delta cache; the mapped virtual size is not equivalent to resident memory.
 
 Before attempting mainnet, follow the staged resource, Core preflight, recovery, and
 checkpoint guidance in [MAINNET_SYNC_READINESS.md](MAINNET_SYNC_READINESS.md).

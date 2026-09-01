@@ -1,6 +1,6 @@
 # Mainnet sync readiness checklist
 
-Last reviewed: 2026-08-31
+Last reviewed: 2026-09-01
 
 ## Current recommendation
 
@@ -10,10 +10,10 @@ preserves and reload-validates the compact 900000 checkpoint, and fails closed o
 an exact-state mismatch. Use that controller for the 943013 validation run rather
 than a single uninterrupted sidecar invocation.
 
-The sidecar process itself still does not checkpoint on every signal or ordinary
-RPC failure. The controller limits that exposure by checkpointing at 250000,
-500000, 800000, and 900000 and retrying transport failures from the last completed
-milestone. A host failure can still lose work since the preceding milestone.
+After a validated bootstrap reaches Core's tip, `--online-state=DIR` writes one native
+mmap generation and switches future block updates to a synchronized WAL. A host failure
+then loses no published block: restart replays committed WAL records over the last
+durable base. Preserve the validated format-3 checkpoint for deep-reorg recovery.
 
 ## Required Bitcoin Core preflight
 
@@ -138,33 +138,26 @@ Record for every stage:
 - checkpoint size and checkpoint write duration; and
 - free space before and after checkpoint replacement.
 
-## Hardening before an unattended full-tip run
+## Online-operation boundaries
 
-Implement these before leaving a complete bootstrap unattended:
-
-1. **Checkpoint on clean termination.** Handle SIGINT and SIGTERM at a safe
-   between-block boundary and write the last internally consistent state.
-2. **Checkpoint after recoverable sync failures.** Forest modification is atomic, so
-   an ordinary RPC/parser/proof failure should preserve and checkpoint the state from
-   before the failed block.
-3. **RPC retries.** Add bounded exponential backoff for connection, read, and timeout
-   failures. Make the current 30-second timeout configurable.
-4. **Configurable response limit.** Make the current 128 MiB RPC response ceiling
-   configurable and report the largest observed verbosity-3 response.
-5. **Checkpoint generations.** Retain at least the current and previous known-good
-   checkpoints, or use distinct files for milestone heights. Do not overwrite the
-   only recoverable checkpoint until the new one is written, validated, and confirmed
-   to be on Core's active chain.
-6. **Startup storage preflight.** Estimate temporary checkpoint space before starting
-   a checkpoint and fail cleanly when the target filesystem is too small.
-
-Automatic reorganization rollback is not implemented. The sidecar detects a change at
-or below its current tip and fails closed. Retaining milestone checkpoint generations
-is therefore important until the planned recent-reversal ring exists.
+- Every published online block has a checksummed, synchronized redo/undo WAL record.
+- Incomplete WAL tails are truncated; corruption inside a committed record fails closed.
+- The mapped base is updated only from coalesced node deltas and advances through an
+  alternating synchronized superblock.
+- Automatic rollback is limited to retained connect transactions (1,008 blocks by
+  default). A deeper reorganization, or one crossing the original online-generation
+  boundary without a retained connect record, requires the preserved checkpoint.
+- The current executable has no proof-serving listener yet. `--follow` maintains the
+  proving forest but does not expose it to remote clients.
+- Graceful signal handling remains desirable for log clarity, but correctness does not
+  depend on a shutdown-time full checkpoint once online: committed WAL replay is the
+  recovery path.
 
 ## Go/no-go decision
 
 - **Go:** the dedicated `rebuild-validate` pipeline to the pinned 943013 reference,
   after its automatic Core, binary-format, reference, and storage preflight passes.
-- **No-go:** an unbounded unattended tip-following process or a direct genesis-to-tip
-  sidecar invocation without the controller's milestone recovery points.
+- **Go:** tip following from a validated checkpoint with `--online-state`, while the
+  bootstrap checkpoint remains available for deep-reorg recovery.
+- **No-go:** a direct genesis-to-tip invocation without the controller's milestone
+  recovery points or deleting the validated fallback checkpoint after switching online.
