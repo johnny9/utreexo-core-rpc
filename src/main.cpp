@@ -6,6 +6,7 @@
 #include <utreexo/p2p.h>
 #include <utreexo/proof_store.h>
 #include <utreexo/sync.h>
+#include <utreexo/trusted_checkpoint.h>
 
 #include <algorithm>
 #include <charconv>
@@ -62,6 +63,7 @@ struct Options {
     uint32_t p2p_proof_cache_blocks{288};
     uint64_t p2p_proof_cache_mib{256};
     utreexo::LogLevel log_level{utreexo::LogLevel::INFO};
+    bool allow_untrusted_checkpoint{false};
     bool follow{false};
     bool show_version{false};
 };
@@ -234,6 +236,8 @@ void Usage()
         << "  --rpc-host=HOST             Bitcoin Core RPC host (default 127.0.0.1)\n"
         << "  --rpc-port=PORT             Bitcoin Core RPC port (default 8332)\n"
         << "  --checkpoint=PATH           Load/save a sparse atomic checkpoint\n"
+        << "  --allow-untrusted-checkpoint\n"
+        << "                              Skip compiled checkpoint validation (unsafe)\n"
         << "  --checkpoint-interval=N     Full checkpoint every N blocks (default 0: final only)\n"
         << "                              Allocation failures save the last completed checkpoint\n"
         << "  --online-state=DIR          Native mmap/WAL state; create after reaching Core tip\n"
@@ -367,6 +371,8 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
                 options.p2p_proof_cache_mib > std::numeric_limits<uint64_t>::max() / (1024ULL * 1024)) {
                 return utreexo::Result<Options>::Err("invalid --p2p-proof-cache-mib");
             }
+        } else if (argument == "--allow-untrusted-checkpoint") {
+            options.allow_untrusted_checkpoint = true;
         } else if (argument == "--follow") {
             options.follow = true;
         } else if (auto stop_height{value("--stop-height")}) {
@@ -392,6 +398,10 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
     }
     if (options.p2p_port && !options.follow) {
         return utreexo::Result<Options>::Err("--p2p-port requires --follow");
+    }
+    if (options.allow_untrusted_checkpoint && !options.checkpoint) {
+        return utreexo::Result<Options>::Err(
+            "--allow-untrusted-checkpoint requires --checkpoint");
     }
     return utreexo::Result<Options>::Ok(std::move(options));
 }
@@ -663,6 +673,49 @@ int main(int argc, char** argv)
         LogOnlineBreakdown("online_state_loaded", recovered_point.height, forest);
         LogProcessResources("online_state_loaded", recovered_point.height);
     } else if (options.checkpoint && std::filesystem::exists(*options.checkpoint)) {
+        const utreexo::TrustedCheckpoint* trusted{
+            utreexo::FindTrustedCheckpoint("mainnet-943013")};
+        if (!trusted) {
+            utreexo::Log(utreexo::LogLevel::ERROR,
+                "trusted_checkpoint_validation_failed",
+                "reason=compiled_anchor_missing action=fail_closed");
+            return 1;
+        }
+        if (options.allow_untrusted_checkpoint) {
+            utreexo::Log(utreexo::LogLevel::WARN,
+                "trusted_checkpoint_validation_skipped",
+                "path=" + PathField(*options.checkpoint) +
+                " reason=operator_override risk=checkpoint_state_not_authenticated");
+        } else {
+            utreexo::Log(utreexo::LogLevel::INFO,
+                "trusted_checkpoint_file_validation_started",
+                "anchor=" + StringField(trusted->name) +
+                " path=" + PathField(*options.checkpoint) +
+                " expected_bytes=" + std::to_string(trusted->file_size) +
+                " expected_sha256=" + trusted->file_sha256.ToHex());
+            auto identity{utreexo::ReadCheckpointFileIdentity(*options.checkpoint)};
+            if (!identity) {
+                utreexo::Log(utreexo::LogLevel::ERROR,
+                    "trusted_checkpoint_validation_failed",
+                    "anchor=" + StringField(trusted->name) +
+                    " error=" + StringField(identity.Error()) + " action=fail_closed");
+                return 1;
+            }
+            auto validated_file{
+                utreexo::ValidateTrustedCheckpointFile(*trusted, identity.Value())};
+            if (!validated_file) {
+                utreexo::Log(utreexo::LogLevel::ERROR,
+                    "trusted_checkpoint_validation_failed",
+                    "anchor=" + StringField(trusted->name) +
+                    " error=" + StringField(validated_file.Error()) +
+                    " action=fail_closed override=--allow-untrusted-checkpoint");
+                return 1;
+            }
+            utreexo::Log(utreexo::LogLevel::INFO, "trusted_checkpoint_file_validated",
+                "anchor=" + StringField(trusted->name) +
+                " bytes=" + std::to_string(identity.Value().size) +
+                " sha256=" + identity.Value().sha256.ToHex());
+        }
         utreexo::Log(utreexo::LogLevel::INFO, "checkpoint_load_started",
                      "path=" + PathField(*options.checkpoint));
         utreexo::CheckpointMetrics checkpoint_metrics;
@@ -672,6 +725,25 @@ int main(int argc, char** argv)
                          "path=" + PathField(*options.checkpoint) +
                          " error=" + StringField(loaded.Error()));
             return 1;
+        }
+        if (!options.allow_untrusted_checkpoint) {
+            auto validated_state{
+                utreexo::ValidateTrustedCheckpointState(*trusted, loaded.Value())};
+            if (!validated_state) {
+                utreexo::Log(utreexo::LogLevel::ERROR,
+                    "trusted_checkpoint_validation_failed",
+                    "anchor=" + StringField(trusted->name) +
+                    " error=" + StringField(validated_state.Error()) +
+                    " action=fail_closed");
+                return 1;
+            }
+            utreexo::Log(utreexo::LogLevel::INFO, "trusted_checkpoint_state_validated",
+                "anchor=" + StringField(trusted->name) +
+                " height=" + std::to_string(loaded.Value().point.height) +
+                " block_hash=" + loaded.Value().point.block_hash.ToBitcoinHex() +
+                " num_leaves=" + std::to_string(loaded.Value().forest.NumLeaves()) +
+                " roots=" + RootsField(loaded.Value().forest) +
+                " exact_file=true");
         }
         if (loaded.Value().chain_hashes.empty()) {
             utreexo::Log(utreexo::LogLevel::ERROR, "checkpoint_load_failed",

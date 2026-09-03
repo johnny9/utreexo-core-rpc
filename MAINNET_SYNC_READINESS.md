@@ -103,6 +103,7 @@ Then verify restoration immediately:
 ./build/utreexo-bridge \
   --rpc-cookie=/path/to/bitcoin/.cookie \
   --checkpoint=/checkpoint-disk/mainnet.chk \
+  --allow-untrusted-checkpoint \
   --state-json=/checkpoint-disk/mainnet-100100.json \
   --stop-height=100100
 ```

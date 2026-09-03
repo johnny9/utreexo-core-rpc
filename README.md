@@ -93,6 +93,29 @@ Utreexo leaves. The corrected sidecar intentionally refuses format-2 checkpoints
 which may contain the incompatible forest; reconstruct from genesis or from an
 independently validated format-3 proving-forest checkpoint.
 
+The binary contains a trust anchor for the published mainnet bridge checkpoint at
+height 943013. Existing checkpoint files are required to match its consensus state
+and exact file identity by default:
+
+```sh
+./build/utreexo-bridge \
+  --rpc-cookie=/path/to/bitcoin/.cookie \
+  --checkpoint=/checkpoint-disk/mainnet-943013-compact.chk \
+  --online-state=/nvme/utreexo-online \
+  --follow
+```
+
+The anchor pins the block hash, leaf count, ordered roots, 14,893,913,136-byte file
+size, and SHA-256
+`e869cb2eaf6a42d71010464b1dac7d0cd5cc7ed237ba78d2c653d2c8efa5a492`.
+The sidecar fails closed before deserialization when the file identity differs and
+again after deserialization when the accumulator state differs. For private rebuild
+milestones or locally generated checkpoints, `--allow-untrusted-checkpoint` skips
+both checks and emits a warning that the state is unauthenticated. Use that override
+only when the checkpoint's provenance has been established separately. Once the
+native online directory exists, it intentionally takes precedence over the bootstrap
+file and no checkpoint override is needed.
+
 `--checkpoint-interval=N` is intentionally opt-in because every checkpoint streams the
 full forest. Large intervals reduce restart cost while avoiding the per-block rewrite
 pattern this project is meant to eliminate.

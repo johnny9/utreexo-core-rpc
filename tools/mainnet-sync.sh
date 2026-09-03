@@ -260,6 +260,7 @@ run_sync()
     stdbuf -oL -eL "$BINARY" \
         --rpc-cookie="$RPC_COOKIE" \
         --checkpoint="$CHECKPOINT" \
+        --allow-untrusted-checkpoint \
         --state-json="$STATE_FILE" \
         --stop-height="$target" \
         --log-level="$LOG_LEVEL" \
