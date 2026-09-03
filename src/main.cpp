@@ -54,9 +54,11 @@ utreexo::Result<void> InstallShutdownSignalHandlers()
     struct sigaction action {};
     action.sa_handler = HandleShutdownSignal;
     action.sa_flags = SA_RESTART;
-    if (::sigemptyset(&action.sa_mask) != 0 ||
-        ::sigaction(SIGINT, &action, nullptr) != 0 ||
-        ::sigaction(SIGTERM, &action, nullptr) != 0) {
+    // Darwin exposes sigemptyset as a function-like macro, so these calls must
+    // remain unqualified to be portable across POSIX implementations.
+    if (sigemptyset(&action.sa_mask) != 0 ||
+        sigaction(SIGINT, &action, nullptr) != 0 ||
+        sigaction(SIGTERM, &action, nullptr) != 0) {
         return utreexo::Result<void>::Err(
             "could not install shutdown signal handlers: " + std::string{std::strerror(errno)});
     }

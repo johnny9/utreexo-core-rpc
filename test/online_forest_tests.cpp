@@ -599,7 +599,7 @@ TEST(online_forest_multiblock_reorg_reopen_and_alternate_branch)
     for (uint32_t expected_height{11}; expected_height >= 7; --expected_height) {
         const auto rolled_back{online.RollbackOnlineBlock()};
         CHECK(rolled_back);
-        CHECK_EQ(rolled_back.Value(), ChainPoint(expected_height, chain[expected_height]));
+        CHECK_EQ(rolled_back.Value(), (ChainPoint{expected_height, chain[expected_height]}));
         CHECK_EQ(online.Roots(), roots_at_height[expected_height]);
         chain.pop_back();
         online = PackedForest{};
