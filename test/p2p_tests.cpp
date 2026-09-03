@@ -31,6 +31,29 @@ constexpr int SEND_FLAGS{MSG_NOSIGNAL};
 constexpr int SEND_FLAGS{0};
 #endif
 
+class StopAndJoinThread
+{
+public:
+    StopAndJoinThread(std::atomic<bool>& stop_requested, std::thread& worker)
+        : m_stop_requested{stop_requested}, m_worker{worker}
+    {
+    }
+
+    ~StopAndJoinThread() { Stop(); }
+    StopAndJoinThread(const StopAndJoinThread&) = delete;
+    StopAndJoinThread& operator=(const StopAndJoinThread&) = delete;
+
+    void Stop()
+    {
+        m_stop_requested.store(true);
+        if (m_worker.joinable()) m_worker.join();
+    }
+
+private:
+    std::atomic<bool>& m_stop_requested;
+    std::thread& m_worker;
+};
+
 std::string Hex(std::span<const std::byte> bytes)
 {
     constexpr char map[]{"0123456789abcdef"};
@@ -1242,9 +1265,10 @@ TEST(p2p_server_releases_proof_work_when_a_peer_dribbles_response_reads)
     CHECK(WaitUntil([&] { return server->Stats().active_proof_requests == 1; },
                     std::chrono::seconds(15)));
 
-    std::jthread dribbling_reader{[&](const std::stop_token& stop) {
+    std::atomic<bool> stop_reader{false};
+    std::thread dribbling_reader{[&] {
         std::array<std::byte, 64 * 1024> bytes{};
-        while (!stop.stop_requested()) {
+        while (!stop_reader.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
             const ssize_t received{
                 ::recv(first, bytes.data(), bytes.size(), MSG_DONTWAIT)};
@@ -1254,6 +1278,7 @@ TEST(p2p_server_releases_proof_work_when_a_peer_dribbles_response_reads)
             }
         }
     }};
+    StopAndJoinThread reader_guard{stop_reader, dribbling_reader};
 
     SendBytes(second, request.Value());
     CHECK(WaitUntil([&] { return server->Stats().proof_busy == 1; }));
@@ -1266,8 +1291,7 @@ TEST(p2p_server_releases_proof_work_when_a_peer_dribbles_response_reads)
                     std::chrono::seconds(60)));
     CHECK_EQ(server->Stats().proofs_served, 0U);
 
-    dribbling_reader.request_stop();
-    dribbling_reader.join();
+    reader_guard.Stop();
     ::close(first);
     ::close(second);
 }

@@ -167,7 +167,12 @@ Result<void> PreadExact(int descriptor, std::span<std::byte> bytes, uint64_t fil
 
 Result<void> SyncFile(int descriptor, std::string_view description)
 {
-    if (::fdatasync(descriptor) != 0) {
+#if defined(__APPLE__)
+    const int result{::fsync(descriptor)};
+#else
+    const int result{::fdatasync(descriptor)};
+#endif
+    if (result != 0) {
         return Result<void>::Err(ErrnoMessage(std::string{"sync "} + std::string{description}));
     }
     return Result<void>::Ok();

@@ -64,8 +64,13 @@ std::string ErrnoMessage(std::string_view operation)
 
 Result<void> SyncDescriptor(int descriptor, std::string_view description)
 {
-    if (::fdatasync(descriptor) != 0) {
-        return Result<void>::Err(ErrnoMessage(std::string{"fdatasync "} + std::string{description}));
+#if defined(__APPLE__)
+    const int result{::fsync(descriptor)};
+#else
+    const int result{::fdatasync(descriptor)};
+#endif
+    if (result != 0) {
+        return Result<void>::Err(ErrnoMessage(std::string{"sync "} + std::string{description}));
     }
     return Result<void>::Ok();
 }
