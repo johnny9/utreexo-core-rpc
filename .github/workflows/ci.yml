@@ -186,6 +186,8 @@ jobs:
       FLORESTA_COMMIT: bc2db8d07e72651f9981ce589c5688f4d575dc7a
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Floresta build dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends libboost-dev
       - name: Build sidecar
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel 2
       - name: Install verified Bitcoin Core binary
