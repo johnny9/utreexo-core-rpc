@@ -56,32 +56,40 @@ bit, version/verack, sendaddrv2/getaddr, ping/pong, and a complete Floresta-shap
 captured and verified before its block mutates the forest. The P2P envelope and request
 decoders also have a sanitizer-backed libFuzzer target.
 
-## Differential regtest
+## Differential regtest and current wire consumer
 
 `integration/floresta_regtest.py` uses:
 
 - `rpc-utreexo-bridge` commit
   `9582853345839d625e80ef46b1a23b6dd0fef6c6` as the independent forest and
   proof producer.
-- Floresta v0.8.1 commit
-  `aaef08453a89a55fdb42e1541de7a18c151cdbe8` as the proof-validating consumer.
+- Floresta v0.9.1 commit
+  `bc2db8d07e72651f9981ce589c5688f4d575dc7a` as the proof-validating consumer.
 
-That Floresta pin is intentional. It is the last tagged release using the
-legacy proof-bearing block inventory `0x41000002` implemented by the reference
-bridge. Floresta v0.9 switched to separate `getuproof`/`uproof` messages and is
-not wire-compatible with that bridge.
+The current pin is intentional: Floresta v0.9 switched to separate
+`getuproof`/`uproof` messages and historical-state exchange. A Rust fixture is
+compiled inside that checkout and decodes sidecar vectors with Floresta's own
+wire and accumulator types.
 
 The harness mines a 104-block regtest chain containing a SegWit spend, a
 same-block parent/child spend, and an OP_RETURN transaction. It requires:
 
 1. The C++ sidecar and reference bridge to report the same tip, leaf count, and
    roots after independent reconstruction from Bitcoin Core.
-2. Floresta to validate every proof-bearing block, leave IBD, reach the exact
-   Core tip, and report the same roots.
+2. A local checkpoint below the tip to bootstrap a fresh mmap forest and bounded
+   suffix proof archive, which must retain identical state across a scrubbed reopen.
+3. A second sidecar to construct a canonical-genesis proof/state archive.
+4. Floresta to activate through the reference peer, then use Bitcoin Core for
+   ordinary blocks and the C++ proof-only sidecar for a newly mined
+   transaction-bearing block, reaching the exact Core tip and roots.
 
 The harness also converts the C++ forest to its mmap/WAL representation, mines
 one more block, reopens the online state, applies that block through the WAL,
-flushes the native base, and repeats the independent root/leaf comparison.
+flushes the native base, and repeats the independent root/leaf comparison. The
+sidecar is stopped with SIGTERM and must drain its proof WAL and preserve the
+same final state. Current Floresta still couples initial archive peer selection
+to header/block service, so initial activation is deliberately staged; header
+forwarding remains an upstream peer-role concern rather than a sidecar feature.
 
 ## Utreexod durability-test review
 

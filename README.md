@@ -6,7 +6,9 @@ Core node using `getblock(hash, 3)` and derives the exact Utreexo leaf hashes. A
 checkpoint catch-up streams directly into native mmap storage and continues through a
 block-atomic write-ahead log with bounded coalesced RAM deltas. High-memory operators
 can opt into a RAM-first catch-up with `--fast-sync`. An optional ordered proof pipeline
-can retain every Floresta-compatible proof from an AssumeUtreexo checkpoint to the tip.
+can retain every Floresta-compatible block proof from an AssumeUtreexo checkpoint to
+the tip. A genesis rebuild additionally records the compact post-block accumulator
+state at every height and can provide full historical block-proof/state coverage.
 
 The accumulator library has no RPC, JSON, filesystem, or P2P dependency. Its value
 types and component boundaries are deliberately close to Bitcoin Core conventions so
@@ -33,18 +35,22 @@ the sidecar transport with it.
   durable superblocks.
 - Automatic shallow-reorg rollback from retained WAL before-images. Reorgs older
   than the configured window fail closed to the preserved validated checkpoint.
-- A durable checkpoint-to-tip proof store with parallel serialization, ordered group
-  commit, checksummed append-only data, a compact index WAL, and a rebuildable mmap
-  height index.
-- An optional inbound Bitcoin-v1 `NODE_UTREEXO` proof peer with bounded recent-proof
-  caching plus proof-store fallback, Floresta-compatible `getuproof`/`uproof`,
-  handshake, ping/pong, and safe handling of unsupported messages.
+- A durable proof store with parallel serialization, ordered group commit,
+  independently authenticated post-block states, checksummed append-only data, a
+  compact index WAL, and a rebuildable mmap height index. Stores can begin at either
+  an AssumeUtreexo checkpoint or canonical genesis.
+- An optional inbound Bitcoin-v1 proof peer with bounded recent-proof caching plus
+  proof-store fallback, Floresta-compatible `getuproof`/`uproof` and historical-state
+  messages, handshake, admission/egress limits, explicit public-address gossip, and
+  safe handling of unsupported messages.
 
 Without `--proof-store`, bootstrap still omits historical proof generation and P2P
 keeps only a bounded, disposable recent cache. With `--proof-store`, each missing proof
 is generated and verified against the pre-mutation forest, made durable, and available
-to P2P. Coverage begins with the block after the store's AssumeUtreexo base, so the node
-does not claim full-genesis `NODE_UTREEXO_ARCHIVE` service.
+to P2P. A checkpoint-based store covers `base + 1` onward and does not claim
+full-history service. Only a store constructed continuously from the selected
+network's canonical genesis through the durable forest tip can advertise archive
+coverage.
 
 ## Build and test
 
@@ -61,11 +67,63 @@ ctest --test-dir build --output-on-failure
 The standalone accumulator can also be built without the RPC adapter using
 `-DUTREEXO_BUILD_RPC=OFF`.
 
+## Install and run with systemd
+
+The release archive is laid out for the default `/usr/local` prefix and its generated
+unit starts `/usr/local/bin/utreexo-bridge`. Verify the adjacent basename-only checksum,
+then extract the single top-level archive directory into that prefix:
+
+```sh
+sha256sum --check utreexo-bridge-0.4.0-Linux-x86_64.tar.gz.sha256
+sudo tar --no-same-owner \
+  -xzf utreexo-bridge-0.4.0-Linux-x86_64.tar.gz \
+  -C /usr/local --strip-components=1
+```
+
+For a conventional `/usr/bin` installation, set the prefix while configuring so the
+unit's `ExecStart` is generated correctly; do not change only the install-time prefix:
+
+```sh
+cmake -S . -B build-system -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build build-system -j2
+sudo cmake --install build-system
+```
+
+Create an unprivileged service account and its writable state directory, then install
+the generated service assets from the selected prefix (replace `/usr/local` with `/usr`
+for the second example):
+
+```sh
+sudo useradd --system --user-group --home-dir /var/lib/utreexo-bridge \
+  --shell /usr/sbin/nologin utreexo
+sudo install -d -o utreexo -g utreexo -m 0750 /var/lib/utreexo-bridge
+sudo install -d -o root -g utreexo -m 0750 /etc/utreexo-bridge
+sudo install -o root -g root -m 0644 \
+  /usr/local/share/utreexo-bridge/systemd/utreexo-bridge.service \
+  /etc/systemd/system/utreexo-bridge.service
+sudo install -o root -g utreexo -m 0640 \
+  /usr/local/share/utreexo-bridge/systemd/utreexo-bridge.conf.example \
+  /etc/utreexo-bridge/utreexo-bridge.conf
+```
+
+Edit the configuration paths, give only the `utreexo` account read access to Core's
+cookie, and place the authenticated checkpoint at the configured path before starting;
+the service fails closed when that input is absent. All online-state and proof-store
+paths must remain under the writable `/var/lib/utreexo-bridge` directory allowed by the
+hardened unit. Finally load and enable it:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now utreexo-bridge.service
+sudo systemctl --no-pager --full status utreexo-bridge.service
+```
+
 ## Bootstrap from genesis
 
 Bitcoin Core must be unpruned and have undo data for every processed block. `txindex`
-is not required. With no `--checkpoint`, the sidecar writes no forest state while it
-builds and a process failure restarts from genesis.
+is not required. With neither `--checkpoint` nor `--recovery-checkpoint`, the sidecar
+writes no forest checkpoint while it builds and a process failure restarts from
+genesis.
 
 The JSON-RPC chain source keeps one HTTP connection alive, performs one
 `getblockhash` and one verbosity-3 `getblock` call per block, and overlaps a bounded
@@ -84,17 +142,30 @@ To make one recoverable checkpoint at shutdown or at the reached tip:
 ```sh
 ./build/utreexo-bridge \
   --rpc-cookie=/path/to/bitcoin/.cookie \
-  --checkpoint=/fast/storage/utreexo-forest.chk \
+  --recovery-checkpoint=/fast/storage/utreexo-forest.chk \
+  --fast-sync \
   --log-level=info
 ```
+
+A missing bootstrap `--checkpoint` fails closed unless
+`--allow-untrusted-checkpoint` is present. This prevents a mistyped distribution path
+from silently starting a Genesis rebuild. `--recovery-checkpoint` is explicitly local
+read/write state: if it exists it is preferred on restart, its format checksum and
+active Core chain point are verified, and otherwise it is created at a completed block
+boundary. Protect it with the same filesystem permissions as the online forest.
+Loading a RAM recovery checkpoint requires `--fast-sync`; without that explicit flag,
+checkpoint catch-up requires `--online-state`. Checkpoint, recovery, and state-JSON files
+must be outside both the online-state and proof-store directories. Those two directories
+must also be separate and non-nested. Startup resolves normalized paths, symlinks, and
+existing hardlinks and rejects violations before opening RPC or modifying storage.
 
 Checkpoint format 3 retains the two overwritten BIP30 originals as permanent
 Utreexo leaves. The corrected sidecar intentionally refuses format-2 checkpoints,
 which may contain the incompatible forest; reconstruct from genesis or from an
 independently validated format-3 proving-forest checkpoint.
 
-The binary contains a trust anchor for the published mainnet bridge checkpoint at
-height 943013. Existing checkpoint files are required to match its consensus state
+The binary contains a trust anchor for the release-candidate mainnet bridge checkpoint
+at height 943013. Existing checkpoint files are required to match its consensus state
 and exact file identity by default:
 
 ```sh
@@ -114,7 +185,24 @@ milestones or locally generated checkpoints, `--allow-untrusted-checkpoint` skip
 both checks and emits a warning that the state is unauthenticated. Use that override
 only when the checkpoint's provenance has been established separately. Once the
 native online directory exists, it intentionally takes precedence over the bootstrap
-file and no checkpoint override is needed.
+file and no checkpoint override is needed. A trusted bootstrap is always immutable:
+RAM-mode interval, memory-guard, signal, and final saves go to
+`mainnet-943013-compact.chk.resume` by default. An existing resume is preferred over
+the bootstrap after its trusted-base lineage and current Core chain point pass
+validation. A corrupt, incomplete, or reorged automatically named resume falls back
+to exact validation of the preserved bootstrap; an explicitly named recovery file
+fails closed so an operator-selected path is never silently ignored. Use
+`--recovery-checkpoint=PATH` to choose a different local location; never point it at
+the bootstrap file.
+
+The machine-readable release manifest is
+[`contrib/checkpoints/mainnet-943013.json`](contrib/checkpoints/mainnet-943013.json).
+Its `download_url` intentionally remains `null` until an external host has published
+the exact 14.9 GB object; do not announce the beta as independently bootstrappable
+before that field points to an HTTPS location. Regardless of transport, the binary
+enforces the embedded size, file hash, block hash, leaf count, and ordered roots. The
+tagged-release workflow also fails closed while this URL is absent, so it cannot
+publish a package whose primary bootstrap artifact is unavailable.
 
 `--checkpoint-interval=N` is intentionally opt-in because every checkpoint streams the
 full forest. Large intervals reduce restart cost while avoiding the per-block rewrite
@@ -149,6 +237,7 @@ silently choosing the high-memory path.
 ./build/utreexo-bridge \
   --rpc-cookie=/path/to/bitcoin/.cookie \
   --checkpoint=/checkpoint-disk/validated-mainnet.chk \
+  --recovery-checkpoint=/checkpoint-disk/validated-mainnet.resume.chk \
   --online-state=/nvme/utreexo-online \
   --fast-sync \
   --follow
@@ -165,16 +254,20 @@ Online defaults:
 - WAL segments: 256 MiB;
 - before-image/reorg retention: 1,008 blocks;
 - WAL synchronization: every block before its state is published;
+- WAL directory synchronization: once when each 256 MiB segment is created;
 - base flush: at the delta ceiling, 1 GiB of unapplied redo WAL, after 24 hours in
   follow mode, or at clean non-follow shutdown; and
 - full-forest compaction/checkpoint rewrites: never during normal tip following.
 
-The native directory contains `forest.hashes`, `forest.meta`, `chain.hashes`, two
-alternating `state.*` superblocks, and `wal-*.log` segments. Do not copy it as a shared
-checkpoint while unapplied WAL exists; use the preserved format-3 checkpoint until an
-explicit online export command is added.
+The native directory contains `forest.hashes`, `forest.meta`, two alternating
+`chain.*.hashes` snapshots paired with the two alternating `state.*` superblocks, and
+`wal-*.log` segments. The small chain index is rewritten to its inactive generation
+before the matching superblock is published, so a reorg cannot expose a mixed chain
+view after a crash. Do not copy the directory as a shared checkpoint while unapplied
+WAL exists; use the preserved format-3 checkpoint until an explicit online export
+command is added.
 
-## Build an AssumeUtreexo proof store
+## Build a proof store
 
 Start from the validated proving-forest checkpoint that will be distributed as the
 AssumeUtreexo base. The `--online-state` path in this first invocation must not already
@@ -194,7 +287,40 @@ the new proof store start at the online tip instead.
 ```
 
 The checkpoint height and hash become the immutable proof-store base. Proofs cover
-`base + 1` through the durable proof tip. During bulk replay, one sequential forest
+`base + 1` through the durable proof tip. This is the recommended, quick bootstrap
+mode for serving clients that start from the same AssumeUtreexo state.
+
+For a full historical archive, start with no existing bootstrap checkpoint,
+online-state, or proof-store data. A recovery checkpoint path is useful as the
+emergency output for SIGTERM or the RAM guard and is automatically considered local
+state on later reloads:
+
+```sh
+./build/utreexo-bridge \
+  --rpc-cookie=/path/to/bitcoin/.cookie \
+  --recovery-checkpoint=/nvme/utreexo-genesis-recovery.chk \
+  --proof-store=/nvme/utreexo-proofs-from-genesis \
+  --online-state=/nvme/utreexo-online-from-genesis \
+  --fast-sync \
+  --follow \
+  --p2p-port=8338 \
+  --log-level=debug
+```
+
+This path generates block proofs from height 1 and stores the empty post-genesis state
+at height 0 plus every subsequent post-block state. It is the only mode eligible for
+historical archive signaling. It performs a full RAM rebuild before the one-time mmap
+switch, so use the same 32 GiB-class host precautions as `--fast-sync`; the completed
+mainnet acceptance evidence is summarized in `MAINNET_SYNC_READINESS.md`. The default
+2 GiB availability reserve stops before the next block and streams an atomic recovery
+checkpoint to that path. Exit status 2 deliberately prevents an automatic restart in
+the supplied systemd unit, avoiding a low-memory checkpoint/restart loop. Hard power
+loss still restarts forest reconstruction from the last completed checkpoint (or
+genesis), while already committed proof batches are reused and verified. Add a
+deliberately large `--checkpoint-interval` only when that extra restart protection
+justifies each full-forest rewrite.
+
+During bulk replay, one sequential forest
 thread performs `prove -> verify -> modify`; two workers serialize completed proofs;
 one writer publishes them in height order. The default queue is bounded by both 1,008
 blocks and 256 MiB. During RAM bootstrap, a batch contains up to 32 proofs; with the
@@ -205,27 +331,54 @@ timed partial batches. Change these limits with `--proof-store-threads`,
 `--proof-store-queue-blocks`, `--proof-store-queue-mib`,
 `--proof-store-group-blocks`, and `--proof-store-group-delay-ms`.
 
-The directory has three files:
+The regular queue ceiling does not reject an otherwise valid unusually large block:
+one proof may enter an empty queue by itself, up to the 320 MiB record limit. This
+preserves forward progress while keeping normal pipelining bounded, but an adversarial
+consensus-valid block can temporarily use more than the nominal 256 MiB queue budget.
+The record limit includes headroom for the maximum input count, 10,000-byte spent
+scripts supplied by Core's undo data, and the batch-proof hashes. Keep the 2 GiB memory
+reserve enabled during the full-RAM archival build.
 
-- `proofs.dat` is append-only proof payload data. Each record includes its height,
-  block/previous hashes, SHA-256 checksum, and commit marker.
+The directory has four files:
+
+- `FORMAT` is the durable ownership marker. It is synchronized before any mutable
+  store file is first created, and must remain a regular file with a single link and
+  the exact supported marker value.
+- `proofs.dat` is append-only proof/state data. Each record includes its height,
+  block/previous hashes, post-block leaf count and ordered roots, an independently
+  authenticated state prefix, a full-record SHA-256 checksum, and a commit marker.
 - `index.wal` is the small authoritative active-chain index. A batch is appended and
   synchronized only after all referenced proof data has been synchronized.
 - `height.index` is an 80-byte-per-proof mmap lookup table. It is rebuilt from the WAL
   on every open and is not synchronized per block; losing or corrupting it does not
   lose proofs.
 
+A markerless nonempty directory is adopted only as a legacy proof store after a
+read-only scan validates every committed WAL record and referenced data record and
+confirms there is no uncommitted tail. Partial stores, unrelated entries, and
+same-name files that do not form a complete archive are rejected unchanged. Once
+adopted, `FORMAT` is synchronized before recovery or index rebuilding can mutate any
+file.
+
 The pipeline drains before a sparse checkpoint is published and before the forest
-switches to online mmap/WAL storage. Once the forest is online, including restart
-catch-up and live-tip following, each proof WAL entry is synchronized before the next
-block is processed or the proof is put in the P2P cache. A crash between the forest WAL
-commit and the proof commit can leave the forest at most one block ahead; startup rolls
-the forest back using its retained undo WAL and replays that block. Existing durable
+switches to online mmap/WAL storage. During mmap catch-up, proof commits remain batched
+but the non-durable distance is never allowed to exceed the forest's retained undo
+window. Live tip following makes each proof durable before publishing that height to
+the P2P cache. After a crash, startup rolls an mmap forest back to the durable proof
+tip when necessary and replays the bounded suffix. If the archive is ahead of an older
+online forest, Core's active-chain hashes are checked first: an active archive is kept
+for proof reuse, while only a stale branch suffix is truncated. Existing durable
 proofs are hash-checked, their compact leaves are compared with Core-derived leaves,
 and their proofs are verified against the pre-mutation forest before reuse on restart.
 A logically invalid record is truncated and regenerated. Shallow reorgs append one
 proof-index truncation record and overwrite only mmap index entries; old payload bytes
 are not rewritten or immediately reclaimed.
+
+`--proof-store-scrub` rereads, bounds, parses, and checksum-verifies every active record
+before serving. It is an on-disk integrity check, not an independent Bitcoin-consensus
+validation of an archive supplied by an untrusted party. The normal construction and
+replay path obtains blocks from Core, verifies generated/reused proofs against the
+forest, and checks archived post-block states against the reconstructed state.
 
 For distribution, copy the proof directory only while the sidecar is stopped or from
 one filesystem-level snapshot; copying `proofs.dat` and `index.wal` at unrelated live
@@ -235,15 +388,18 @@ be distributed because it is reconstructed from `index.wal`.
 
 ## Serve proofs to Floresta
 
-P2P service is deliberately available only in durable follow mode. It advertises
-`NODE_UTREEXO` but not `NODE_NETWORK` or `NODE_UTREEXO_ARCHIVE`: Floresta downloads
-ordinary headers and blocks from another Bitcoin peer and selects this sidecar for
-`getuproof` requests.
+P2P service is deliberately available only in durable follow mode. It never advertises
+`NODE_NETWORK` or serves headers/blocks: Floresta downloads ordinary chain data from
+another Bitcoin peer and uses this sidecar for `getuproof`. Checkpoint-to-tip stores
+advertise only the new-proof compatibility service. A canonical genesis-to-tip store
+also advertises historical archive service and answers Floresta's type-1 `getcfilters`
+state requests.
 
 ```sh
 ./build/utreexo-bridge \
   --rpc-cookie=/path/to/bitcoin/.cookie \
   --online-state=/nvme/utreexo-online \
+  --proof-store=/nvme/utreexo-proofs \
   --follow \
   --p2p-port=8338 \
   --p2p-bind=127.0.0.1 \
@@ -253,21 +409,83 @@ ordinary headers and blocks from another Bitcoin peer and selects this sidecar f
 The default RAM cache retains at most 288 proofs and 256 MiB. Both limits apply, and
 can be changed with `--p2p-proof-cache-blocks` and `--p2p-proof-cache-mib`. The cache is
 disposable: restart begins empty, while reorganization rollback immediately removes
-entries above the recovered active-chain height. With `--proof-store`, a cache miss is
-served from the durable checkpoint-to-tip index. Without it, proofs are captured only
-for blocks arriving after this process starts. A request that races the sidecar's Core
-poll waits up to 15 seconds for publication, avoiding Floresta's longer retry.
+entries above the recovered active-chain height. A single proof larger than this RAM
+budget is intentionally not cached and increments `proof_cache_oversized_skips`; it
+does not stop the sidecar. With `--proof-store`, that cache miss is served from the
+durable checkpoint-to-tip index. Without it, proofs are captured only for blocks
+arriving after this process starts, and an oversized uncached proof is unavailable. A
+request that races the sidecar's Core poll waits up to 15 seconds for publication,
+avoiding Floresta's longer retry.
+
+The listener also limits total peers, peers per IPv4 address, concurrent archive work,
+proof-response bandwidth, and each peer's inbound traffic to a whole-message 4 MiB/s
+window by default. One absolute deadline covers each inbound message and each complete
+outbound response or gossip handshake, so byte dribbling cannot extend a connection's
+resource hold indefinitely. A cache miss waits for tip publication without holding a
+proof-work slot or egress reservation, and shutdown cancels those waits. After a proof
+is found, its response size is measured against the payload limit and that exact wire
+size is reserved before the response vector is created. Reservations are charged
+conservatively on later serialization or send failure, avoiding concurrent refunds
+that could exceed the configured burst. The framed header and payload are sent without
+building a second full response copy. The corresponding `--p2p-*` options are listed
+by `utreexo-bridge --help`; lower them before exposing a resource-constrained host.
+
+For a directly reachable public listener, forward/open the chosen TCP port, bind all
+interfaces, provide the numeric globally routable IPv4 endpoint that clients should
+dial, and name one or more Utreexo-aware peers to relay that address:
+
+```sh
+./build/utreexo-bridge \
+  --rpc-cookie=/path/to/bitcoin/.cookie \
+  --online-state=/nvme/utreexo-online \
+  --proof-store=/nvme/utreexo-proofs \
+  --follow \
+  --p2p-port=8338 \
+  --p2p-bind=0.0.0.0 \
+  --p2p-advertise=YOUR_PUBLIC_IPV4:8338 \
+  --p2p-gossip-seed=UTREEXO_AWARE_IPV4:PORT \
+  --p2p-network=mainnet
+```
+
+`--p2p-gossip-seed` is repeatable. At startup and every five minutes by default, the
+sidecar performs a bounded v1 handshake, verifies the peer advertises a Utreexo
+service bit, and sends its advertised endpoint with the same Utreexo service bits
+offered by its listener. It also returns that endpoint to
+inbound `getaddr` requests using `addr` or `addrv2`. This is best-effort Bitcoin
+address relay, not automatic external-IP detection or a DNS seed: verify the public
+NAT/firewall path independently and use more than one trusted seed for redundancy.
+Ordinary Bitcoin Core peers discard Utreexo-only address records, so they are not
+valid gossip seeds and the successful-send log does not claim downstream relay.
+The clearnet gossip implementation accepts numeric IPv4 endpoints only; use the Tor
+deployment below for onion reachability.
 
 The first implementation supports the Bitcoin v1 transport. Current Floresta must be
-configured with `--allow-v1-fallback`. When using Floresta's fixed-peer mode, include
-both a normal `NODE_NETWORK` peer (the local Core node is suitable) and the sidecar:
+configured with `--allow-v1-fallback`. Floresta v0.9.1 requires its initial sync peer to
+provide headers and blocks as well as Utreexo archive service, which this proof-only
+sidecar intentionally does not claim. Until Floresta separates those peer roles during
+initial selection, first activate it through a normal/reference peer and then add Core
+and the sidecar with Floresta's `addnode` RPC. The integration test exercises exactly
+that staged arrangement. Header forwarding is intentionally deferred to Floresta-side
+peer-role work.
 
 ```sh
 florestad \
-  --connect 127.0.0.1:8333 \
-  --connect 127.0.0.1:8338 \
+  --connect=REFERENCE_PEER:8333 \
   --allow-v1-fallback
 ```
+
+After `getblockchaininfo` reports that Floresta is active, call `addnode` for the Core
+block peer and the sidecar proof peer, then remove the temporary reference peer. See
+`test/integration/floresta_regtest.py` for the current JSON-RPC sequence.
+
+The draft service bit used for Floresta interoperability also describes unconfirmed
+transaction-proof relay, which is not implemented here; this beta serves block proofs
+only. The type-1 `getcfilters` state exchange is a current-Floresta compatibility
+protocol rather than BIP157 compact-filter service. Floresta v0.9.1's transport also
+rejects messages over 5,000,000 bytes. Ordinary mainnet proofs fit below that client
+limit, but a deliberately adversarial valid block could require a larger proof; the
+archive and sidecar retain a 320 MiB safety bound for such blocks, while support in
+that Floresta release remains an upstream limitation.
 
 To share both peers without exposing either listener on a clearnet interface, publish
 separate Tor onion services for Core and the sidecar. Keep the sidecar on
@@ -276,8 +494,8 @@ The complete mainnet configuration, client example, and verification checklist a
 [`doc/tor.md`](doc/tor.md).
 
 Keep the listener on loopback while testing; binding `0.0.0.0` is an explicit operator
-choice. BIP 324 transport, peer discovery, transaction relay, standard block service,
-and proofs at or before the AssumeUtreexo base remain out of scope.
+choice. BIP 324 transport, transaction relay, standard block service, and proofs at or
+before an AssumeUtreexo base remain out of scope.
 
 ## Offline arena compaction
 
@@ -312,7 +530,8 @@ The sidecar emits UTC, single-line key/value records in the form
 - `debug` adds forest arena/index capacity and tombstones; 1,000-block timing windows
   split into prefetch wait, RPC, parse, archive policy, prove, verify, modify, proof
   enqueue, and durability wait; proof queue/backpressure/batch/write/fsync statistics;
-  mmap-forest WAL serialization/rotation/write/fsync timing; checkpoint timing; and
+  mmap-forest WAL serialization/rotation/write/fsync timing and segment-directory
+  sync count; checkpoint timing; and
   process RSS/HWM, CPU, faults, context switches, and I/O.
 - `trace` adds the same phase timings for every processed block plus every successful
   RPC call. It is useful for short investigations but produces substantial output
@@ -415,7 +634,9 @@ sequential sync; reorg detection; randomized RAM-versus-mmap differential
 sequences; WAL crash/corruption recovery; alternating-superblock recovery;
 multi-block undo/redo; WAL rotation/retention boundaries; ordered proof-pipeline
 publication; proof-WAL torn-tail and corruption recovery; mmap-index rebuild;
-proof-store reorgs; and real-socket P2P archive fallback. The accumulator
+proof-store v1-to-v2 migration, authenticated bounded state reads, proof-store
+reorgs; per-IP/concurrency/egress admission; and real-socket P2P archive fallback.
+The accumulator
 tests run without RPC or Bitcoin Core. See
 [test/UPSTREAM_TESTS.md](test/UPSTREAM_TESTS.md) for the exact upstream pins,
 case mapping, utreexod durability-test review, and intentionally inapplicable
@@ -425,27 +646,30 @@ Rustreexo API suites.
 
 The opt-in integration harness creates an exceptional-output regtest chain in
 Bitcoin Core, independently reconstructs it with this sidecar and
-`rpc-utreexo-bridge`, switches the C++ sidecar to mmap/WAL storage, mines another
-block, reopens and advances that state, then makes Floresta proof-validate the
-reference bridge's blocks. All three implementations must agree on the tip,
-leaf count, and roots.
+`rpc-utreexo-bridge`, switches and reopens the C++ mmap/WAL state, and compares all
+three accumulators. It also creates a compact checkpoint below the tip, streams it
+into a fresh mmap forest, builds only the checkpoint-to-tip proof suffix, and verifies
+that both stores survive a scrubbed reopen. It then constructs a C++ Genesis
+proof/state archive,
+activates current Floresta through the reference peer, stages Core as the block peer
+and the C++ sidecar as the proof peer, stops the reference peer, and mines a
+transaction-bearing block. Floresta must validate that block using the sidecar's
+actual `uproof`, and graceful sidecar shutdown must persist the same final state.
 
 The external binaries are deliberately pinned to:
 
 - `rpc-utreexo-bridge` commit
   `9582853345839d625e80ef46b1a23b6dd0fef6c6`.
-- Floresta v0.8.1 commit
-  `aaef08453a89a55fdb42e1541de7a18c151cdbe8`.
+- Floresta v0.9.1 commit
+  `bc2db8d07e72651f9981ce589c5688f4d575dc7a`.
 
-Floresta v0.9 and later use the newer `getuproof`/`uproof` protocol and cannot
-consume the legacy proof-bearing blocks published by that reference bridge. The
-harness checks the Floresta version up front.
+The harness requires Floresta v0.9.1 or newer and checks the version up front.
 
 ```sh
 cmake -S . -B build-integration \
   -DUTREEXO_ENABLE_REGTEST_INTEGRATION=ON \
   -DUTREEXO_REFERENCE_BRIDGE_EXECUTABLE=/path/to/rpc-utreexo-bridge \
-  -DFLORESTAD_EXECUTABLE=/path/to/floresta-v0.8.1/florestad
+  -DFLORESTAD_EXECUTABLE=/path/to/floresta-v0.9.1/florestad
 cmake --build build-integration -j2
 ctest --test-dir build-integration -R utreexo_floresta_regtest --output-on-failure
 ```
@@ -465,11 +689,13 @@ request:
 - Address/Leak/UndefinedBehavior Sanitizers and ThreadSanitizer in separate jobs.
 - Clang-Tidy's Clang analyzer, use-after-move, and performance checks.
 - ASan/UBSan-backed libFuzzer smoke tests for forest deserialization and verbose
-  Bitcoin Core RPC JSON parsing.
+  Bitcoin Core RPC JSON parsing plus P2P envelopes and proof requests.
 - Valgrind leak and memory-error checks for both deterministic test executables.
 - ShellCheck, Python bytecode compilation, and whitespace validation.
 - The pinned Bitcoin Core/reference bridge/Floresta differential regtest described
   above.
+- A current-Floresta Rust fixture that decodes the exact sidecar proof and historical
+  state messages into Floresta's own wire and accumulator types.
 
 The sanitizer interface is also available locally:
 

@@ -92,18 +92,25 @@ Do not start two sidecars against the same online state or proof store. Wait for
 `p2p_listening` log event; the listener is started only after the sidecar has opened,
 recovered, and synchronized its durable state.
 
-The sidecar does not announce addresses or provide peer discovery. Share its onion
-endpoint out of band. It serves Utreexo proofs but not ordinary headers or blocks, so
-a Floresta client still needs at least one `NODE_NETWORK` peer. Current Floresta can
-use the two endpoints together:
+The sidecar's clearnet discovery support intentionally handles IPv4 only; it does not
+announce onion addresses. Share its onion endpoint out of band. It serves Utreexo
+proofs but not ordinary headers or blocks, so a Floresta client still needs at least
+one `NODE_NETWORK` peer. Floresta v0.9.1 also couples initial AssumeUtreexo peer
+selection to block service. Activate it through a temporary full archive/block peer,
+then add the two local services as separate block and proof peers before removing that
+temporary peer:
 
 ```sh
 florestad \
   --proxy=127.0.0.1:9050 \
-  --connect=BITCOIN_ONION.onion:8333 \
-  --connect=UTREEXO_ONION.onion:8338 \
+  --connect=TEMPORARY_ARCHIVE_PEER.onion:8333 \
   --allow-v1-fallback
 ```
+
+Once its RPC reports an active chain, use Floresta's `addnode` RPC for
+`BITCOIN_ONION.onion:8333` and `UTREEXO_ONION.onion:8338`, then remove the temporary
+peer. This staging can be dropped when Floresta separates initial header/block and
+proof peer selection.
 
 The fallback flag is required because this sidecar currently implements Bitcoin v1
 transport only. Proofs at or before the proof store's AssumeUtreexo base are not
