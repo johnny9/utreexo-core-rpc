@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.22)
 
 project(utreexo_bridge VERSION 0.4.0 LANGUAGES CXX)
 
+set(UTREEXO_VERSION_SUFFIX "-beta.1")
+if(NOT UTREEXO_VERSION_SUFFIX STREQUAL "" AND
+   NOT UTREEXO_VERSION_SUFFIX MATCHES "^-(alpha|beta|rc)\\.[1-9][0-9]*$")
+    message(FATAL_ERROR
+        "UTREEXO_VERSION_SUFFIX must be empty or a numbered alpha, beta, or rc suffix")
+endif()
+set(UTREEXO_FULL_VERSION "${PROJECT_VERSION}${UTREEXO_VERSION_SUFFIX}")
+
 include(CTest)
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
@@ -134,7 +142,7 @@ if(UTREEXO_BUILD_RPC)
     add_executable(utreexo-bridge src/main.cpp)
     target_link_libraries(utreexo-bridge PRIVATE utreexo_core_rpc utreexo_checkpoint utreexo_p2p)
     target_compile_definitions(utreexo-bridge PRIVATE
-        UTREEXO_BRIDGE_VERSION="${PROJECT_VERSION}")
+        UTREEXO_BRIDGE_VERSION="${UTREEXO_FULL_VERSION}")
     utreexo_configure_target(utreexo-bridge)
 endif()
 
@@ -259,7 +267,7 @@ install(FILES doc/tor.md
     DESTINATION ${CMAKE_INSTALL_DOCDIR})
 
 set(CPACK_PACKAGE_NAME "utreexo-bridge")
-set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_VERSION "${UTREEXO_FULL_VERSION}")
 set(CPACK_PACKAGE_FILE_NAME
     "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_GENERATOR "TGZ")

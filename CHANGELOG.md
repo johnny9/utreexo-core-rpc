@@ -4,7 +4,7 @@ All notable changes to the Utreexo bridge sidecar are documented here. The
 project follows Semantic Versioning while the command line, checkpoint, and
 proof-store formats remain explicitly versioned.
 
-## 0.4.0 - 2026-09-03
+## 0.4.0-beta.1 - 2026-09-03
 
 ### Added
 
