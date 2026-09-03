@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  preflight:
+    name: Validate release identity and checkpoint availability
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Require a version-matching tag on master
+        run: |
+          project_version="$(sed -n 's/^project(utreexo_bridge VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
+          test "${GITHUB_REF_NAME}" = "v${project_version}"
+          git fetch --no-tags origin master
+          git merge-base --is-ancestor "${GITHUB_SHA}" origin/master
+      - name: Require a published authenticated checkpoint
+        run: python3 tools/verify-checkpoint-manifest.py --require-download-url
+      - name: Stream and authenticate the published checkpoint
+        run: python3 tools/verify-checkpoint-download.py
+
+  validate:
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+
+  linux-package:
+    name: Validate and publish Linux package
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build, test, and package
+        run: tools/package-release.sh "${RUNNER_TEMP}/build-release"
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          "${RUNNER_TEMP}"/build-release/utreexo-bridge-*.tar.gz
+          "${RUNNER_TEMP}"/build-release/utreexo-bridge-*.tar.gz.sha256
+          --generate-notes
+          --verify-tag

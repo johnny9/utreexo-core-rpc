@@ -5,6 +5,7 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -112,9 +113,13 @@ jobs:
       - name: Run Clang-Tidy
         run: run-clang-tidy -p build -quiet '.*/(src|test|bench)/.*\.cpp$'
       - name: Check shell scripts
-        run: shellcheck tools/*.sh
+        run: shellcheck tools/*.sh test/*.sh
       - name: Check Python syntax
-        run: python3 -m compileall -q test/integration
+        run: python3 -m compileall -q test tools
+      - name: Check release checkpoint metadata
+        run: python3 tools/verify-checkpoint-manifest.py
+      - name: Test release checkpoint download verifier
+        run: python3 test/verify_checkpoint_download_tests.py
       - name: Check whitespace
         run: git diff --check
 
@@ -132,11 +137,13 @@ jobs:
       - name: Check accumulator tests
         run: >-
           valgrind --error-exitcode=1 --leak-check=full
+          --fair-sched=yes
           --show-leak-kinds=all --errors-for-leak-kinds=definite,possible
           ./build/utreexo_tests
       - name: Check RPC tests
         run: >-
           valgrind --error-exitcode=1 --leak-check=full
+          --fair-sched=yes
           --show-leak-kinds=all --errors-for-leak-kinds=definite,possible
           ./build/utreexo_rpc_tests
 
@@ -176,7 +183,7 @@ jobs:
       CORE_VERSION: "31.1"
       CORE_ARCHIVE_SHA256: b80d9c3e04da78fb6f0569685673418cf686fadba9042d926d13fb87ff503f9e
       REFERENCE_COMMIT: 9582853345839d625e80ef46b1a23b6dd0fef6c6
-      FLORESTA_COMMIT: aaef08453a89a55fdb42e1541de7a18c151cdbe8
+      FLORESTA_COMMIT: bc2db8d07e72651f9981ce589c5688f4d575dc7a
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Build sidecar
@@ -216,7 +223,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      FLORESTA_COMMIT: 81eaf6a39773a10307c8555d06460b227739682e
+      FLORESTA_COMMIT: bc2db8d07e72651f9981ce589c5688f4d575dc7a
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -226,9 +233,10 @@ jobs:
           git clone --filter=blob:none https://github.com/getfloresta/Floresta floresta-current
           git -C floresta-current checkout --detach "${FLORESTA_COMMIT}"
       - name: Install sidecar wire compatibility test
-        run: >-
-          cp test/integration/floresta_wire_compat.rs
-          "${RUNNER_TEMP}/floresta-current/crates/floresta-wire/tests/sidecar_compat.rs"
+        run: |
+          mkdir -p "${RUNNER_TEMP}/floresta-current/crates/floresta-wire/tests"
+          cp test/integration/floresta_wire_compat.rs \
+            "${RUNNER_TEMP}/floresta-current/crates/floresta-wire/tests/sidecar_compat.rs"
       - name: Decode sidecar vectors with current Floresta
         working-directory: ${{ runner.temp }}/floresta-current
         run: cargo test --release --locked -p floresta-wire --test sidecar_compat
