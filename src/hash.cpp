@@ -182,11 +182,11 @@ void Ripemd160Transform(std::array<uint32_t, 5>& state, const std::byte* chunk)
     for (std::size_t i{0}; i < 80; ++i) {
         const uint32_t left{std::rotl(al + RipemdFunction(i, bl, cl, dl) +
                                          words[RIPEMD_R_LEFT[i]] + RipemdLeftConstant(i),
-                                     static_cast<int>(RIPEMD_S_LEFT[i])) + el};
+                                     RIPEMD_S_LEFT[i]) + el};
         al = el; el = dl; dl = std::rotl(cl, 10); cl = bl; bl = left;
         const uint32_t right{std::rotl(ar + RipemdFunction(79 - i, br, cr, dr) +
                                           words[RIPEMD_R_RIGHT[i]] + RipemdRightConstant(i),
-                                      static_cast<int>(RIPEMD_S_RIGHT[i])) + er};
+                                      RIPEMD_S_RIGHT[i]) + er};
         ar = er; er = dr; dr = std::rotl(cr, 10); cr = br; br = right;
     }
     const uint32_t temporary{state[1] + cl + dr};

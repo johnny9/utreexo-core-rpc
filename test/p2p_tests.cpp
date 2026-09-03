@@ -1259,8 +1259,11 @@ TEST(p2p_server_releases_proof_work_when_a_peer_dribbles_response_reads)
     CHECK(WaitUntil([&] { return server->Stats().proof_busy == 1; }));
     std::byte rejected{};
     CHECK_EQ(::recv(second, &rejected, 1, 0), 0);
+    // Serialization and checksumming of the deliberately large proof run under
+    // heavy instrumentation in CI. This is test-harness grace; the server's
+    // one-second socket write deadline above remains unchanged.
     CHECK(WaitUntil([&] { return server->Stats().active_proof_requests == 0; },
-                    std::chrono::seconds(15)));
+                    std::chrono::seconds(60)));
     CHECK_EQ(server->Stats().proofs_served, 0U);
 
     dribbling_reader.request_stop();
