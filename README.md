@@ -2,10 +2,10 @@
 
 This is a C++20, Bitcoin Core-compatible implementation of the low-write bridge
 bootstrap design. It reads sequential active-chain blocks from an unpruned Bitcoin
-Core node using `getblock(hash, 3)`, derives the exact Utreexo leaf hashes, and keeps
-the full proving forest in RAM during bulk bootstrap. At the validated Core tip it
-can atomically publish a native mmap generation and continue through a block-atomic
-write-ahead log with bounded coalesced RAM deltas. An optional ordered proof pipeline
+Core node using `getblock(hash, 3)` and derives the exact Utreexo leaf hashes. A new
+checkpoint catch-up streams directly into native mmap storage and continues through a
+block-atomic write-ahead log with bounded coalesced RAM deltas. High-memory operators
+can opt into a RAM-first catch-up with `--fast-sync`. An optional ordered proof pipeline
 can retain every Floresta-compatible proof from an AssumeUtreexo checkpoint to the tip.
 
 The accumulator library has no RPC, JSON, filesystem, or P2P dependency. Its value
@@ -61,7 +61,7 @@ ctest --test-dir build --output-on-failure
 The standalone accumulator can also be built without the RPC adapter using
 `-DUTREEXO_BUILD_RPC=OFF`.
 
-## Run a RAM-first bootstrap
+## Bootstrap from genesis
 
 Bitcoin Core must be unpruned and have undo data for every processed block. `txindex`
 is not required. With no `--checkpoint`, the sidecar writes no forest state while it
@@ -122,11 +122,12 @@ pattern this project is meant to eliminate.
 
 ## Switch to post-sync mmap/WAL operation
 
-Pass `--online-state` on the final bootstrap invocation. The sidecar continues using
-the RAM forest while it is behind, revalidates its final chain point against Core, then
-writes one native generation and releases the RAM arena. It does not overwrite the
-bootstrap checkpoint, which remains the recovery source for a reorg deeper than the
-online undo window.
+Pass `--online-state` when loading an existing checkpoint. This is the default
+checkpoint catch-up mode: the sidecar verifies the checkpoint checksum, streams its
+forest directly into a new native mmap generation without constructing the full RAM
+arena, validates every branch and root, and applies subsequent blocks through the WAL.
+It does not overwrite the bootstrap checkpoint, which remains the recovery source for
+a reorg deeper than the online undo window.
 
 ```sh
 ./build/utreexo-bridge \
@@ -135,6 +136,22 @@ online undo window.
   --online-state=/nvme/utreexo-online \
   --follow \
   --log-level=debug
+```
+
+`--fast-sync` is an explicit performance option. It keeps the checkpoint forest in
+RAM while catching up, then publishes `--online-state` at Core's tip. The process emits
+a warning before loading that this mode requires at least 32 GiB of system RAM; on
+smaller hosts use the default mmap/WAL path. Loading an existing checkpoint without
+either `--online-state` or `--fast-sync` fails with an actionable error instead of
+silently choosing the high-memory path.
+
+```sh
+./build/utreexo-bridge \
+  --rpc-cookie=/path/to/bitcoin/.cookie \
+  --checkpoint=/checkpoint-disk/validated-mainnet.chk \
+  --online-state=/nvme/utreexo-online \
+  --fast-sync \
+  --follow
 ```
 
 On later starts, the existing online directory takes precedence over `--checkpoint`.
@@ -376,11 +393,12 @@ forest or temporarily require a second arena.
 `ForestUsage` reports live and allocated arena slots, arena capacity/free slots,
 reverse-index entries/capacity/tombstones, and separate deterministic arena/index byte
 estimates. Actual RSS also includes allocator, RPC JSON, block, and executable overhead.
-The intended 32 GiB bootstrap profile processes one verbosity-3 block at a time and
-checkpoints only sparsely. Online mode maps the 48-byte native arena without populating
-or locking it, so the operating system can evict cold forest pages. Its explicit RAM
-cost is primarily the keyless reverse index, free-node bookkeeping, and the bounded
-delta cache; the mapped virtual size is not equivalent to resident memory.
+The opt-in fast-sync profile requires at least 32 GiB of system RAM, processes one
+verbosity-3 block at a time, and checkpoints only sparsely. Default checkpoint catch-up
+maps the 48-byte native arena without populating or locking it, so the operating system
+can evict cold forest pages. Its explicit RAM cost is primarily the keyless reverse
+index, free-node bookkeeping, and the bounded delta cache; the mapped virtual size is
+not equivalent to resident memory.
 
 Before attempting mainnet, follow the staged resource, Core preflight, recovery, and
 checkpoint guidance in [MAINNET_SYNC_READINESS.md](MAINNET_SYNC_READINESS.md).

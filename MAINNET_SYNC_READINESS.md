@@ -10,10 +10,12 @@ preserves and reload-validates the compact 900000 checkpoint, and fails closed o
 an exact-state mismatch. Use that controller for the 943013 validation run rather
 than a single uninterrupted sidecar invocation.
 
-After a validated bootstrap reaches Core's tip, `--online-state=DIR` writes one native
-mmap generation and switches future block updates to a synchronized WAL. A host failure
-then loses no published block: restart replays committed WAL records over the last
-durable base. Preserve the validated format-3 checkpoint for deep-reorg recovery.
+When loading a validated checkpoint, `--online-state=DIR` streams it directly into one
+native mmap generation and uses a synchronized WAL during catch-up and tip following.
+A host failure then loses no published block: restart replays committed WAL records
+over the last durable base. Preserve the validated format-3 checkpoint for deep-reorg
+recovery. `--fast-sync` is opt-in and emits a warning that it requires at least 32 GiB
+of system RAM; the unattended historical rebuild controller enables it explicitly.
 
 To bootstrap Floresta nodes from that checkpoint, add `--proof-store=DIR` while replaying
 the checkpoint to the tip. The proof data is appended once, its compact index WAL is
@@ -47,7 +49,8 @@ The final command should print `true`.
 
 ## Memory and checkpoint storage
 
-The deterministic estimator currently reports approximately:
+For the opt-in RAM fast-sync mode, the deterministic estimator currently reports
+approximately:
 
 | Live leaves | Estimated sidecar data |
 | ---: | ---: |
@@ -57,7 +60,9 @@ The deterministic estimator currently reports approximately:
 
 Actual resident memory is higher because the estimate excludes allocator overhead,
 RPC JSON, the current block, the executable, the operating system, and Bitcoin Core.
-On a 32 GiB machine:
+The default checkpoint-to-mmap import does not allocate this arena in anonymous RAM,
+although it still needs the reverse index and reclaimable filesystem page cache. On a
+32 GiB machine using `--fast-sync`:
 
 - keep Bitcoin Core's `dbcache` conservative;
 - monitor the combined RSS of Core and the sidecar;
@@ -104,6 +109,7 @@ Then verify restoration immediately:
   --rpc-cookie=/path/to/bitcoin/.cookie \
   --checkpoint=/checkpoint-disk/mainnet.chk \
   --allow-untrusted-checkpoint \
+  --fast-sync \
   --state-json=/checkpoint-disk/mainnet-100100.json \
   --stop-height=100100
 ```

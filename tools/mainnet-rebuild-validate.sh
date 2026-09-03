@@ -447,6 +447,7 @@ verify_compact_checkpoint()
         --rpc-cookie="$RPC_COOKIE" \
         --checkpoint="$FINAL_CHECKPOINT" \
         --allow-untrusted-checkpoint \
+        --fast-sync \
         --state-json="$validation_state" \
         --stop-height="$COMPACT_HEIGHT" \
         --log-level="$LOG_LEVEL" \

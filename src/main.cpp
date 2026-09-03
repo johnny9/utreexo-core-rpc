@@ -64,6 +64,7 @@ struct Options {
     uint64_t p2p_proof_cache_mib{256};
     utreexo::LogLevel log_level{utreexo::LogLevel::INFO};
     bool allow_untrusted_checkpoint{false};
+    bool fast_sync{false};
     bool follow{false};
     bool show_version{false};
 };
@@ -238,9 +239,11 @@ void Usage()
         << "  --checkpoint=PATH           Load/save a sparse atomic checkpoint\n"
         << "  --allow-untrusted-checkpoint\n"
         << "                              Skip compiled checkpoint validation (unsafe)\n"
+        << "  --fast-sync                 Keep the forest in RAM until Core tip (opt-in)\n"
+        << "                              WARNING: requires at least 32 GiB system RAM\n"
         << "  --checkpoint-interval=N     Full checkpoint every N blocks (default 0: final only)\n"
         << "                              Allocation failures save the last completed checkpoint\n"
-        << "  --online-state=DIR          Native mmap/WAL state; create after reaching Core tip\n"
+        << "  --online-state=DIR          Native mmap/WAL state (default for checkpoint catch-up)\n"
         << "  --online-cache-mib=N        Dirty-node cache (default: 128 on <=20GiB, else 512)\n"
         << "  --online-wal-segment-mib=N  WAL segment size (default 256)\n"
         << "  --online-undo-depth=N       Retained WAL before-image window (default 1008)\n"
@@ -373,6 +376,8 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
             }
         } else if (argument == "--allow-untrusted-checkpoint") {
             options.allow_untrusted_checkpoint = true;
+        } else if (argument == "--fast-sync") {
+            options.fast_sync = true;
         } else if (argument == "--follow") {
             options.follow = true;
         } else if (auto stop_height{value("--stop-height")}) {
@@ -633,6 +638,24 @@ int main(int argc, char** argv)
         " proof_store_format=" + std::to_string(utreexo::ProofStore::FORMAT_VERSION) +
         " log_level=" + std::string{utreexo::LogLevelName(options.log_level)});
     LogProcessResources("sidecar_start", 0);
+    if (options.fast_sync) {
+        constexpr uint64_t GIB{1024ULL * 1024 * 1024};
+        const uint64_t detected_bytes{PhysicalMemoryBytes()};
+        const bool existing_online{options.online_state &&
+                                   std::filesystem::exists(*options.online_state)};
+        if (existing_online) {
+            utreexo::Log(utreexo::LogLevel::INFO, "fast_sync_not_used",
+                "reason=online_state_already_exists storage_mode=mmap_wal");
+        } else {
+            utreexo::Log(utreexo::LogLevel::WARN, "fast_sync_memory_warning",
+                "message=fast_sync_requires_at_least_32_GiB_of_system_RAM"
+                " minimum_system_ram_gib=32 detected_system_ram_gib=" +
+                std::to_string(detected_bytes / GIB) +
+                " detected_below_minimum=" +
+                std::string{detected_bytes != 0 && detected_bytes < 32 * GIB ? "true" : "false"} +
+                " storage_mode=ram_bootstrap risk=memory_exhaustion");
+        }
+    }
     if (options.authorization.empty()) {
         auto cookie{utreexo::ReadCookieAuthorization(options.cookie)};
         if (!cookie) {
@@ -673,6 +696,12 @@ int main(int argc, char** argv)
         LogOnlineBreakdown("online_state_loaded", recovered_point.height, forest);
         LogProcessResources("online_state_loaded", recovered_point.height);
     } else if (options.checkpoint && std::filesystem::exists(*options.checkpoint)) {
+        if (!options.fast_sync && !options.online_state) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "checkpoint_load_failed",
+                "reason=mmap_wal_is_default_for_checkpoint_catchup"
+                " action=provide_online_state_or_use_fast_sync");
+            return 1;
+        }
         const utreexo::TrustedCheckpoint* trusted{
             utreexo::FindTrustedCheckpoint("mainnet-943013")};
         if (!trusted) {
@@ -717,9 +746,14 @@ int main(int argc, char** argv)
                 " sha256=" + identity.Value().sha256.ToHex());
         }
         utreexo::Log(utreexo::LogLevel::INFO, "checkpoint_load_started",
-                     "path=" + PathField(*options.checkpoint));
+            "path=" + PathField(*options.checkpoint) +
+            " storage_mode=" + std::string{options.fast_sync ? "ram_bootstrap" : "mmap_wal"} +
+            " import_mode=" + std::string{options.fast_sync ? "deserialize_ram" : "stream_to_native"});
         utreexo::CheckpointMetrics checkpoint_metrics;
-        auto loaded{utreexo::LoadCheckpoint(*options.checkpoint, &checkpoint_metrics)};
+        auto loaded{options.fast_sync ?
+            utreexo::LoadCheckpoint(*options.checkpoint, &checkpoint_metrics) :
+            utreexo::LoadCheckpointOnline(*options.checkpoint, *options.online_state,
+                                          online_config, &checkpoint_metrics)};
         if (!loaded) {
             utreexo::Log(utreexo::LogLevel::ERROR, "checkpoint_load_failed",
                          "path=" + PathField(*options.checkpoint) +
@@ -753,11 +787,13 @@ int main(int argc, char** argv)
         const uint32_t loaded_height{loaded.Value().point.height};
         forest = std::move(loaded.Value().forest);
         chain_hashes = std::move(loaded.Value().chain_hashes);
+        loaded_online = forest.IsOnline();
         utreexo::Log(utreexo::LogLevel::INFO, "checkpoint_loaded",
             "height=" + std::to_string(loaded_height) +
             " path=" + PathField(*options.checkpoint) +
             " bytes=" + std::to_string(checkpoint_metrics.final_bytes) +
-            " total_us=" + std::to_string(checkpoint_metrics.total_us));
+            " total_us=" + std::to_string(checkpoint_metrics.total_us) +
+            " storage_mode=" + std::string{loaded_online ? "mmap_wal" : "ram_bootstrap"});
         if (utreexo::LogEnabled(utreexo::LogLevel::DEBUG)) {
             utreexo::Log(utreexo::LogLevel::DEBUG, "checkpoint_load_metrics",
                 "height=" + std::to_string(loaded_height) +
@@ -767,6 +803,7 @@ int main(int argc, char** argv)
                 " total_us=" + std::to_string(checkpoint_metrics.total_us));
         }
         LogMemoryBreakdown("checkpoint_loaded", loaded_height, forest);
+        if (loaded_online) LogOnlineBreakdown("checkpoint_loaded", loaded_height, forest);
         LogProcessResources("checkpoint_loaded", loaded_height);
     }
 
