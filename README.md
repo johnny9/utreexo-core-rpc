@@ -197,12 +197,18 @@ the bootstrap file.
 
 The machine-readable release manifest is
 [`contrib/checkpoints/mainnet-943013.json`](contrib/checkpoints/mainnet-943013.json).
-Its `download_url` intentionally remains `null` until an external host has published
-the exact 14.9 GB object; do not announce the beta as independently bootstrappable
-before that field points to an HTTPS location. Regardless of transport, the binary
-enforces the embedded size, file hash, block hash, leaf count, and ordered roots. The
-tagged-release workflow also fails closed while this URL is absent, so it cannot
-publish a package whose primary bootstrap artifact is unavailable.
+The 14.9 GB bootstrap is published at
+[`https://checkpoints.johnny9.dev/mainnet-943013-compact.chk`](https://checkpoints.johnny9.dev/mainnet-943013-compact.chk).
+Treat the download transport as untrusted: the binary enforces the embedded size,
+file hash, block hash, leaf count, and ordered roots before accepting it. Operators
+can also stream and authenticate the published object without retaining another copy:
+
+```sh
+python3 tools/verify-checkpoint-download.py
+```
+
+The tagged-release workflow independently performs the same full-stream verification
+before publishing a package.
 
 `--checkpoint-interval=N` is intentionally opt-in because every checkpoint streams the
 full forest. Large intervals reduce restart cost while avoiding the per-block rewrite

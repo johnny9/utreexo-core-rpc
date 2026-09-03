@@ -34,6 +34,6 @@
     "implementation": "utreexod",
     "commit": "25deba281b612f8b87f734b0ac169d8a46ede988"
   },
-  "download_url": null,
-  "note": "Set download_url only when a release host has published this exact file. The binary independently embeds and enforces these consensus and file-identity values."
+  "download_url": "https://checkpoints.johnny9.dev/mainnet-943013-compact.chk",
+  "note": "The binary independently embeds and enforces the checkpoint size, SHA-256, block hash, leaf count, and ordered roots; treat the download transport as untrusted."
 }
