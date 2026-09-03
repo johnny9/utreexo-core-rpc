@@ -2418,4 +2418,203 @@ Result<PackedForest> ReadForest(std::istream& input)
     return Result<PackedForest>::Ok(std::move(forest));
 }
 
+Result<PackedForest> ReadForestOnline(std::istream& input,
+                                      const std::filesystem::path& directory,
+                                      const ChainPoint& point,
+                                      std::span<const Hash256> chain_hashes,
+                                      OnlineForestConfig config)
+{
+    if (config.max_dirty_bytes == 0 || config.wal_segment_bytes < 1024 * 1024 ||
+        config.undo_depth == 0) {
+        return Result<PackedForest>::Err("invalid online forest configuration");
+    }
+    if (chain_hashes.size() != static_cast<std::size_t>(point.height) + 1 ||
+        chain_hashes.empty() || chain_hashes.back() != point.block_hash) {
+        return Result<PackedForest>::Err("online chain-hash index does not match its chain point");
+    }
+    if (std::filesystem::exists(directory)) {
+        return Result<PackedForest>::Err("online-state directory already exists");
+    }
+    const std::filesystem::path temporary{directory.string() + ".tmp"};
+    if (std::filesystem::exists(temporary)) {
+        return Result<PackedForest>::Err(
+            "online-state temporary directory already exists: " + temporary.string());
+    }
+
+    constexpr std::array<char, 8> MAGIC{'U', 'T', 'R', 'F', 'O', 'R', 'S', 'T'};
+    std::array<char, MAGIC.size()> magic{};
+    input.read(magic.data(), static_cast<std::streamsize>(magic.size()));
+    if (!input || magic != MAGIC) return Result<PackedForest>::Err("invalid forest magic");
+
+    uint32_t version{0};
+    uint64_t leaves{0};
+    uint64_t slots{0};
+    if (!ReadLE(input, version) || !ReadLE(input, leaves) || !ReadLE(input, slots)) {
+        return Result<PackedForest>::Err("truncated forest header");
+    }
+    if (version != PackedForest::FORMAT_VERSION) {
+        return Result<PackedForest>::Err("unsupported forest version");
+    }
+    if (slots >= NO_NODE) {
+        return Result<PackedForest>::Err("forest node count exceeds the NodeId range");
+    }
+
+    std::array<NodeId, 64> roots{};
+    for (NodeId& root : roots) {
+        if (!ReadLE(input, root)) return Result<PackedForest>::Err("truncated forest roots");
+        if (root != NO_NODE && root >= slots) {
+            return Result<PackedForest>::Err("forest root is out of range");
+        }
+    }
+
+    uint64_t capacity{NodeArena::CHUNK_SIZE};
+    while (capacity < slots) capacity += NodeArena::CHUNK_SIZE;
+    if (capacity >= NO_NODE) {
+        return Result<PackedForest>::Err("forest capacity exceeds the NodeId range");
+    }
+
+    std::error_code create_error;
+    std::filesystem::create_directories(temporary, create_error);
+    if (create_error) {
+        return Result<PackedForest>::Err("create online-state directory: " + create_error.message());
+    }
+
+    int hash_fd{-1};
+    int meta_fd{-1};
+    const auto fail = [&](std::string error) -> Result<PackedForest> {
+        if (hash_fd >= 0) ::close(hash_fd);
+        if (meta_fd >= 0) ::close(meta_fd);
+        std::error_code cleanup_error;
+        std::filesystem::remove_all(temporary, cleanup_error);
+        return Result<PackedForest>::Err(std::move(error));
+    };
+
+    const auto hashes_path{temporary / "forest.hashes"};
+    const auto meta_path{temporary / "forest.meta"};
+    hash_fd = ::open(hashes_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (hash_fd < 0) return fail(ErrnoMessage("create forest hashes"));
+    meta_fd = ::open(meta_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (meta_fd < 0) return fail(ErrnoMessage("create forest metadata"));
+    if (::ftruncate(hash_fd, static_cast<off_t>(capacity * sizeof(Hash256))) != 0 ||
+        ::ftruncate(meta_fd, static_cast<off_t>(capacity * sizeof(DiskMeta))) != 0) {
+        return fail(ErrnoMessage("size native forest files"));
+    }
+
+    constexpr uint64_t RECORD_BYTES{1 + Hash256::SIZE + sizeof(NodeId) * 3};
+    constexpr std::size_t IMPORT_BATCH{64 * 1024};
+    std::vector<unsigned char> serialized(IMPORT_BATCH * RECORD_BYTES);
+    std::vector<Hash256> hashes(IMPORT_BATCH);
+    std::vector<DiskMeta> metadata(IMPORT_BATCH);
+    uint64_t live_nodes{0};
+    for (uint64_t first{0}; first < slots; first += IMPORT_BATCH) {
+        const std::size_t count{static_cast<std::size_t>(
+            std::min<uint64_t>(IMPORT_BATCH, slots - first))};
+        const std::size_t byte_count{count * static_cast<std::size_t>(RECORD_BYTES)};
+        input.read(reinterpret_cast<char*>(serialized.data()),
+                   static_cast<std::streamsize>(byte_count));
+        if (!input) return fail("truncated node record");
+
+        for (std::size_t i{0}; i < count; ++i) {
+            const unsigned char* record{serialized.data() + i * RECORD_BYTES};
+            const uint8_t raw_type{record[0]};
+            if (raw_type > static_cast<uint8_t>(NodeType::BRANCH)) {
+                return fail("invalid node type");
+            }
+            Hash256::Storage hash_bytes{};
+            std::memcpy(hash_bytes.data(), record + 1, Hash256::SIZE);
+            hashes[i] = Hash256{hash_bytes};
+            const auto read_id = [&](std::size_t offset) {
+                uint32_t value{0};
+                for (std::size_t byte{0}; byte < sizeof(value); ++byte) {
+                    value |= static_cast<uint32_t>(record[offset + byte]) << (byte * 8);
+                }
+                return static_cast<NodeId>(value);
+            };
+            const NodeId parent{read_id(1 + Hash256::SIZE)};
+            const NodeId left{read_id(1 + Hash256::SIZE + sizeof(NodeId))};
+            const NodeId right{read_id(1 + Hash256::SIZE + sizeof(NodeId) * 2)};
+            const auto valid_link{[slots](NodeId link) {
+                return link == NO_NODE || link < slots;
+            }};
+            if (!valid_link(parent) || !valid_link(left) || !valid_link(right)) {
+                return fail("node link is out of range");
+            }
+            metadata[i] = DiskMeta{parent, left, right, raw_type, {}};
+            if (raw_type != static_cast<uint8_t>(NodeType::FREE)) ++live_nodes;
+        }
+
+        auto hashes_written{PwriteAll(hash_fd,
+            std::as_bytes(std::span<const Hash256>{hashes.data(), count}),
+            first * sizeof(Hash256))};
+        if (!hashes_written) return fail(hashes_written.Error());
+        auto metadata_written{PwriteAll(meta_fd,
+            std::as_bytes(std::span<const DiskMeta>{metadata.data(), count}),
+            first * sizeof(DiskMeta))};
+        if (!metadata_written) return fail(metadata_written.Error());
+    }
+
+    auto hash_synced{SyncDescriptor(hash_fd, "native forest hashes")};
+    if (!hash_synced) return fail(hash_synced.Error());
+    auto meta_synced{SyncDescriptor(meta_fd, "native forest metadata")};
+    if (!meta_synced) return fail(meta_synced.Error());
+    if (::close(hash_fd) != 0) {
+        hash_fd = -1;
+        return fail(ErrnoMessage("close native forest hashes"));
+    }
+    hash_fd = -1;
+    if (::close(meta_fd) != 0) {
+        meta_fd = -1;
+        return fail(ErrnoMessage("close native forest metadata"));
+    }
+    meta_fd = -1;
+
+    const auto chain_path{temporary / "chain.hashes"};
+    const int chain_fd{::open(chain_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600)};
+    if (chain_fd < 0) return fail(ErrnoMessage("create online chain hashes"));
+    auto chain_written{WriteAll(chain_fd, std::as_bytes(chain_hashes))};
+    if (chain_written) chain_written = SyncDescriptor(chain_fd, "online chain hashes");
+    const int chain_close{::close(chain_fd)};
+    if (!chain_written) return fail(chain_written.Error());
+    if (chain_close != 0) return fail(ErrnoMessage("close online chain hashes"));
+
+    const OnlineSuperblock state{
+        .generation = 0,
+        .base_lsn = 0,
+        .point = point,
+        .num_leaves = leaves,
+        .next = static_cast<NodeId>(slots),
+        .live_nodes = live_nodes,
+        .capacity_slots = capacity,
+        .chain_hash_count = chain_hashes.size(),
+        .roots = roots,
+    };
+    auto state_written{WriteSuperblock(temporary, state)};
+    if (!state_written) return fail(state_written.Error());
+
+    PackedForest forest;
+    forest.m_impl->roots = roots;
+    forest.m_impl->num_leaves = leaves;
+    auto mapped{forest.m_impl->arena.OpenMapped(hashes_path, meta_path, capacity,
+                                                static_cast<NodeId>(slots))};
+    if (!mapped) return fail(mapped.Error());
+    if (forest.m_impl->arena.LiveCount() != live_nodes) {
+        return fail("online arena live-node count does not match its superblock");
+    }
+    auto rebuilt{forest.m_impl->RebuildIndexAndValidate()};
+    if (!rebuilt) return fail(rebuilt.Error());
+
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, directory, rename_error);
+    if (rename_error) return fail("publish online-state directory: " + rename_error.message());
+    const auto parent{directory.has_parent_path() ? directory.parent_path() :
+                                                   std::filesystem::path{"."}};
+    auto parent_synced{SyncDirectory(parent)};
+    if (!parent_synced) return Result<PackedForest>::Err(parent_synced.Error());
+
+    std::vector<Hash256> chain_copy{chain_hashes.begin(), chain_hashes.end()};
+    forest.m_impl->online = std::make_unique<OnlineStore>(directory, config, state,
+                                                          std::move(chain_copy));
+    return Result<PackedForest>::Ok(std::move(forest));
+}
+
 } // namespace utreexo

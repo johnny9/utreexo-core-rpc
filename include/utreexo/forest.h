@@ -127,11 +127,25 @@ private:
 
     friend Result<void> WriteForest(std::ostream&, const PackedForest&);
     friend Result<PackedForest> ReadForest(std::istream&);
+    friend Result<PackedForest> ReadForestOnline(std::istream&,
+                                                 const std::filesystem::path&,
+                                                 const ChainPoint&,
+                                                 std::span<const Hash256>,
+                                                 OnlineForestConfig);
 };
 
 /** Stable, endian-defined accumulator serialization used inside checkpoints. */
 Result<void> WriteForest(std::ostream& output, const PackedForest& forest);
 Result<PackedForest> ReadForest(std::istream& input);
+/**
+ * Stream the stable forest serialization directly into a native mmap/WAL
+ * generation. This avoids materializing the checkpoint arena in RAM.
+ */
+Result<PackedForest> ReadForestOnline(std::istream& input,
+                                      const std::filesystem::path& directory,
+                                      const ChainPoint& point,
+                                      std::span<const Hash256> chain_hashes,
+                                      OnlineForestConfig config = {});
 
 } // namespace utreexo
 

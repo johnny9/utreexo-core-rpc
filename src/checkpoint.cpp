@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <type_traits>
@@ -181,8 +182,13 @@ Result<void> SaveCheckpoint(const std::filesystem::path& path,
     return directory_synced;
 }
 
-Result<LoadedCheckpoint> LoadCheckpoint(const std::filesystem::path& path,
-                                        CheckpointMetrics* metrics)
+namespace {
+
+Result<LoadedCheckpoint> LoadCheckpointImpl(
+    const std::filesystem::path& path,
+    const std::optional<std::filesystem::path>& online_directory,
+    OnlineForestConfig online_config,
+    CheckpointMetrics* metrics)
 {
     if (metrics) *metrics = {};
     const auto total_start{Clock::now()};
@@ -241,10 +247,17 @@ Result<LoadedCheckpoint> LoadCheckpoint(const std::filesystem::path& path,
          chain_hashes.back() != Hash256{block_hash})) {
         return Result<LoadedCheckpoint>::Err("checkpoint chain-hash index does not match its chain point");
     }
-    auto forest{ReadForest(input)};
+    const ChainPoint point{height, Hash256{block_hash}};
+    auto forest{online_directory ?
+        ReadForestOnline(input, *online_directory, point, chain_hashes, online_config) :
+        ReadForest(input)};
     if (!forest) return Result<LoadedCheckpoint>::Err(forest.Error());
     const auto payload_end{input.tellg()};
     if (payload_end < 0 || static_cast<uint64_t>(payload_end) != file_size - sizeof(uint64_t)) {
+        if (online_directory) {
+            std::error_code cleanup_error;
+            std::filesystem::remove_all(*online_directory, cleanup_error);
+        }
         return Result<LoadedCheckpoint>::Err("checkpoint contains trailing or missing forest data");
     }
     if (metrics) {
@@ -252,10 +265,26 @@ Result<LoadedCheckpoint> LoadCheckpoint(const std::filesystem::path& path,
         metrics->total_us = Micros(total_start);
     }
     return Result<LoadedCheckpoint>::Ok(LoadedCheckpoint{
-        .point = ChainPoint{height, Hash256{block_hash}},
+        .point = point,
         .chain_hashes = std::move(chain_hashes),
         .forest = forest.Take(),
     });
+}
+
+} // namespace
+
+Result<LoadedCheckpoint> LoadCheckpoint(const std::filesystem::path& path,
+                                        CheckpointMetrics* metrics)
+{
+    return LoadCheckpointImpl(path, std::nullopt, {}, metrics);
+}
+
+Result<LoadedCheckpoint> LoadCheckpointOnline(const std::filesystem::path& path,
+                                              const std::filesystem::path& online_directory,
+                                              OnlineForestConfig config,
+                                              CheckpointMetrics* metrics)
+{
+    return LoadCheckpointImpl(path, online_directory, config, metrics);
 }
 
 } // namespace utreexo
