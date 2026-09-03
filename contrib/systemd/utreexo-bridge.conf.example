@@ -1,0 +1,8 @@
+# Keep this file readable only by root when --rpc-auth contains a password.
+# Prefer a cookie path readable through a narrowly scoped group membership.
+UTREEXO_BRIDGE_ARGS=--rpc-cookie=/var/lib/bitcoin/.cookie --checkpoint=/var/lib/utreexo-bridge/mainnet-943013-compact.chk --online-state=/var/lib/utreexo-bridge/forest --proof-store=/var/lib/utreexo-bridge/proofs --follow --p2p-bind=127.0.0.1 --p2p-port=8338 --p2p-network=mainnet --log-level=info
+
+# For a deliberately public clearnet listener, change p2p-bind to 0.0.0.0 and add:
+#   --p2p-advertise=YOUR_PUBLIC_IPV4:8338
+#   --p2p-gossip-seed=UTREEXO_AWARE_IPV4:PORT
+# Open/forward TCP 8338 and independently verify it is reachable before advertising.

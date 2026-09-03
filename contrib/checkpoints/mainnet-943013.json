@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "name": "mainnet-943013",
+  "network": "mainnet",
+  "height": 943013,
+  "block_hash": "00000000000000000001c595730bd4a5fb0e2b35af70882962ce7ae602f48aff",
+  "num_leaves": 3082565786,
+  "roots_encoding": "sha512_256_internal_bytes_high_row_to_low_row_present_roots",
+  "roots": [
+    "58903d7b8f355710ddb5d8dfaf17f240af6a3a14c1d606422dcd6362f8a338e3",
+    "10d6640db81dae22a18b99d8f1179ebcf7f39d8758a9183b02762a244e68099e",
+    "430e732e0d30717765e7128b6a5fe70eb22b4b3e6dc772a40b46846d9333800d",
+    "3dc7194b8069bd841aed28b33791e01297c05e46e2eb8eed8ea93f7202388980",
+    "eb41827f548a811e6dcd259f8a486e2233757d100f0e9ac63b2d9fd1559b010d",
+    "33ed5b7b9f71bee8f2e8ab03d4bc8544f362600819f13e6267b72d8a9a8fd36d",
+    "a51fa39fb261c4ba5596e7239b257241545889428cbd8e8f49c70e24645fe756",
+    "db4326c816eea0eafa495b33195a56c696f5a4ef8fdec62f85f8b756b794d53a",
+    "091f556e7803e4136025fa5d518a6c88dadd926451b90b5739483bbe49f3d090",
+    "7e770db3ace3c6298eb2a64282d57db6aed78fc8b9a4efd7c1714a3a8e23fb74",
+    "e62ea173baecb1ea1e51985cfa56dc2ffbd22161be9b10d77467e61f95e5a86e",
+    "fd2ab9a7c539d9f1e5dc94879c690980ebc710b431a367eff166792c90963545",
+    "a47bc57aea513f1a58d1e9510f61b96ec27fa9bd5cab4c532e72df9507b8641a",
+    "a88dc84b5dc1c5392191f066201849274e6cbf4e86b8f0dbce90ce3aaeab07ed",
+    "bb7c6dd45d49a024fef17dd043370bcc93e5ca969b2256a38b5a0e96220ff0ab",
+    "194411f2b062acb34454bb7f48859a6300df07ad04d8d63f39b6e34275de2e19",
+    "539fea58450d5142766460d4c40b9cde097fa18264dae636c38bda061e3f22ac",
+    "a25a97e938c05b554de2e3102622c4b4f6a66152f6d2cb2c6445d20a97e28013"
+  ],
+  "checkpoint_format": 3,
+  "file_name": "mainnet-943013-compact.chk",
+  "file_size": 14893913136,
+  "file_sha256": "e869cb2eaf6a42d71010464b1dac7d0cd5cc7ed237ba78d2c653d2c8efa5a492",
+  "reference": {
+    "implementation": "utreexod",
+    "commit": "25deba281b612f8b87f734b0ac169d8a46ede988"
+  },
+  "download_url": null,
+  "note": "Set download_url only when a release host has published this exact file. The binary independently embeds and enforces these consensus and file-identity values."
+}

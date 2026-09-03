@@ -1,0 +1,28 @@
+[Unit]
+Description=Utreexo bridge sidecar
+After=network-online.target bitcoind.service
+Wants=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=utreexo
+Group=utreexo
+EnvironmentFile=/etc/utreexo-bridge/utreexo-bridge.conf
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/utreexo-bridge $UTREEXO_BRIDGE_ARGS
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=10s
+TimeoutStopSec=10min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/utreexo-bridge
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
