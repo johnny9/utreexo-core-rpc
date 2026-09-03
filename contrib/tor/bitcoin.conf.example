@@ -1,0 +1,23 @@
+# Mainnet Bitcoin Core settings for the manually managed onion service in
+# torrc.example. Merge these into bitcoin.conf after Tor has created the
+# service, then replace the placeholder with the contents of:
+#   /var/lib/tor/bitcoin-core/hostname
+
+[main]
+listen=1
+
+# The onion service is managed by torrc, not Bitcoin Core's control-port
+# integration. This prevents a second, unrelated onion service being created.
+listenonion=0
+
+# Allow outbound onion peers through Tor without proxying IPv4/IPv6 peers.
+onion=127.0.0.1:9050
+
+# Do not discover or advertise a clearnet address. Keep a regular loopback
+# listener for local clients and a separate onion-tagged listener for Tor.
+discover=0
+bind=127.0.0.1:8333
+bind=127.0.0.1:8334=onion
+
+# Use the complete 56-character v3 hostname, including its `.onion` suffix.
+externalip=REPLACE_WITH_BITCOIN_CORE_ONION_HOSTNAME:8333

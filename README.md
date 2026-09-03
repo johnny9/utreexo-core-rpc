@@ -252,6 +252,12 @@ florestad \
   --allow-v1-fallback
 ```
 
+To share both peers without exposing either listener on a clearnet interface, publish
+separate Tor onion services for Core and the sidecar. Keep the sidecar on
+`--p2p-bind=127.0.0.1`; Tor forwards the public onion port to that loopback listener.
+The complete mainnet configuration, client example, and verification checklist are in
+[`doc/tor.md`](doc/tor.md).
+
 Keep the listener on loopback while testing; binding `0.0.0.0` is an explicit operator
 choice. BIP 324 transport, peer discovery, transaction relay, standard block service,
 and proofs at or before the AssumeUtreexo base remain out of scope.

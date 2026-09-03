@@ -1,0 +1,13 @@
+# Publish Bitcoin Core and the Utreexo proof sidecar as separate v3 onion
+# services. Keeping separate HiddenServiceDir entries avoids trivially linking
+# the two public identities.
+
+# Bitcoin Core's public P2P port is forwarded to its onion-tagged loopback
+# listener. Do not forward the RPC port (8332).
+HiddenServiceDir /var/lib/tor/bitcoin-core/
+HiddenServicePort 8333 127.0.0.1:8334
+
+# The Utreexo sidecar remains bound to loopback; Tor is its only public entry
+# point. Do not add its state files or any administrative service here.
+HiddenServiceDir /var/lib/tor/utreexo-sidecar/
+HiddenServicePort 8338 127.0.0.1:8338
