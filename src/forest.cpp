@@ -19,11 +19,14 @@
 #include <ostream>
 #include <set>
 #include <string>
+#include <string_view>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <unistd.h>
 
 namespace utreexo {
@@ -74,6 +77,95 @@ uint64_t ElapsedMicros(std::chrono::steady_clock::time_point start)
 }
 
 Result<void> PwriteAll(int descriptor, std::span<const std::byte> bytes, uint64_t file_offset);
+Result<void> WriteAll(int descriptor, std::span<const std::byte> bytes);
+
+constexpr std::string_view ONLINE_LOCK_CONTENT{"utreexo-online-state-lock-v1\n"};
+constexpr std::string_view ONLINE_OWNER_CONTENT{"utreexo-online-state-v1\n"};
+constexpr std::string_view ONLINE_LOCK_FILE{"LOCK"};
+constexpr std::string_view ONLINE_OWNER_FILE{"FORMAT"};
+
+class OnlineStateLock
+{
+public:
+    OnlineStateLock() = default;
+    explicit OnlineStateLock(int descriptor) : m_descriptor{descriptor} {}
+    ~OnlineStateLock()
+    {
+        if (m_descriptor >= 0) ::close(m_descriptor);
+    }
+    OnlineStateLock(const OnlineStateLock&) = delete;
+    OnlineStateLock& operator=(const OnlineStateLock&) = delete;
+    OnlineStateLock(OnlineStateLock&& other) noexcept
+        : m_descriptor{std::exchange(other.m_descriptor, -1)}
+    {
+    }
+    OnlineStateLock& operator=(OnlineStateLock&& other) noexcept
+    {
+        if (this == &other) return *this;
+        if (m_descriptor >= 0) ::close(m_descriptor);
+        m_descriptor = std::exchange(other.m_descriptor, -1);
+        return *this;
+    }
+
+    static Result<OnlineStateLock> Acquire(const std::filesystem::path& directory,
+                                           bool allow_create)
+    {
+        const auto path{directory / ONLINE_LOCK_FILE};
+        const int create_flags{allow_create ? O_CREAT : 0};
+        const int descriptor{::open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW |
+                                                     create_flags, 0600)};
+        if (descriptor < 0) {
+            return Result<OnlineStateLock>::Err(ErrnoMessage(
+                allow_create ? "open online-state lock" : "open existing online-state lock"));
+        }
+        if (::flock(descriptor, LOCK_EX | LOCK_NB) != 0) {
+            const int saved_errno{errno};
+            ::close(descriptor);
+            errno = saved_errno;
+            if (saved_errno == EWOULDBLOCK || saved_errno == EAGAIN) {
+                return Result<OnlineStateLock>::Err(
+                    "online-state directory is locked by another process: " +
+                    directory.string());
+            }
+            return Result<OnlineStateLock>::Err(ErrnoMessage("lock online state"));
+        }
+
+        struct stat status{};
+        if (::fstat(descriptor, &status) != 0) {
+            const auto error{ErrnoMessage("stat online-state lock")};
+            ::close(descriptor);
+            return Result<OnlineStateLock>::Err(error);
+        }
+        if (status.st_size == 0 && allow_create) {
+            auto written{WriteAll(descriptor, std::as_bytes(std::span<const char>{
+                ONLINE_LOCK_CONTENT.data(), ONLINE_LOCK_CONTENT.size()}))};
+            if (written) written = SyncDescriptor(descriptor, "online-state lock");
+            if (!written) {
+                const auto error{written.Error()};
+                ::close(descriptor);
+                return Result<OnlineStateLock>::Err(error);
+            }
+        } else {
+            if (status.st_size != static_cast<off_t>(ONLINE_LOCK_CONTENT.size())) {
+                ::close(descriptor);
+                return Result<OnlineStateLock>::Err(
+                    "online-state lock has an unrecognized format: " + path.string());
+            }
+            std::array<char, ONLINE_LOCK_CONTENT.size()> content{};
+            const ssize_t count{::pread(descriptor, content.data(), content.size(), 0)};
+            if (count != static_cast<ssize_t>(content.size()) ||
+                std::string_view{content.data(), content.size()} != ONLINE_LOCK_CONTENT) {
+                ::close(descriptor);
+                return Result<OnlineStateLock>::Err(
+                    "online-state lock has an unrecognized format: " + path.string());
+            }
+        }
+        return Result<OnlineStateLock>::Ok(OnlineStateLock{descriptor});
+    }
+
+private:
+    int m_descriptor{-1};
+};
 
 class MappedArenaFiles
 {
@@ -971,6 +1063,156 @@ Result<void> SyncDirectory(const std::filesystem::path& directory)
     return Result<void>::Ok();
 }
 
+Result<void> WriteOnlineOwnerMarker(const std::filesystem::path& directory)
+{
+    const auto path{directory / ONLINE_OWNER_FILE};
+    const int descriptor{::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL |
+                                              O_CLOEXEC | O_NOFOLLOW, 0600)};
+    if (descriptor < 0) return Result<void>::Err(ErrnoMessage("create online-state format marker"));
+    auto written{WriteAll(descriptor, std::as_bytes(std::span<const char>{
+        ONLINE_OWNER_CONTENT.data(), ONLINE_OWNER_CONTENT.size()}))};
+    if (written) written = SyncDescriptor(descriptor, "online-state format marker");
+    const int close_result{::close(descriptor)};
+    if (!written) return written;
+    if (close_result != 0) return Result<void>::Err(ErrnoMessage("close online-state format marker"));
+    return SyncDirectory(directory);
+}
+
+Result<void> ValidateOnlineOwnerMarker(const std::filesystem::path& directory)
+{
+    const auto path{directory / ONLINE_OWNER_FILE};
+    const int descriptor{::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+    if (descriptor < 0) {
+        return Result<void>::Err(ErrnoMessage("open online-state format marker"));
+    }
+    struct stat status{};
+    if (::fstat(descriptor, &status) != 0) {
+        const auto error{ErrnoMessage("stat online-state format marker")};
+        ::close(descriptor);
+        return Result<void>::Err(error);
+    }
+    if (status.st_size != static_cast<off_t>(ONLINE_OWNER_CONTENT.size())) {
+        ::close(descriptor);
+        return Result<void>::Err(
+            "online-state format marker has an unrecognized size: " + path.string());
+    }
+    std::array<char, ONLINE_OWNER_CONTENT.size()> content{};
+    const ssize_t count{::read(descriptor, content.data(), content.size())};
+    const int saved_errno{errno};
+    ::close(descriptor);
+    errno = saved_errno;
+    if (count != static_cast<ssize_t>(content.size()) ||
+        std::string_view{content.data(), content.size()} != ONLINE_OWNER_CONTENT) {
+        return Result<void>::Err("online-state format marker is unrecognized: " + path.string());
+    }
+    return Result<void>::Ok();
+}
+
+class OnlineImportGuard
+{
+public:
+    OnlineImportGuard(std::filesystem::path directory, OnlineStateLock lock)
+        : m_directory{std::move(directory)}, m_lock{std::move(lock)}
+    {
+    }
+    ~OnlineImportGuard()
+    {
+        if (!m_cleanup) return;
+        std::error_code ignored;
+        std::filesystem::remove_all(m_directory, ignored);
+    }
+    OnlineImportGuard(const OnlineImportGuard&) = delete;
+    OnlineImportGuard& operator=(const OnlineImportGuard&) = delete;
+    OnlineImportGuard(OnlineImportGuard&& other) noexcept
+        : m_directory{std::move(other.m_directory)}, m_lock{std::move(other.m_lock)},
+          m_cleanup{std::exchange(other.m_cleanup, false)}
+    {
+    }
+    OnlineImportGuard& operator=(OnlineImportGuard&&) = delete;
+
+    const std::filesystem::path& Directory() const { return m_directory; }
+    OnlineStateLock ReleaseLock()
+    {
+        m_cleanup = false;
+        return std::move(m_lock);
+    }
+
+private:
+    std::filesystem::path m_directory;
+    OnlineStateLock m_lock;
+    bool m_cleanup{true};
+};
+
+Result<OnlineImportGuard> PrepareOnlineImport(const std::filesystem::path& directory)
+{
+    std::error_code status_error;
+    if (std::filesystem::exists(directory, status_error)) {
+        return Result<OnlineImportGuard>::Err("online-state directory already exists");
+    }
+    if (status_error) {
+        return Result<OnlineImportGuard>::Err(
+            "inspect online-state directory: " + status_error.message());
+    }
+    const auto parent{directory.has_parent_path() ? directory.parent_path() :
+                                                   std::filesystem::path{"."}};
+    std::error_code create_parent_error;
+    std::filesystem::create_directories(parent, create_parent_error);
+    if (create_parent_error) {
+        return Result<OnlineImportGuard>::Err(
+            "create online-state parent directory: " + create_parent_error.message());
+    }
+
+    const std::filesystem::path temporary{directory.string() + ".tmp"};
+    status_error.clear();
+    if (std::filesystem::exists(temporary, status_error)) {
+        auto stale_lock{OnlineStateLock::Acquire(temporary, false)};
+        if (!stale_lock) {
+            return Result<OnlineImportGuard>::Err(
+                "refusing to remove active or ambiguous online-state temporary directory: " +
+                stale_lock.Error());
+        }
+        auto owned{ValidateOnlineOwnerMarker(temporary)};
+        if (!owned) {
+            return Result<OnlineImportGuard>::Err(
+                "refusing to remove ambiguous online-state temporary directory: " +
+                owned.Error());
+        }
+        std::error_code cleanup_error;
+        std::filesystem::remove_all(temporary, cleanup_error);
+        if (cleanup_error) {
+            return Result<OnlineImportGuard>::Err(
+                "remove stale online-state temporary directory: " + cleanup_error.message());
+        }
+        auto parent_synced{SyncDirectory(parent)};
+        if (!parent_synced) return Result<OnlineImportGuard>::Err(parent_synced.Error());
+    } else if (status_error) {
+        return Result<OnlineImportGuard>::Err(
+            "inspect online-state temporary directory: " + status_error.message());
+    }
+
+    std::error_code create_error;
+    const bool created{std::filesystem::create_directory(temporary, create_error)};
+    if (create_error || !created) {
+        return Result<OnlineImportGuard>::Err(
+            "create online-state temporary directory: " +
+            (create_error ? create_error.message() : std::string{"already exists"}));
+    }
+    auto lock{OnlineStateLock::Acquire(temporary, true)};
+    if (!lock) {
+        std::error_code ignored;
+        std::filesystem::remove_all(temporary, ignored);
+        return Result<OnlineImportGuard>::Err(lock.Error());
+    }
+    auto marker{WriteOnlineOwnerMarker(temporary)};
+    if (!marker) {
+        std::error_code ignored;
+        std::filesystem::remove_all(temporary, ignored);
+        return Result<OnlineImportGuard>::Err(marker.Error());
+    }
+    return Result<OnlineImportGuard>::Ok(
+        OnlineImportGuard{temporary, lock.Take()});
+}
+
 struct OnlineSuperblock {
     uint64_t generation{0};
     uint64_t base_lsn{0};
@@ -1216,16 +1458,23 @@ class OnlineStore
 {
 public:
     OnlineStore(std::filesystem::path directory, OnlineForestConfig config,
-                OnlineSuperblock base, std::vector<Hash256> chain_hashes)
+                OnlineSuperblock base, std::vector<Hash256> chain_hashes,
+                OnlineStateLock lock,
+                std::optional<std::filesystem::path> publish_target = std::nullopt)
         : m_directory{std::move(directory)}, m_config{config}, m_base{base},
           m_point{base.point}, m_chain_hashes{std::move(chain_hashes)},
-          m_current_lsn{base.base_lsn}
+          m_current_lsn{base.base_lsn}, m_lock{std::move(lock)},
+          m_publish_target{std::move(publish_target)}
     {
     }
 
     ~OnlineStore()
     {
         if (m_wal_fd >= 0) ::close(m_wal_fd);
+        if (m_publish_target) {
+            std::error_code ignored;
+            std::filesystem::remove_all(m_directory, ignored);
+        }
     }
 
     const std::filesystem::path& Directory() const { return m_directory; }
@@ -1244,6 +1493,30 @@ public:
     uint64_t LastTransactionSyncUs() const { return m_last_transaction_sync_us; }
     uint64_t LastTransactionPublishUs() const { return m_last_transaction_publish_us; }
     uint64_t LastTransactionTotalUs() const { return m_last_transaction_total_us; }
+    bool IsPendingPublication() const { return m_publish_target.has_value(); }
+
+    Result<void> Publish()
+    {
+        if (!m_publish_target) {
+            return Result<void>::Err("online forest has no pending generation to publish");
+        }
+        if (std::filesystem::exists(*m_publish_target)) {
+            return Result<void>::Err("online-state directory appeared before publication: " +
+                                     m_publish_target->string());
+        }
+        const std::filesystem::path target{*m_publish_target};
+        std::error_code rename_error;
+        std::filesystem::rename(m_directory, target, rename_error);
+        if (rename_error) {
+            return Result<void>::Err("publish online-state directory: " +
+                                     rename_error.message());
+        }
+        m_directory = target;
+        m_publish_target.reset();
+        const auto parent{target.has_parent_path() ? target.parent_path() :
+                                                   std::filesystem::path{"."}};
+        return SyncDirectory(parent);
+    }
 
     Result<void> Append(WalTransaction& transaction)
     {
@@ -1588,6 +1861,8 @@ private:
     uint64_t m_last_transaction_sync_us{0};
     uint64_t m_last_transaction_publish_us{0};
     uint64_t m_last_transaction_total_us{0};
+    OnlineStateLock m_lock;
+    std::optional<std::filesystem::path> m_publish_target;
 };
 
 } // namespace
@@ -1862,6 +2137,9 @@ Result<void> PackedForest::ModifyBlock(std::span<const Hash256> additions,
                                        const ChainPoint& point)
 {
     if (!m_impl->online) return m_impl->Modify(additions, deletions);
+    if (m_impl->online->IsPendingPublication()) {
+        return Result<void>::Err("publish the validated online generation before modifying it");
+    }
     const ChainPoint previous{m_impl->online->Point()};
     if (point.height != previous.height + 1) {
         return Result<void>::Err("online block height does not extend the durable tip");
@@ -2069,16 +2347,10 @@ Result<void> PackedForest::EnableOnline(const std::filesystem::path& directory,
         chain_hashes.empty() || chain_hashes.back() != point.block_hash) {
         return Result<void>::Err("online chain-hash index does not match its chain point");
     }
-    if (std::filesystem::exists(directory)) {
-        return Result<void>::Err("online-state directory already exists");
-    }
-    const std::filesystem::path temporary{directory.string() + ".tmp"};
-    if (std::filesystem::exists(temporary)) {
-        return Result<void>::Err("online-state temporary directory already exists: " + temporary.string());
-    }
-    std::error_code create_error;
-    std::filesystem::create_directories(temporary, create_error);
-    if (create_error) return Result<void>::Err("create online-state directory: " + create_error.message());
+    auto prepared_result{PrepareOnlineImport(directory)};
+    if (!prepared_result) return Result<void>::Err(prepared_result.Error());
+    auto prepared{prepared_result.Take()};
+    const std::filesystem::path temporary{prepared.Directory()};
 
     uint64_t capacity{NodeArena::CHUNK_SIZE};
     while (capacity < m_impl->arena.Next()) capacity += NodeArena::CHUNK_SIZE;
@@ -2122,7 +2394,8 @@ Result<void> PackedForest::EnableOnline(const std::filesystem::path& directory,
         return Result<void>::Err("online state was published but could not be mapped: " + mapped.Error());
     }
     std::vector<Hash256> chain_copy{chain_hashes.begin(), chain_hashes.end()};
-    m_impl->online = std::make_unique<OnlineStore>(directory, config, state, std::move(chain_copy));
+    m_impl->online = std::make_unique<OnlineStore>(directory, config, state,
+        std::move(chain_copy), prepared.ReleaseLock());
     return Result<void>::Ok();
 }
 
@@ -2134,6 +2407,17 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
     if (config.max_dirty_bytes == 0 || config.wal_segment_bytes < 1024 * 1024 ||
         config.undo_depth == 0) {
         return Result<PackedForest>::Err("invalid online forest configuration");
+    }
+    auto directory_lock{OnlineStateLock::Acquire(directory, true)};
+    if (!directory_lock) return Result<PackedForest>::Err(directory_lock.Error());
+    const auto owner_path{directory / ONLINE_OWNER_FILE};
+    std::error_code owner_error;
+    if (std::filesystem::exists(owner_path, owner_error)) {
+        auto owner{ValidateOnlineOwnerMarker(directory)};
+        if (!owner) return Result<PackedForest>::Err(owner.Error());
+    } else if (owner_error) {
+        return Result<PackedForest>::Err(
+            "inspect online-state format marker: " + owner_error.message());
     }
     auto state{ReadBestSuperblock(directory)};
     if (!state) return Result<PackedForest>::Err(state.Error());
@@ -2170,7 +2454,8 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
         return Result<PackedForest>::Err("online arena live-node count does not match its superblock");
     }
     auto online{std::make_unique<OnlineStore>(directory, config, state.Value(),
-                                               std::move(recovered_chain))};
+                                               std::move(recovered_chain),
+                                               directory_lock.Take())};
     auto recovered{online->Recover(forest.m_impl->arena, forest.m_impl->roots,
                                    forest.m_impl->num_leaves)};
     if (!recovered) return Result<PackedForest>::Err(recovered.Error());
@@ -2188,9 +2473,18 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
     return Result<PackedForest>::Ok(std::move(forest));
 }
 
+Result<void> PackedForest::PublishOnline()
+{
+    if (!m_impl->online) return Result<void>::Err("forest is not using online storage");
+    return m_impl->online->Publish();
+}
+
 Result<void> PackedForest::FlushOnline()
 {
     if (!m_impl->online) return Result<void>::Err("forest is not using online storage");
+    if (m_impl->online->IsPendingPublication()) {
+        return Result<void>::Err("publish the validated online generation before flushing it");
+    }
     if (m_impl->arena.DirtyNodes() == 0 &&
         m_impl->online->BaseLsn() == m_impl->online->CurrentLsn()) {
         return Result<void>::Ok();
@@ -2201,6 +2495,10 @@ Result<void> PackedForest::FlushOnline()
 Result<ChainPoint> PackedForest::RollbackOnlineBlock()
 {
     if (!m_impl->online) return Result<ChainPoint>::Err("forest is not using online storage");
+    if (m_impl->online->IsPendingPublication()) {
+        return Result<ChainPoint>::Err(
+            "publish the validated online generation before rolling it back");
+    }
     const ChainPoint current{m_impl->online->Point()};
     if (current.height == 0) return Result<ChainPoint>::Err("cannot roll back the genesis point");
     auto original{m_impl->online->ReadConnectTransaction(current)};
@@ -2432,15 +2730,6 @@ Result<PackedForest> ReadForestOnline(std::istream& input,
         chain_hashes.empty() || chain_hashes.back() != point.block_hash) {
         return Result<PackedForest>::Err("online chain-hash index does not match its chain point");
     }
-    if (std::filesystem::exists(directory)) {
-        return Result<PackedForest>::Err("online-state directory already exists");
-    }
-    const std::filesystem::path temporary{directory.string() + ".tmp"};
-    if (std::filesystem::exists(temporary)) {
-        return Result<PackedForest>::Err(
-            "online-state temporary directory already exists: " + temporary.string());
-    }
-
     constexpr std::array<char, 8> MAGIC{'U', 'T', 'R', 'F', 'O', 'R', 'S', 'T'};
     std::array<char, MAGIC.size()> magic{};
     input.read(magic.data(), static_cast<std::streamsize>(magic.size()));
@@ -2473,19 +2762,16 @@ Result<PackedForest> ReadForestOnline(std::istream& input,
         return Result<PackedForest>::Err("forest capacity exceeds the NodeId range");
     }
 
-    std::error_code create_error;
-    std::filesystem::create_directories(temporary, create_error);
-    if (create_error) {
-        return Result<PackedForest>::Err("create online-state directory: " + create_error.message());
-    }
+    auto prepared_result{PrepareOnlineImport(directory)};
+    if (!prepared_result) return Result<PackedForest>::Err(prepared_result.Error());
+    auto prepared{prepared_result.Take()};
+    const std::filesystem::path temporary{prepared.Directory()};
 
     int hash_fd{-1};
     int meta_fd{-1};
     const auto fail = [&](std::string error) -> Result<PackedForest> {
         if (hash_fd >= 0) ::close(hash_fd);
         if (meta_fd >= 0) ::close(meta_fd);
-        std::error_code cleanup_error;
-        std::filesystem::remove_all(temporary, cleanup_error);
         return Result<PackedForest>::Err(std::move(error));
     };
 
@@ -2603,17 +2889,13 @@ Result<PackedForest> ReadForestOnline(std::istream& input,
     auto rebuilt{forest.m_impl->RebuildIndexAndValidate()};
     if (!rebuilt) return fail(rebuilt.Error());
 
-    std::error_code rename_error;
-    std::filesystem::rename(temporary, directory, rename_error);
-    if (rename_error) return fail("publish online-state directory: " + rename_error.message());
-    const auto parent{directory.has_parent_path() ? directory.parent_path() :
-                                                   std::filesystem::path{"."}};
-    auto parent_synced{SyncDirectory(parent)};
-    if (!parent_synced) return Result<PackedForest>::Err(parent_synced.Error());
-
     std::vector<Hash256> chain_copy{chain_hashes.begin(), chain_hashes.end()};
-    forest.m_impl->online = std::make_unique<OnlineStore>(directory, config, state,
-                                                          std::move(chain_copy));
+    forest.m_impl->online = std::make_unique<OnlineStore>(temporary, config, state,
+        std::move(chain_copy), prepared.ReleaseLock(), directory);
+    if (!config.defer_publish) {
+        auto published{forest.PublishOnline()};
+        if (!published) return Result<PackedForest>::Err(published.Error());
+    }
     return Result<PackedForest>::Ok(std::move(forest));
 }
 

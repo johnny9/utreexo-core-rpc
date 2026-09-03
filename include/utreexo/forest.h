@@ -53,6 +53,8 @@ struct OnlineForestConfig {
     uint32_t undo_depth{1'008};
     /** Synchronize every WAL transaction before publishing it. */
     bool sync_wal{true};
+    /** Keep a newly imported generation private until PublishOnline succeeds. */
+    bool defer_publish{false};
 };
 
 struct OnlineForestUsage {
@@ -113,6 +115,8 @@ public:
                                            std::vector<Hash256>& chain_hashes,
                                            ChainPoint& point,
                                            OnlineForestConfig config = {});
+    /** Atomically publish a directly imported generation after external validation. */
+    Result<void> PublishOnline();
     /** Flush coalesced records into the mmap base and advance its superblock. */
     Result<void> FlushOnline();
     /** Durably disconnect the current online tip using its retained WAL before-images. */

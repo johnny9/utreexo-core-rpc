@@ -204,6 +204,45 @@ TEST(online_forest_switch_wal_recovery_and_flush)
     Cleanup(path);
 }
 
+TEST(online_forest_holds_exclusive_lock_for_lifetime)
+{
+    const auto path{OnlinePath("exclusive-lock")};
+    Cleanup(path);
+    const Hash256 genesis{OnlineHash(201)};
+    const std::array<Hash256, 1> chain{genesis};
+    const std::array<Hash256, 2> leaves{OnlineHash(21), OnlineHash(22)};
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = true,
+    };
+
+    {
+        PackedForest owner;
+        CHECK(owner.Modify(leaves, {}));
+        CHECK(owner.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+
+        std::vector<Hash256> duplicate_chain;
+        ChainPoint duplicate_point;
+        const auto duplicate{
+            PackedForest::OpenOnline(path, duplicate_chain, duplicate_point, config)};
+        CHECK(!duplicate);
+        CHECK(duplicate.Error().find("locked by another process") != std::string::npos);
+
+        CHECK(owner.ModifyBlock({}, {}, ChainPoint{1, OnlineHash(202)}));
+    }
+
+    std::vector<Hash256> recovered_chain;
+    ChainPoint recovered_point;
+    {
+        const auto reopened{PackedForest::OpenOnline(path, recovered_chain, recovered_point, config)};
+        CHECK(reopened);
+        CHECK_EQ(recovered_point, (ChainPoint{1, OnlineHash(202)}));
+    }
+    Cleanup(path);
+}
+
 TEST(online_forest_truncates_uncommitted_wal_tail)
 {
     const auto path{OnlinePath("tail")};

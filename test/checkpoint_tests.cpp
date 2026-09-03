@@ -4,8 +4,47 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <string>
+#include <unistd.h>
+#include <vector>
 
 using namespace utreexo;
+
+namespace {
+
+uint64_t CheckpointChecksum(std::span<const unsigned char> bytes)
+{
+    constexpr uint64_t FNV_OFFSET{14695981039346656037ULL};
+    constexpr uint64_t FNV_PRIME{1099511628211ULL};
+    uint64_t checksum{FNV_OFFSET};
+    for (const unsigned char byte : bytes) {
+        checksum ^= byte;
+        checksum *= FNV_PRIME;
+    }
+    return checksum;
+}
+
+void AddCheckpointTrailingByteWithValidChecksum(const std::filesystem::path& path)
+{
+    std::ifstream input{path, std::ios::binary};
+    std::vector<unsigned char> bytes{
+        std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+    CHECK(bytes.size() >= sizeof(uint64_t));
+    bytes.resize(bytes.size() - sizeof(uint64_t));
+    bytes.push_back(0x5aU);
+    uint64_t checksum{CheckpointChecksum(bytes)};
+    for (std::size_t i{0}; i < sizeof(checksum); ++i) {
+        bytes.push_back(static_cast<unsigned char>(checksum & 0xffU));
+        checksum >>= 8;
+    }
+    std::ofstream output{path, std::ios::binary | std::ios::trunc};
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    CHECK(output.good());
+}
+
+} // namespace
 
 TEST(checkpoint_roundtrip)
 {
@@ -100,6 +139,193 @@ TEST(checkpoint_streams_directly_to_online_state)
     CHECK_EQ(recovered_point, next_point);
     CHECK_EQ(recovered_chain, expected_chain);
     CHECK_EQ(reopened.Value().Roots(), expected_roots);
+
+    std::filesystem::remove(checkpoint_path, cleanup_error);
+    std::filesystem::remove_all(online_path, cleanup_error);
+}
+
+TEST(checkpoint_online_import_stays_private_until_explicit_publication)
+{
+    const std::string suffix{std::to_string(::getpid())};
+    const auto checkpoint_path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-staged-" + suffix + ".dat")};
+    const auto online_path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-staged-state-" + suffix)};
+    const auto temporary_path{std::filesystem::path{online_path.string() + ".tmp"}};
+    std::error_code cleanup_error;
+    std::filesystem::remove(checkpoint_path, cleanup_error);
+    std::filesystem::remove_all(online_path, cleanup_error);
+    std::filesystem::remove_all(temporary_path, cleanup_error);
+
+    const std::array<Hash256, 2> leaves{
+        Hash256::FromHex("6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d").Value(),
+        Hash256::FromHex("4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a").Value(),
+    };
+    const ChainPoint point{0, Hash256{}};
+    const std::array<Hash256, 1> chain{point.block_hash};
+    PackedForest source;
+    CHECK(source.Modify(leaves, {}));
+    CHECK(SaveCheckpoint(checkpoint_path, point, source, chain));
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = true,
+        .defer_publish = true,
+    };
+
+    {
+        auto staged{LoadCheckpointOnline(checkpoint_path, online_path, config)};
+        CHECK(staged);
+        CHECK(!std::filesystem::exists(online_path));
+        CHECK(std::filesystem::exists(temporary_path));
+
+        const auto competing{LoadCheckpointOnline(checkpoint_path, online_path, config)};
+        CHECK(!competing);
+        CHECK(competing.Error().find("active or ambiguous") != std::string::npos);
+        CHECK(std::filesystem::exists(temporary_path));
+
+        const auto premature_modify{staged.Value().forest.ModifyBlock(
+            {}, {}, ChainPoint{1, Hash256::FromHex(
+                "010102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").Value()})};
+        CHECK(!premature_modify);
+        CHECK(premature_modify.Error().find("before modifying") != std::string::npos);
+
+        CHECK(staged.Value().forest.PublishOnline());
+        CHECK(std::filesystem::exists(online_path));
+        CHECK(!std::filesystem::exists(temporary_path));
+
+        std::vector<Hash256> duplicate_chain;
+        ChainPoint duplicate_point;
+        const auto duplicate{PackedForest::OpenOnline(
+            online_path, duplicate_chain, duplicate_point, config)};
+        CHECK(!duplicate);
+        CHECK(duplicate.Error().find("locked by another process") != std::string::npos);
+    }
+
+    std::vector<Hash256> recovered_chain;
+    ChainPoint recovered_point;
+    {
+        auto reopened{PackedForest::OpenOnline(
+            online_path, recovered_chain, recovered_point, config)};
+        CHECK(reopened);
+        CHECK_EQ(recovered_point, point);
+        CHECK_EQ(reopened.Value().Roots(), source.Roots());
+    }
+    std::filesystem::remove(checkpoint_path, cleanup_error);
+    std::filesystem::remove_all(online_path, cleanup_error);
+}
+
+TEST(checkpoint_rejected_staged_state_is_not_published)
+{
+    const std::string suffix{std::to_string(::getpid())};
+    const auto checkpoint_path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-rejected-" + suffix + ".dat")};
+    const auto online_path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-rejected-state-" + suffix)};
+    const auto temporary_path{std::filesystem::path{online_path.string() + ".tmp"}};
+    std::error_code cleanup_error;
+    std::filesystem::remove(checkpoint_path, cleanup_error);
+    std::filesystem::remove_all(online_path, cleanup_error);
+    std::filesystem::remove_all(temporary_path, cleanup_error);
+
+    PackedForest source;
+    const std::array<Hash256, 1> leaves{Hash256::FromHex(
+        "dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986").Value()};
+    CHECK(source.Modify(leaves, {}));
+    const ChainPoint point{0, Hash256{}};
+    const std::array<Hash256, 1> chain{point.block_hash};
+    CHECK(SaveCheckpoint(checkpoint_path, point, source, chain));
+    {
+        auto staged{LoadCheckpointOnline(checkpoint_path, online_path,
+            OnlineForestConfig{.defer_publish = true})};
+        CHECK(staged);
+        CHECK(std::filesystem::exists(temporary_path));
+        // Model a trusted-state validator rejecting the loaded roots: dropping
+        // the staged forest must remove its private generation.
+    }
+    CHECK(!std::filesystem::exists(online_path));
+    CHECK(!std::filesystem::exists(temporary_path));
+
+    std::filesystem::create_directories(temporary_path);
+    {
+        std::ofstream sentinel{temporary_path / "operator-data"};
+        sentinel << "not an owned online-state import";
+    }
+    const auto ambiguous{LoadCheckpointOnline(checkpoint_path, online_path)};
+    CHECK(!ambiguous);
+    CHECK(ambiguous.Error().find("ambiguous") != std::string::npos);
+    CHECK(std::filesystem::exists(temporary_path / "operator-data"));
+
+    std::filesystem::remove(checkpoint_path, cleanup_error);
+    std::filesystem::remove_all(temporary_path, cleanup_error);
+}
+
+TEST(checkpoint_online_import_validates_complete_payload_before_publication)
+{
+    const std::string suffix{std::to_string(::getpid())};
+    const auto checkpoint_path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-trailing-" + suffix + ".dat")};
+    const auto online_path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-trailing-state-" + suffix)};
+    const auto temporary_path{std::filesystem::path{online_path.string() + ".tmp"}};
+    std::error_code cleanup_error;
+    std::filesystem::remove(checkpoint_path, cleanup_error);
+    std::filesystem::remove_all(online_path, cleanup_error);
+    std::filesystem::remove_all(temporary_path, cleanup_error);
+
+    PackedForest source;
+    const std::array<Hash256, 1> leaves{Hash256::FromHex(
+        "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d").Value()};
+    CHECK(source.Modify(leaves, {}));
+    const ChainPoint point{0, Hash256{}};
+    const std::array<Hash256, 1> chain{point.block_hash};
+    CHECK(SaveCheckpoint(checkpoint_path, point, source, chain));
+    AddCheckpointTrailingByteWithValidChecksum(checkpoint_path);
+
+    const auto loaded{LoadCheckpointOnline(checkpoint_path, online_path)};
+    CHECK(!loaded);
+    CHECK(loaded.Error().find("trailing or missing") != std::string::npos);
+    CHECK(!std::filesystem::exists(online_path));
+    CHECK(!std::filesystem::exists(temporary_path));
+
+    std::filesystem::remove(checkpoint_path, cleanup_error);
+}
+
+TEST(checkpoint_online_import_reclaims_only_recognized_stale_temporary_state)
+{
+    const std::string suffix{std::to_string(::getpid())};
+    const auto checkpoint_path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-stale-" + suffix + ".dat")};
+    const auto online_path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-stale-state-" + suffix)};
+    const auto temporary_path{std::filesystem::path{online_path.string() + ".tmp"}};
+    std::error_code cleanup_error;
+    std::filesystem::remove(checkpoint_path, cleanup_error);
+    std::filesystem::remove_all(online_path, cleanup_error);
+    std::filesystem::remove_all(temporary_path, cleanup_error);
+
+    PackedForest source;
+    const std::array<Hash256, 1> leaves{Hash256::FromHex(
+        "084fed08b978af4d7d196a7446a86b58009e636b6117e7f3187e3b156dd6e938").Value()};
+    CHECK(source.Modify(leaves, {}));
+    const ChainPoint point{0, Hash256{}};
+    const std::array<Hash256, 1> chain{point.block_hash};
+    CHECK(SaveCheckpoint(checkpoint_path, point, source, chain));
+    {
+        auto first{LoadCheckpointOnline(checkpoint_path, online_path)};
+        CHECK(first);
+    }
+    std::filesystem::rename(online_path, temporary_path);
+    std::filesystem::remove(temporary_path / "state.0", cleanup_error);
+    CHECK(!cleanup_error);
+
+    {
+        auto recovered_import{LoadCheckpointOnline(checkpoint_path, online_path)};
+        CHECK(recovered_import);
+        CHECK(std::filesystem::exists(online_path / "state.0"));
+        CHECK(!std::filesystem::exists(temporary_path));
+    }
 
     std::filesystem::remove(checkpoint_path, cleanup_error);
     std::filesystem::remove_all(online_path, cleanup_error);

@@ -248,17 +248,19 @@ Result<LoadedCheckpoint> LoadCheckpointImpl(
         return Result<LoadedCheckpoint>::Err("checkpoint chain-hash index does not match its chain point");
     }
     const ChainPoint point{height, Hash256{block_hash}};
+    OnlineForestConfig import_config{online_config};
+    if (online_directory) import_config.defer_publish = true;
     auto forest{online_directory ?
-        ReadForestOnline(input, *online_directory, point, chain_hashes, online_config) :
+        ReadForestOnline(input, *online_directory, point, chain_hashes, import_config) :
         ReadForest(input)};
     if (!forest) return Result<LoadedCheckpoint>::Err(forest.Error());
     const auto payload_end{input.tellg()};
     if (payload_end < 0 || static_cast<uint64_t>(payload_end) != file_size - sizeof(uint64_t)) {
-        if (online_directory) {
-            std::error_code cleanup_error;
-            std::filesystem::remove_all(*online_directory, cleanup_error);
-        }
         return Result<LoadedCheckpoint>::Err("checkpoint contains trailing or missing forest data");
+    }
+    if (online_directory && !online_config.defer_publish) {
+        auto published{forest.Value().PublishOnline()};
+        if (!published) return Result<LoadedCheckpoint>::Err(published.Error());
     }
     if (metrics) {
         metrics->deserialize_us = Micros(deserialize_start);
