@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <random>
 #include <string>
@@ -65,6 +66,12 @@ void FlipByte(const std::filesystem::path& path, std::streamoff offset)
     file.seekp(offset);
     file.write(&value, 1);
     CHECK(file.good());
+}
+
+std::string ReadText(const std::filesystem::path& path)
+{
+    std::ifstream input{path, std::ios::binary};
+    return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
 }
 
 std::vector<Hash256> ConcreteRoots(const PackedForest& forest)
@@ -166,6 +173,16 @@ TEST(online_forest_switch_wal_recovery_and_flush)
         CHECK(forest.OnlineUsage().dirty_nodes > 0U);
         CHECK(forest.OnlineUsage().wal_bytes > 0U);
     }
+
+    // Model a crash after a capacity-growing base flush resized the arena files
+    // but before its new superblock was published. The old superblock must map
+    // only its declared prefix and replay the already durable WAL.
+    const auto hashes_path{path / "forest.hashes"};
+    const auto metadata_path{path / "forest.meta"};
+    std::filesystem::resize_file(
+        hashes_path, std::filesystem::file_size(hashes_path) * 2);
+    std::filesystem::resize_file(
+        metadata_path, std::filesystem::file_size(metadata_path) * 2);
 
     std::vector<Hash256> recovered_chain;
     ChainPoint recovered_point;
@@ -288,6 +305,138 @@ TEST(online_forest_truncates_uncommitted_wal_tail)
     CHECK_EQ(point, expected_point);
     CHECK_EQ(std::filesystem::file_size(wal_path), committed_size);
     Cleanup(path);
+}
+
+TEST(online_forest_rejects_hard_linked_wal_before_tail_truncation)
+{
+    const auto path{OnlinePath("wal-external-hardlink")};
+    const auto external{OnlinePath("wal-external-hardlink-sentinel")};
+    Cleanup(path);
+    std::error_code cleanup_error;
+    std::filesystem::remove(external, cleanup_error);
+    const Hash256 genesis{OnlineHash(112)};
+    const std::array<Hash256, 1> chain{genesis};
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = true,
+    };
+    {
+        PackedForest forest;
+        const std::array<Hash256, 2> leaves{OnlineHash(13), OnlineHash(14)};
+        CHECK(forest.Modify(leaves, {}));
+        CHECK(forest.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+        const std::array<Hash256, 1> addition{OnlineHash(15)};
+        CHECK(forest.ModifyBlock(addition, {}, ChainPoint{1, OnlineHash(113)}));
+    }
+
+    const auto wal_path{WalPath(path)};
+    CHECK(!wal_path.empty());
+    {
+        std::ofstream output{wal_path, std::ios::binary | std::ios::app};
+        output << "incomplete external tail";
+    }
+    std::filesystem::create_hard_link(wal_path, external);
+    const auto size{std::filesystem::file_size(wal_path)};
+
+    std::vector<Hash256> recovered_chain;
+    ChainPoint point;
+    const auto recovered{
+        PackedForest::OpenOnline(path, recovered_chain, point, config)};
+    CHECK(!recovered);
+    CHECK(recovered.Error().find("hard-linked") != std::string::npos);
+    CHECK_EQ(std::filesystem::file_size(wal_path), size);
+    CHECK_EQ(std::filesystem::file_size(external), size);
+
+    std::filesystem::remove(external, cleanup_error);
+    Cleanup(path);
+}
+
+TEST(online_forest_rejects_hard_linked_owned_files_on_recovery)
+{
+    const auto path{OnlinePath("arena-external-hardlink")};
+    const auto external{OnlinePath("arena-external-hardlink-sentinel")};
+    Cleanup(path);
+    std::error_code cleanup_error;
+    std::filesystem::remove(external, cleanup_error);
+    const Hash256 genesis{OnlineHash(114)};
+    const std::array<Hash256, 1> chain{genesis};
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = true,
+    };
+    {
+        PackedForest forest;
+        const std::array<Hash256, 2> leaves{OnlineHash(16), OnlineHash(17)};
+        CHECK(forest.Modify(leaves, {}));
+        CHECK(forest.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+    }
+    for (const std::string_view name : {std::string_view{"LOCK"},
+                                       std::string_view{"FORMAT"},
+                                       std::string_view{"state.0"},
+                                       std::string_view{"chain.0.hashes"},
+                                       std::string_view{"forest.hashes"},
+                                       std::string_view{"forest.meta"}}) {
+        std::filesystem::create_hard_link(path / name, external);
+        const auto size{std::filesystem::file_size(external)};
+        std::vector<Hash256> recovered_chain;
+        ChainPoint point;
+        const auto recovered{
+            PackedForest::OpenOnline(path, recovered_chain, point, config)};
+        CHECK(!recovered);
+        CHECK(recovered.Error().find("hard-linked") != std::string::npos);
+        CHECK_EQ(std::filesystem::file_size(external), size);
+        std::filesystem::remove(external, cleanup_error);
+        CHECK(!cleanup_error);
+    }
+    Cleanup(path);
+}
+
+TEST(online_forest_flush_rejects_hard_linked_temporary_files_without_clobbering)
+{
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = true,
+    };
+    const std::string sentinel_content{"external online-state sentinel\n"};
+    for (const std::string_view temporary_name :
+         {std::string_view{"chain.1.hashes.tmp"}, std::string_view{"state.1.tmp"}}) {
+        const auto path{OnlinePath(std::string{"flush-temp-"} +
+                                   std::string{temporary_name})};
+        const auto external{OnlinePath(std::string{"flush-temp-sentinel-"} +
+                                       std::string{temporary_name})};
+        Cleanup(path);
+        std::error_code cleanup_error;
+        std::filesystem::remove(external, cleanup_error);
+        {
+            std::ofstream output{external, std::ios::binary};
+            output << sentinel_content;
+        }
+        const Hash256 genesis{OnlineHash(118)};
+        const std::array<Hash256, 1> chain{genesis};
+        PackedForest forest;
+        const std::array<Hash256, 2> leaves{OnlineHash(18), OnlineHash(19)};
+        CHECK(forest.Modify(leaves, {}));
+        CHECK(forest.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+        CHECK(forest.ModifyBlock({}, {}, ChainPoint{1, OnlineHash(119)}));
+        std::filesystem::create_hard_link(external, path / temporary_name);
+
+        const auto flushed{forest.FlushOnline()};
+        CHECK(!flushed);
+        CHECK(flushed.Error().find("hard-linked") != std::string::npos);
+        CHECK_EQ(ReadText(external), sentinel_content);
+
+        std::filesystem::remove(path / temporary_name, cleanup_error);
+        CHECK(forest.FlushOnline());
+        forest = PackedForest{};
+        std::filesystem::remove(external, cleanup_error);
+        Cleanup(path);
+    }
 }
 
 TEST(online_forest_disconnect_is_durable_after_base_flush)
@@ -478,9 +627,70 @@ TEST(online_forest_multiblock_reorg_reopen_and_alternate_branch)
         CHECK(online.ModifyBlock(additions, deletions, point));
         CheckEquivalent(reference, online, live);
     }
+    // Replacing hashes at existing heights must publish the alternate chain,
+    // rather than treating the old chain file length as a valid prefix.
+    CHECK(online.FlushOnline());
     online = PackedForest{};
     online = ReopenOnline(path, chain, ChainPoint{12, chain.back()}, config);
     CheckEquivalent(reference, online, live);
+    Cleanup(path);
+}
+
+TEST(online_forest_recovers_reorg_when_base_flush_stops_before_superblock)
+{
+    const auto path{OnlinePath("reorg-flush-boundary")};
+    Cleanup(path);
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 16,
+        .sync_wal = true,
+    };
+    const Hash256 genesis{OnlineHash64(7'000'000)};
+    const ChainPoint point_one{1, OnlineHash64(7'000'001)};
+    const ChainPoint point_two{2, OnlineHash64(7'000'002)};
+    std::vector<Hash256> chain{genesis};
+    const std::array<Hash256, 4> initial{
+        OnlineHash64(71), OnlineHash64(72), OnlineHash64(73), OnlineHash64(74)};
+    const std::array<Hash256, 1> addition_one{OnlineHash64(75)};
+    const std::array<Hash256, 1> addition_two{OnlineHash64(76)};
+
+    PackedForest reference;
+    CHECK(reference.Modify(initial, {}));
+    CHECK(reference.Modify(addition_one, {}));
+    const auto expected_roots{reference.Roots()};
+
+    {
+        PackedForest online;
+        CHECK(online.Modify(initial, {}));
+        CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+        CHECK(online.ModifyBlock(addition_one, {}, point_one));
+        chain.push_back(point_one.block_hash);
+        CHECK(online.FlushOnline());
+        CHECK(online.ModifyBlock(addition_two, {}, point_two));
+        chain.push_back(point_two.block_hash);
+        CHECK(online.FlushOnline());
+        CHECK(online.RollbackOnlineBlock());
+        chain.pop_back();
+        CHECK_EQ(online.Roots(), expected_roots);
+
+        // Generation 3 would publish state.1. Blocking its temporary file makes
+        // FlushBase stop after syncing the inactive chain snapshot and mmap base,
+        // exactly where a power loss previously made the old superblock unusable.
+        std::filesystem::create_directory(path / "state.1.tmp");
+        const auto flushed{online.FlushOnline()};
+        CHECK(!flushed);
+    }
+
+    auto recovered{ReopenOnline(path, chain, point_one, config)};
+    CHECK_EQ(recovered.Roots(), expected_roots);
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(path / "state.1.tmp", cleanup_error);
+    CHECK(!cleanup_error);
+    CHECK(recovered.FlushOnline());
+    recovered = PackedForest{};
+    recovered = ReopenOnline(path, chain, point_one, config);
+    CHECK_EQ(recovered.Roots(), expected_roots);
     Cleanup(path);
 }
 
@@ -529,6 +739,51 @@ TEST(online_forest_recovers_from_corrupt_newest_superblock)
     CHECK_EQ(recovered.OnlineUsage().base_lsn, 1U);
     CHECK_EQ(recovered.OnlineUsage().current_lsn, 2U);
     CHECK(recovered.OnlineUsage().dirty_nodes > 0U);
+    Cleanup(path);
+}
+
+TEST(online_forest_falls_back_from_corrupt_newest_chain_snapshot)
+{
+    const auto path{OnlinePath("chain-superblock-pair")};
+    Cleanup(path);
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = true,
+    };
+    const Hash256 genesis{OnlineHash64(4'100'000)};
+    const ChainPoint point_one{1, OnlineHash64(4'100'001)};
+    const ChainPoint point_two{2, OnlineHash64(4'100'002)};
+    std::vector<Hash256> chain{genesis};
+    const std::array<Hash256, 4> initial{
+        OnlineHash64(81), OnlineHash64(82), OnlineHash64(83), OnlineHash64(84)};
+    const std::array<Hash256, 1> addition_one{OnlineHash64(85)};
+    const std::array<Hash256, 1> addition_two{OnlineHash64(86)};
+
+    PackedForest reference;
+    CHECK(reference.Modify(initial, {}));
+    CHECK(reference.Modify(addition_one, {}));
+    CHECK(reference.Modify(addition_two, {}));
+    {
+        PackedForest online;
+        CHECK(online.Modify(initial, {}));
+        CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+        CHECK(online.ModifyBlock(addition_one, {}, point_one));
+        chain.push_back(point_one.block_hash);
+        CHECK(online.FlushOnline());
+        CHECK(online.ModifyBlock(addition_two, {}, point_two));
+        chain.push_back(point_two.block_hash);
+        CHECK(online.FlushOnline());
+    }
+
+    // Generation 2 uses state.0 + chain.0.hashes. Corrupting only its chain
+    // snapshot must select generation 1 and replay block 2 from retained WAL.
+    FlipByte(path / "chain.0.hashes", 2 * static_cast<std::streamoff>(Hash256::SIZE));
+    auto recovered{ReopenOnline(path, chain, point_two, config)};
+    CHECK_EQ(recovered.Roots(), reference.Roots());
+    CHECK_EQ(recovered.OnlineUsage().base_lsn, 1U);
+    CHECK_EQ(recovered.OnlineUsage().current_lsn, 2U);
     Cleanup(path);
 }
 
@@ -637,6 +892,7 @@ TEST(online_forest_rotates_prunes_and_enforces_undo_window)
         CHECK(transaction.last_transaction_total_us >= transaction.last_transaction_write_us);
         CHECK(transaction.last_transaction_total_us >= transaction.last_transaction_sync_us);
         CHECK(transaction.last_transaction_total_us >= transaction.last_transaction_publish_us);
+        CHECK_EQ(transaction.wal_segment_directory_syncs, height);
         CHECK(online.FlushOnline());
     }
 

@@ -79,6 +79,135 @@ uint64_t ElapsedMicros(std::chrono::steady_clock::time_point start)
 Result<void> PwriteAll(int descriptor, std::span<const std::byte> bytes, uint64_t file_offset);
 Result<void> WriteAll(int descriptor, std::span<const std::byte> bytes);
 
+class ScopedDescriptor
+{
+public:
+    explicit ScopedDescriptor(int descriptor = -1) : m_descriptor{descriptor} {}
+    ~ScopedDescriptor() { if (m_descriptor >= 0) ::close(m_descriptor); }
+    ScopedDescriptor(const ScopedDescriptor&) = delete;
+    ScopedDescriptor& operator=(const ScopedDescriptor&) = delete;
+    ScopedDescriptor(ScopedDescriptor&& other) noexcept
+        : m_descriptor{std::exchange(other.m_descriptor, -1)}
+    {
+    }
+    ScopedDescriptor& operator=(ScopedDescriptor&& other) noexcept
+    {
+        if (this == &other) return *this;
+        if (m_descriptor >= 0) ::close(m_descriptor);
+        m_descriptor = std::exchange(other.m_descriptor, -1);
+        return *this;
+    }
+    int Get() const { return m_descriptor; }
+    int Release() { return std::exchange(m_descriptor, -1); }
+
+private:
+    int m_descriptor{-1};
+};
+
+int NoFollowFlag()
+{
+#ifdef O_NOFOLLOW
+    return O_NOFOLLOW;
+#else
+    return 0;
+#endif
+}
+
+Result<void> InspectOwnedRegularFile(int descriptor,
+                                     const std::filesystem::path& path,
+                                     std::string_view description)
+{
+    struct stat descriptor_status{};
+    struct stat path_status{};
+    if (::fstat(descriptor, &descriptor_status) != 0 ||
+        ::lstat(path.c_str(), &path_status) != 0) {
+        return Result<void>::Err(ErrnoMessage(
+            std::string{"inspect "} + std::string{description}));
+    }
+    if (!S_ISREG(descriptor_status.st_mode) || !S_ISREG(path_status.st_mode) ||
+        descriptor_status.st_dev != path_status.st_dev ||
+        descriptor_status.st_ino != path_status.st_ino) {
+        return Result<void>::Err(std::string{description} +
+            " must be an unaliased regular file in the online-state directory");
+    }
+    if (descriptor_status.st_nlink != 1) {
+        return Result<void>::Err(std::string{description} +
+            " must not be hard-linked outside its online-state path");
+    }
+    return Result<void>::Ok();
+}
+
+Result<ScopedDescriptor> OpenOwnedRegularFile(const std::filesystem::path& path,
+                                              int flags,
+                                              std::string_view description)
+{
+    const int descriptor{::open(path.c_str(), flags | O_CLOEXEC | NoFollowFlag(), 0600)};
+    if (descriptor < 0) {
+        return Result<ScopedDescriptor>::Err(ErrnoMessage(
+            std::string{"open "} + std::string{description}));
+    }
+    ScopedDescriptor scoped{descriptor};
+    auto inspected{InspectOwnedRegularFile(descriptor, path, description)};
+    if (!inspected) return Result<ScopedDescriptor>::Err(inspected.Error());
+    return Result<ScopedDescriptor>::Ok(std::move(scoped));
+}
+
+Result<ScopedDescriptor> CreateFreshTemporaryFile(
+    const std::filesystem::path& path, std::string_view description)
+{
+    int descriptor{::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
+        NoFollowFlag(), 0600)};
+    if (descriptor < 0 && errno == EEXIST) {
+        struct stat path_status{};
+        if (::lstat(path.c_str(), &path_status) != 0) {
+            return Result<ScopedDescriptor>::Err(ErrnoMessage(
+                std::string{"inspect stale "} + std::string{description}));
+        }
+        if (S_ISLNK(path_status.st_mode)) {
+            return Result<ScopedDescriptor>::Err(
+                std::string{description} + " must not be a symbolic link");
+        }
+        if (!S_ISREG(path_status.st_mode)) {
+            return Result<ScopedDescriptor>::Err(
+                std::string{description} + " must be a regular file");
+        }
+        auto stale{OpenOwnedRegularFile(path, O_RDONLY | O_NONBLOCK, description)};
+        if (!stale) return Result<ScopedDescriptor>::Err(stale.Error());
+        if (::unlink(path.c_str()) != 0) {
+            return Result<ScopedDescriptor>::Err(ErrnoMessage(
+                std::string{"remove stale "} + std::string{description}));
+        }
+        descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC |
+            NoFollowFlag(), 0600);
+    }
+    if (descriptor < 0) {
+        return Result<ScopedDescriptor>::Err(ErrnoMessage(
+            std::string{"create "} + std::string{description}));
+    }
+    ScopedDescriptor scoped{descriptor};
+    auto inspected{InspectOwnedRegularFile(descriptor, path, description)};
+    if (!inspected) return Result<ScopedDescriptor>::Err(inspected.Error());
+    return Result<ScopedDescriptor>::Ok(std::move(scoped));
+}
+
+Result<void> ValidateReplaceableOwnedFile(const std::filesystem::path& path,
+                                          std::string_view description)
+{
+    struct stat status{};
+    if (::lstat(path.c_str(), &status) != 0) {
+        if (errno == ENOENT) return Result<void>::Ok();
+        return Result<void>::Err(ErrnoMessage(
+            std::string{"inspect "} + std::string{description}));
+    }
+    if (S_ISLNK(status.st_mode)) {
+        return Result<void>::Err(std::string{description} +
+            " must not be a symbolic link");
+    }
+    auto opened{OpenOwnedRegularFile(path, O_RDONLY | O_NONBLOCK, description)};
+    if (!opened) return Result<void>::Err(opened.Error());
+    return Result<void>::Ok();
+}
+
 constexpr std::string_view ONLINE_LOCK_CONTENT{"utreexo-online-state-lock-v1\n"};
 constexpr std::string_view ONLINE_OWNER_CONTENT{"utreexo-online-state-v1\n"};
 constexpr std::string_view ONLINE_LOCK_FILE{"LOCK"};
@@ -112,11 +241,16 @@ public:
     {
         const auto path{directory / ONLINE_LOCK_FILE};
         const int create_flags{allow_create ? O_CREAT : 0};
-        const int descriptor{::open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW |
+        const int descriptor{::open(path.c_str(), O_RDWR | O_CLOEXEC | NoFollowFlag() |
                                                      create_flags, 0600)};
         if (descriptor < 0) {
             return Result<OnlineStateLock>::Err(ErrnoMessage(
                 allow_create ? "open online-state lock" : "open existing online-state lock"));
+        }
+        auto inspected{InspectOwnedRegularFile(descriptor, path, "online-state lock")};
+        if (!inspected) {
+            ::close(descriptor);
+            return Result<OnlineStateLock>::Err(inspected.Error());
         }
         if (::flock(descriptor, LOCK_EX | LOCK_NB) != 0) {
             const int saved_errno{errno};
@@ -141,7 +275,7 @@ public:
                 ONLINE_LOCK_CONTENT.data(), ONLINE_LOCK_CONTENT.size()}))};
             if (written) written = SyncDescriptor(descriptor, "online-state lock");
             if (!written) {
-                const auto error{written.Error()};
+                const auto& error{written.Error()};
                 ::close(descriptor);
                 return Result<OnlineStateLock>::Err(error);
             }
@@ -183,21 +317,25 @@ public:
         if (capacity_slots == 0 || capacity_slots >= NO_NODE) {
             return Result<void>::Err("invalid mapped arena capacity");
         }
-        m_hash_fd = ::open(hashes_path.c_str(), O_RDWR | O_CLOEXEC);
-        if (m_hash_fd < 0) return Result<void>::Err(ErrnoMessage("open forest hashes"));
-        m_meta_fd = ::open(meta_path.c_str(), O_RDWR | O_CLOEXEC);
-        if (m_meta_fd < 0) {
-            const auto error{ErrnoMessage("open forest metadata")};
+        auto hash_opened{OpenOwnedRegularFile(hashes_path, O_RDWR, "forest hashes")};
+        if (!hash_opened) return Result<void>::Err(hash_opened.Error());
+        m_hash_fd = hash_opened.Value().Release();
+        auto meta_opened{OpenOwnedRegularFile(meta_path, O_RDWR, "forest metadata")};
+        if (!meta_opened) {
             Close();
-            return Result<void>::Err(error);
+            return Result<void>::Err(meta_opened.Error());
         }
+        m_meta_fd = meta_opened.Value().Release();
         const uint64_t hash_bytes{capacity_slots * sizeof(Hash256)};
         const uint64_t meta_bytes{capacity_slots * sizeof(DiskMeta)};
         struct stat hash_stat{};
         struct stat meta_stat{};
         if (::fstat(m_hash_fd, &hash_stat) != 0 || ::fstat(m_meta_fd, &meta_stat) != 0 ||
-            static_cast<uint64_t>(hash_stat.st_size) != hash_bytes ||
-            static_cast<uint64_t>(meta_stat.st_size) != meta_bytes) {
+            hash_stat.st_size < 0 || meta_stat.st_size < 0 ||
+            static_cast<uint64_t>(hash_stat.st_size) < hash_bytes ||
+            static_cast<uint64_t>(meta_stat.st_size) < meta_bytes ||
+            static_cast<uint64_t>(hash_stat.st_size) % sizeof(Hash256) != 0 ||
+            static_cast<uint64_t>(meta_stat.st_size) % sizeof(DiskMeta) != 0) {
             Close();
             return Result<void>::Err("mapped arena files have unexpected sizes");
         }
@@ -226,25 +364,20 @@ public:
                         uint64_t capacity_slots)
     {
         Close();
-        const int hash_fd{::open(hashes_path.c_str(), O_RDWR | O_CLOEXEC)};
-        if (hash_fd < 0) return Result<void>::Err(ErrnoMessage("open forest hashes for resize"));
-        const int meta_fd{::open(meta_path.c_str(), O_RDWR | O_CLOEXEC)};
-        if (meta_fd < 0) {
-            const auto error{ErrnoMessage("open forest metadata for resize")};
-            ::close(hash_fd);
-            return Result<void>::Err(error);
-        }
+        auto hash_opened{OpenOwnedRegularFile(hashes_path, O_RDWR,
+                                              "forest hashes for resize")};
+        if (!hash_opened) return Result<void>::Err(hash_opened.Error());
+        auto meta_opened{OpenOwnedRegularFile(meta_path, O_RDWR,
+                                              "forest metadata for resize")};
+        if (!meta_opened) return Result<void>::Err(meta_opened.Error());
+        const int hash_fd{hash_opened.Value().Get()};
+        const int meta_fd{meta_opened.Value().Get()};
         const uint64_t hash_bytes{capacity_slots * sizeof(Hash256)};
         const uint64_t meta_bytes{capacity_slots * sizeof(DiskMeta)};
         if (::ftruncate(hash_fd, static_cast<off_t>(hash_bytes)) != 0 ||
             ::ftruncate(meta_fd, static_cast<off_t>(meta_bytes)) != 0) {
-            const auto error{ErrnoMessage("resize mapped arena")};
-            ::close(hash_fd);
-            ::close(meta_fd);
-            return Result<void>::Err(error);
+            return Result<void>::Err(ErrnoMessage("resize mapped arena"));
         }
-        ::close(hash_fd);
-        ::close(meta_fd);
         return Open(hashes_path, meta_path, capacity_slots);
     }
 
@@ -473,13 +606,26 @@ public:
                              const std::filesystem::path& meta_path,
                              uint64_t capacity_slots) const
     {
-        const int hash_fd{::open(hashes_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)};
+        const int hash_fd{::open(hashes_path.c_str(), O_RDWR | O_CREAT | O_EXCL |
+            O_CLOEXEC | NoFollowFlag(), 0600)};
         if (hash_fd < 0) return Result<void>::Err(ErrnoMessage("create forest hashes"));
-        const int meta_fd{::open(meta_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600)};
+        auto hash_inspected{InspectOwnedRegularFile(hash_fd, hashes_path, "forest hashes")};
+        if (!hash_inspected) {
+            ::close(hash_fd);
+            return hash_inspected;
+        }
+        const int meta_fd{::open(meta_path.c_str(), O_RDWR | O_CREAT | O_EXCL |
+            O_CLOEXEC | NoFollowFlag(), 0600)};
         if (meta_fd < 0) {
             const auto error{ErrnoMessage("create forest metadata")};
             ::close(hash_fd);
             return Result<void>::Err(error);
+        }
+        auto meta_inspected{InspectOwnedRegularFile(meta_fd, meta_path, "forest metadata")};
+        if (!meta_inspected) {
+            ::close(hash_fd);
+            ::close(meta_fd);
+            return meta_inspected;
         }
         const uint64_t hash_bytes{capacity_slots * sizeof(Hash256)};
         const uint64_t meta_bytes{capacity_slots * sizeof(DiskMeta)};
@@ -498,7 +644,7 @@ public:
                 std::as_bytes(std::span<const Hash256>{chunk.hashes.get(), static_cast<std::size_t>(count)}),
                 first * sizeof(Hash256))};
             if (!hash_written) {
-                const auto error{hash_written.Error()};
+                const auto& error{hash_written.Error()};
                 ::close(hash_fd);
                 ::close(meta_fd);
                 return Result<void>::Err(error);
@@ -511,7 +657,7 @@ public:
                 std::as_bytes(std::span<const DiskMeta>{meta_buffer.data(), static_cast<std::size_t>(count)}),
                 first * sizeof(DiskMeta))};
             if (!meta_written) {
-                const auto error{meta_written.Error()};
+                const auto& error{meta_written.Error()};
                 ::close(hash_fd);
                 ::close(meta_fd);
                 return Result<void>::Err(error);
@@ -921,7 +1067,10 @@ constexpr std::array<std::byte, 8> WAL_MAGIC{
 constexpr std::array<std::byte, 8> WAL_COMMIT{
     std::byte{'C'}, std::byte{'O'}, std::byte{'M'}, std::byte{'M'},
     std::byte{'I'}, std::byte{'T'}, std::byte{'0'}, std::byte{'1'}};
-constexpr uint32_t ONLINE_FORMAT_VERSION{1};
+// Version 2 pairs each superblock generation with an immutable-at-publication
+// chain-hash snapshot. Version-1 state/WAL remains readable for migration.
+constexpr uint32_t ONLINE_FORMAT_VERSION{2};
+constexpr uint32_t LEGACY_ONLINE_FORMAT_VERSION{1};
 
 template <typename T>
 void AppendUnsigned(std::vector<std::byte>& output, T value)
@@ -1053,7 +1202,8 @@ Result<void> PwriteAll(int descriptor, std::span<const std::byte> bytes, uint64_
 
 Result<void> SyncDirectory(const std::filesystem::path& directory)
 {
-    const int descriptor{::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+    const int descriptor{::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+        NoFollowFlag())};
     if (descriptor < 0) return Result<void>::Err(ErrnoMessage("open online-state directory"));
     const int result{::fsync(descriptor)};
     const int saved_errno{errno};
@@ -1067,8 +1217,13 @@ Result<void> WriteOnlineOwnerMarker(const std::filesystem::path& directory)
 {
     const auto path{directory / ONLINE_OWNER_FILE};
     const int descriptor{::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL |
-                                              O_CLOEXEC | O_NOFOLLOW, 0600)};
+                                              O_CLOEXEC | NoFollowFlag(), 0600)};
     if (descriptor < 0) return Result<void>::Err(ErrnoMessage("create online-state format marker"));
+    auto inspected{InspectOwnedRegularFile(descriptor, path, "online-state format marker")};
+    if (!inspected) {
+        ::close(descriptor);
+        return inspected;
+    }
     auto written{WriteAll(descriptor, std::as_bytes(std::span<const char>{
         ONLINE_OWNER_CONTENT.data(), ONLINE_OWNER_CONTENT.size()}))};
     if (written) written = SyncDescriptor(descriptor, "online-state format marker");
@@ -1081,9 +1236,14 @@ Result<void> WriteOnlineOwnerMarker(const std::filesystem::path& directory)
 Result<void> ValidateOnlineOwnerMarker(const std::filesystem::path& directory)
 {
     const auto path{directory / ONLINE_OWNER_FILE};
-    const int descriptor{::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+    const int descriptor{::open(path.c_str(), O_RDONLY | O_CLOEXEC | NoFollowFlag())};
     if (descriptor < 0) {
         return Result<void>::Err(ErrnoMessage("open online-state format marker"));
+    }
+    auto inspected{InspectOwnedRegularFile(descriptor, path, "online-state format marker")};
+    if (!inspected) {
+        ::close(descriptor);
+        return inspected;
     }
     struct stat status{};
     if (::fstat(descriptor, &status) != 0) {
@@ -1214,6 +1374,7 @@ Result<OnlineImportGuard> PrepareOnlineImport(const std::filesystem::path& direc
 }
 
 struct OnlineSuperblock {
+    uint32_t format_version{ONLINE_FORMAT_VERSION};
     uint64_t generation{0};
     uint64_t base_lsn{0};
     ChainPoint point;
@@ -1224,6 +1385,13 @@ struct OnlineSuperblock {
     uint64_t chain_hash_count{0};
     std::array<NodeId, 64> roots{};
 };
+
+std::filesystem::path ChainHashesPath(const std::filesystem::path& directory,
+                                      uint64_t generation)
+{
+    return directory /
+        (generation % 2 == 0 ? "chain.0.hashes" : "chain.1.hashes");
+}
 
 std::vector<std::byte> SerializeSuperblock(const OnlineSuperblock& state)
 {
@@ -1261,13 +1429,15 @@ Result<OnlineSuperblock> ParseSuperblock(std::span<const std::byte> bytes)
     uint32_t version{0};
     OnlineSuperblock state;
     if (!reader.ReadBytes(magic) || magic != ONLINE_MAGIC || !reader.ReadUnsigned(version) ||
-        version != ONLINE_FORMAT_VERSION || !reader.ReadUnsigned(state.generation) ||
+        (version != LEGACY_ONLINE_FORMAT_VERSION && version != ONLINE_FORMAT_VERSION) ||
+        !reader.ReadUnsigned(state.generation) ||
         !reader.ReadUnsigned(state.base_lsn) || !reader.ReadUnsigned(state.point.height) ||
         !reader.ReadHash(state.point.block_hash) || !reader.ReadUnsigned(state.num_leaves) ||
         !reader.ReadUnsigned(state.next) || !reader.ReadUnsigned(state.live_nodes) ||
         !reader.ReadUnsigned(state.capacity_slots) || !reader.ReadUnsigned(state.chain_hash_count)) {
         return Result<OnlineSuperblock>::Err("invalid online superblock");
     }
+    state.format_version = version;
     for (NodeId& root : state.roots) {
         if (!reader.ReadUnsigned(root)) return Result<OnlineSuperblock>::Err("truncated online roots");
     }
@@ -1284,32 +1454,70 @@ Result<void> WriteSuperblock(const std::filesystem::path& directory,
     const auto bytes{SerializeSuperblock(state)};
     const std::filesystem::path final_path{directory / (state.generation % 2 == 0 ? "state.0" : "state.1")};
     const std::filesystem::path temporary{final_path.string() + ".tmp"};
-    const int descriptor{::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)};
-    if (descriptor < 0) return Result<void>::Err(ErrnoMessage("create online superblock"));
-    auto written{WriteAll(descriptor, bytes)};
-    if (written) written = SyncDescriptor(descriptor, "online superblock");
-    const int close_result{::close(descriptor)};
+    auto opened{CreateFreshTemporaryFile(temporary, "online superblock temporary file")};
+    if (!opened) return Result<void>::Err(opened.Error());
+    auto written{WriteAll(opened.Value().Get(), bytes)};
+    if (written) written = SyncDescriptor(opened.Value().Get(), "online superblock");
     if (!written) return written;
-    if (close_result != 0) return Result<void>::Err(ErrnoMessage("close online superblock"));
+    auto inspected{InspectOwnedRegularFile(opened.Value().Get(), temporary,
+                                           "online superblock temporary file")};
+    if (!inspected) return inspected;
+    auto replaceable{ValidateReplaceableOwnedFile(final_path, "online superblock")};
+    if (!replaceable) return replaceable;
     std::error_code rename_error;
     std::filesystem::rename(temporary, final_path, rename_error);
     if (rename_error) return Result<void>::Err("publish online superblock: " + rename_error.message());
+    inspected = InspectOwnedRegularFile(opened.Value().Get(), final_path,
+                                        "published online superblock");
+    if (!inspected) return inspected;
     return SyncDirectory(directory);
+}
+
+struct OwnedFileContents {
+    ScopedDescriptor descriptor;
+    std::vector<std::byte> bytes;
+};
+
+Result<OwnedFileContents> ReadOwnedFile(const std::filesystem::path& path,
+                                       bool writable = false)
+{
+    auto opened{OpenOwnedRegularFile(path, writable ? O_RDWR : O_RDONLY,
+                                     "online-state file " + path.filename().string())};
+    if (!opened) return Result<OwnedFileContents>::Err(opened.Error());
+    struct stat status{};
+    if (::fstat(opened.Value().Get(), &status) != 0 || status.st_size < 0 ||
+        static_cast<uint64_t>(status.st_size) > std::numeric_limits<std::size_t>::max()) {
+        return Result<OwnedFileContents>::Err("could not size " + path.string());
+    }
+    std::vector<std::byte> bytes(static_cast<std::size_t>(status.st_size));
+    std::size_t offset{0};
+    while (offset < bytes.size()) {
+        const ssize_t count{::pread(opened.Value().Get(), bytes.data() + offset,
+                                    bytes.size() - offset, static_cast<off_t>(offset))};
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return Result<OwnedFileContents>::Err(ErrnoMessage("read " + path.string()));
+        }
+        if (count == 0) {
+            return Result<OwnedFileContents>::Err("online-state file was truncated while reading: " +
+                                                  path.string());
+        }
+        offset += static_cast<std::size_t>(count);
+    }
+    auto inspected{InspectOwnedRegularFile(opened.Value().Get(), path,
+        "online-state file " + path.filename().string())};
+    if (!inspected) return Result<OwnedFileContents>::Err(inspected.Error());
+    return Result<OwnedFileContents>::Ok(OwnedFileContents{
+        .descriptor = opened.Take(),
+        .bytes = std::move(bytes),
+    });
 }
 
 Result<std::vector<std::byte>> ReadFile(const std::filesystem::path& path)
 {
-    std::error_code size_error;
-    const uint64_t size{std::filesystem::file_size(path, size_error)};
-    if (size_error || size > std::numeric_limits<std::size_t>::max()) {
-        return Result<std::vector<std::byte>>::Err("could not size " + path.string());
-    }
-    std::vector<std::byte> bytes(static_cast<std::size_t>(size));
-    std::ifstream input{path, std::ios::binary};
-    if (!input) return Result<std::vector<std::byte>>::Err("could not open " + path.string());
-    input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    if (!input && !bytes.empty()) return Result<std::vector<std::byte>>::Err("could not read " + path.string());
-    return Result<std::vector<std::byte>>::Ok(std::move(bytes));
+    auto read{ReadOwnedFile(path)};
+    if (!read) return Result<std::vector<std::byte>>::Err(read.Error());
+    return Result<std::vector<std::byte>>::Ok(std::move(read.Value().bytes));
 }
 
 Result<OnlineSuperblock> ReadBestSuperblock(const std::filesystem::path& directory)
@@ -1318,7 +1526,12 @@ Result<OnlineSuperblock> ReadBestSuperblock(const std::filesystem::path& directo
     std::string errors;
     for (const std::string_view name : {"state.0", "state.1"}) {
         const auto path{directory / name};
-        if (!std::filesystem::exists(path)) continue;
+        struct stat state_status{};
+        if (::lstat(path.c_str(), &state_status) != 0) {
+            if (errno == ENOENT) continue;
+            errors += ErrnoMessage("inspect online superblock") + "; ";
+            continue;
+        }
         auto bytes{ReadFile(path)};
         if (!bytes) {
             errors += bytes.Error() + "; ";
@@ -1329,13 +1542,38 @@ Result<OnlineSuperblock> ReadBestSuperblock(const std::filesystem::path& directo
             errors += parsed.Error() + "; ";
             continue;
         }
+        const auto chain_path{parsed.Value().format_version >= ONLINE_FORMAT_VERSION ?
+            ChainHashesPath(directory, parsed.Value().generation) :
+            directory / "chain.hashes"};
+        auto chain_bytes{ReadFile(chain_path)};
+        const uint64_t required_size{parsed.Value().chain_hash_count * Hash256::SIZE};
+        if (!chain_bytes) {
+            errors += chain_bytes.Error() + "; ";
+            continue;
+        }
+        if (chain_bytes.Value().size() % Hash256::SIZE != 0 ||
+            (parsed.Value().format_version >= ONLINE_FORMAT_VERSION ?
+                chain_bytes.Value().size() != required_size :
+                chain_bytes.Value().size() < required_size)) {
+            errors += "state has no complete matching chain-hash snapshot; ";
+            continue;
+        }
+        Hash256::Storage tip_bytes{};
+        const std::size_t tip_offset{static_cast<std::size_t>(
+            (parsed.Value().chain_hash_count - 1) * Hash256::SIZE)};
+        std::copy_n(chain_bytes.Value().begin() + static_cast<std::ptrdiff_t>(tip_offset),
+                    Hash256::SIZE, tip_bytes.begin());
+        if (Hash256{tip_bytes} != parsed.Value().point.block_hash) {
+            errors += "state chain-hash snapshot has the wrong tip; ";
+            continue;
+        }
         if (!best || parsed.Value().generation > best->generation) best = parsed.Take();
     }
     if (!best) return Result<OnlineSuperblock>::Err("no valid online superblock: " + errors);
     return Result<OnlineSuperblock>::Ok(*best);
 }
 
-enum class WalKind : uint32_t { CONNECT = 1, DISCONNECT = 2 };
+enum class WalKind : uint8_t { CONNECT = 1, DISCONNECT = 2 };
 
 struct WalTransaction {
     WalKind kind{WalKind::CONNECT};
@@ -1413,7 +1651,8 @@ Result<WalTransaction> ParseWal(std::span<const std::byte> record)
     uint32_t kind{0};
     WalTransaction transaction;
     uint64_t change_count{0};
-    if (!reader.ReadUnsigned(version) || version != ONLINE_FORMAT_VERSION ||
+    if (!reader.ReadUnsigned(version) ||
+        (version != LEGACY_ONLINE_FORMAT_VERSION && version != ONLINE_FORMAT_VERSION) ||
         !reader.ReadUnsigned(kind) || kind < static_cast<uint32_t>(WalKind::CONNECT) ||
         kind > static_cast<uint32_t>(WalKind::DISCONNECT) ||
         !reader.ReadUnsigned(transaction.lsn) || !reader.ReadUnsigned(transaction.previous.height) ||
@@ -1485,6 +1724,7 @@ public:
     uint64_t CurrentLsn() const { return m_current_lsn; }
     uint64_t WalBytes() const { return m_wal_bytes; }
     uint64_t RedoWalBytes() const { return m_redo_wal_bytes; }
+    uint64_t WalSegmentDirectorySyncs() const { return m_wal_segment_directory_syncs; }
     uint64_t LastTransactionNodes() const { return m_last_transaction_nodes; }
     uint64_t LastTransactionWalBytes() const { return m_last_transaction_wal_bytes; }
     uint64_t LastTransactionSerializeUs() const { return m_last_transaction_serialize_us; }
@@ -1637,11 +1877,6 @@ public:
     Result<void> FlushBase(NodeArena& arena, const std::array<NodeId, 64>& roots,
                            uint64_t num_leaves)
     {
-        auto forest_written{arena.WriteDirtyToBase(m_directory / "forest.hashes",
-                                                    m_directory / "forest.meta")};
-        if (!forest_written) return forest_written;
-        auto chain_written{WriteChainHashes()};
-        if (!chain_written) return chain_written;
         OnlineSuperblock next{
             .generation = m_base.generation + 1,
             .base_lsn = m_current_lsn,
@@ -1653,6 +1888,15 @@ public:
             .chain_hash_count = m_chain_hashes.size(),
             .roots = roots,
         };
+        auto forest_written{arena.WriteDirtyToBase(m_directory / "forest.hashes",
+                                                    m_directory / "forest.meta")};
+        if (!forest_written) return forest_written;
+        // Chain entries can change at existing heights after a reorg, so an
+        // in-place rewrite cannot be made atomic with a separately published
+        // superblock. Write the inactive generation in full and synchronize its
+        // directory entry before publishing the matching superblock.
+        auto chain_written{WriteChainHashes(next.generation)};
+        if (!chain_written) return chain_written;
         auto state_written{WriteSuperblock(m_directory, next)};
         if (!state_written) return state_written;
         arena.ClearDirty();
@@ -1676,10 +1920,29 @@ private:
         std::ostringstream name;
         name << "wal-" << std::setw(20) << std::setfill('0') << start_lsn << ".log";
         const auto path{m_directory / name.str()};
-        m_wal_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-        if (m_wal_fd < 0) return Result<void>::Err(ErrnoMessage("open WAL segment"));
+        auto opened{OpenOwnedRegularFile(path, O_WRONLY | O_CREAT | O_APPEND,
+                                         "forest WAL segment")};
+        if (!opened) return Result<void>::Err(opened.Error());
+        m_wal_fd = opened.Value().Release();
         struct stat status{};
-        if (::fstat(m_wal_fd, &status) != 0) return Result<void>::Err(ErrnoMessage("stat WAL segment"));
+        if (::fstat(m_wal_fd, &status) != 0) {
+            const auto error{ErrnoMessage("stat WAL segment")};
+            ::close(m_wal_fd);
+            m_wal_fd = -1;
+            return Result<void>::Err(error);
+        }
+        // A transaction cannot be published until the segment's directory entry
+        // is durable.  Re-sync empty pre-existing segments as well: one can remain
+        // after a previous directory-sync failure or a crash before the first write.
+        if (status.st_size == 0) {
+            auto directory_synced{SyncDirectory(m_directory)};
+            if (!directory_synced) {
+                ::close(m_wal_fd);
+                m_wal_fd = -1;
+                return directory_synced;
+            }
+            ++m_wal_segment_directory_syncs;
+        }
         m_wal_segment_size = static_cast<uint64_t>(status.st_size);
         return Result<void>::Ok();
     }
@@ -1688,9 +1951,10 @@ private:
                                 std::array<NodeId, 64>& roots, uint64_t& num_leaves,
                                 uint64_t& last_seen_lsn)
     {
-        auto bytes_result{ReadFile(path)};
-        if (!bytes_result) return Result<void>::Err(bytes_result.Error());
-        const auto& bytes{bytes_result.Value()};
+        auto file_result{ReadOwnedFile(path, true)};
+        if (!file_result) return Result<void>::Err(file_result.Error());
+        auto file{file_result.Take()};
+        const auto& bytes{file.bytes};
         std::size_t offset{0};
         std::size_t valid_size{0};
         while (offset < bytes.size()) {
@@ -1742,47 +2006,44 @@ private:
         }
         m_wal_bytes += valid_size;
         if (valid_size != bytes.size()) {
-            const int descriptor{::open(path.c_str(), O_WRONLY | O_CLOEXEC)};
-            if (descriptor < 0) return Result<void>::Err(ErrnoMessage("open incomplete WAL tail"));
-            const int truncate_result{::ftruncate(descriptor, static_cast<off_t>(valid_size))};
-            const int saved_errno{errno};
-            ::close(descriptor);
-            errno = saved_errno;
-            if (truncate_result != 0) return Result<void>::Err(ErrnoMessage("truncate incomplete WAL tail"));
+            auto inspected{InspectOwnedRegularFile(file.descriptor.Get(), path,
+                                                   "forest WAL segment")};
+            if (!inspected) return inspected;
+            if (::ftruncate(file.descriptor.Get(), static_cast<off_t>(valid_size)) != 0) {
+                return Result<void>::Err(ErrnoMessage("truncate incomplete WAL tail"));
+            }
+            auto synced{SyncDescriptor(file.descriptor.Get(), "truncated forest WAL")};
+            if (!synced) return synced;
         }
         return Result<void>::Ok();
     }
 
-    Result<void> WriteChainHashes()
+    Result<void> WriteChainHashes(uint64_t generation)
     {
-        const auto path{m_directory / "chain.hashes"};
-        const int descriptor{::open(path.c_str(), O_RDWR | O_CLOEXEC)};
-        if (descriptor < 0) return Result<void>::Err(ErrnoMessage("open online chain hashes"));
-        struct stat status{};
-        if (::fstat(descriptor, &status) != 0 || status.st_size < 0 ||
-            status.st_size % static_cast<off_t>(Hash256::SIZE) != 0) {
-            ::close(descriptor);
-            return Result<void>::Err("online chain-hash file is invalid");
+        const auto path{ChainHashesPath(m_directory, generation)};
+        const std::filesystem::path temporary{path.string() + ".tmp"};
+        auto opened{CreateFreshTemporaryFile(temporary,
+                                             "online chain-hash temporary file")};
+        if (!opened) return Result<void>::Err(opened.Error());
+        auto written{WriteAll(opened.Value().Get(),
+            std::as_bytes(std::span<const Hash256>{m_chain_hashes}))};
+        if (written) written = SyncDescriptor(opened.Value().Get(), "online chain hashes");
+        if (!written) return written;
+        auto inspected{InspectOwnedRegularFile(opened.Value().Get(), temporary,
+                                               "online chain-hash temporary file")};
+        if (!inspected) return inspected;
+        auto replaceable{ValidateReplaceableOwnedFile(path, "online chain-hash snapshot")};
+        if (!replaceable) return replaceable;
+        std::error_code rename_error;
+        std::filesystem::rename(temporary, path, rename_error);
+        if (rename_error) {
+            return Result<void>::Err(
+                "publish online chain-hash snapshot: " + rename_error.message());
         }
-        uint64_t stored{static_cast<uint64_t>(status.st_size) / Hash256::SIZE};
-        if (stored > m_chain_hashes.size()) stored = m_chain_hashes.size();
-        for (uint64_t i{stored}; i < m_chain_hashes.size(); ++i) {
-            const auto& bytes{m_chain_hashes[static_cast<std::size_t>(i)].Bytes()};
-            auto written{PwriteAll(descriptor, bytes, i * Hash256::SIZE)};
-            if (!written) {
-                const auto error{written.Error()};
-                ::close(descriptor);
-                return Result<void>::Err(error);
-            }
-        }
-        if (::ftruncate(descriptor, static_cast<off_t>(m_chain_hashes.size() * Hash256::SIZE)) != 0) {
-            const auto error{ErrnoMessage("truncate online chain hashes")};
-            ::close(descriptor);
-            return Result<void>::Err(error);
-        }
-        auto synced{SyncDescriptor(descriptor, "online chain hashes")};
-        ::close(descriptor);
-        return synced;
+        inspected = InspectOwnedRegularFile(opened.Value().Get(), path,
+                                            "published online chain-hash snapshot");
+        if (!inspected) return inspected;
+        return SyncDirectory(m_directory);
     }
 
     Result<void> PruneWal()
@@ -1851,6 +2112,7 @@ private:
     uint64_t m_current_lsn{0};
     uint64_t m_wal_bytes{0};
     uint64_t m_redo_wal_bytes{0};
+    uint64_t m_wal_segment_directory_syncs{0};
     int m_wal_fd{-1};
     uint64_t m_wal_segment_size{0};
     uint64_t m_last_transaction_nodes{0};
@@ -1900,7 +2162,7 @@ public:
     {
         uint64_t branches{0};
         for (uint64_t i{0}; i < additions; ++i) {
-            branches += std::countr_one(num_leaves + i);
+            branches += static_cast<uint64_t>(std::countr_one(num_leaves + i));
         }
         // Each deletion frees at most a leaf and one branch.
         arena.PrepareFrees(deletions * 2);
@@ -2358,9 +2620,15 @@ Result<void> PackedForest::EnableOnline(const std::filesystem::path& directory,
                                                    temporary / "forest.meta", capacity)};
     if (!native_written) return native_written;
 
-    const auto chain_path{temporary / "chain.hashes"};
-    const int chain_fd{::open(chain_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600)};
+    const auto chain_path{ChainHashesPath(temporary, 0)};
+    const int chain_fd{::open(chain_path.c_str(), O_WRONLY | O_CREAT | O_EXCL |
+        O_CLOEXEC | NoFollowFlag(), 0600)};
     if (chain_fd < 0) return Result<void>::Err(ErrnoMessage("create online chain hashes"));
+    auto chain_inspected{InspectOwnedRegularFile(chain_fd, chain_path, "online chain hashes")};
+    if (!chain_inspected) {
+        ::close(chain_fd);
+        return chain_inspected;
+    }
     auto chain_written{WriteAll(chain_fd, std::as_bytes(chain_hashes))};
     if (chain_written) chain_written = SyncDescriptor(chain_fd, "online chain hashes");
     const int chain_close{::close(chain_fd)};
@@ -2411,31 +2679,33 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
     auto directory_lock{OnlineStateLock::Acquire(directory, true)};
     if (!directory_lock) return Result<PackedForest>::Err(directory_lock.Error());
     const auto owner_path{directory / ONLINE_OWNER_FILE};
-    std::error_code owner_error;
-    if (std::filesystem::exists(owner_path, owner_error)) {
+    struct stat owner_status{};
+    if (::lstat(owner_path.c_str(), &owner_status) == 0) {
         auto owner{ValidateOnlineOwnerMarker(directory)};
         if (!owner) return Result<PackedForest>::Err(owner.Error());
-    } else if (owner_error) {
-        return Result<PackedForest>::Err(
-            "inspect online-state format marker: " + owner_error.message());
+    } else if (errno != ENOENT) {
+        return Result<PackedForest>::Err(ErrnoMessage(
+            "inspect online-state format marker"));
     }
     auto state{ReadBestSuperblock(directory)};
     if (!state) return Result<PackedForest>::Err(state.Error());
-    const auto chain_path{directory / "chain.hashes"};
-    std::error_code chain_size_error;
-    const uint64_t chain_size{std::filesystem::file_size(chain_path, chain_size_error)};
+    const auto chain_path{state.Value().format_version >= ONLINE_FORMAT_VERSION ?
+        ChainHashesPath(directory, state.Value().generation) :
+        directory / "chain.hashes"};
+    auto chain_bytes{ReadFile(chain_path)};
     const uint64_t required_chain_bytes{state.Value().chain_hash_count * Hash256::SIZE};
-    if (chain_size_error || chain_size < required_chain_bytes || chain_size % Hash256::SIZE != 0) {
+    if (!chain_bytes) return Result<PackedForest>::Err(chain_bytes.Error());
+    if (chain_bytes.Value().size() < required_chain_bytes ||
+        chain_bytes.Value().size() % Hash256::SIZE != 0) {
         return Result<PackedForest>::Err("online chain-hash file is truncated or malformed");
     }
-    std::ifstream chain_input{chain_path, std::ios::binary};
-    if (!chain_input) return Result<PackedForest>::Err("could not open online chain hashes");
     std::vector<Hash256> recovered_chain;
     recovered_chain.reserve(static_cast<std::size_t>(state.Value().chain_hash_count));
     for (uint64_t i{0}; i < state.Value().chain_hash_count; ++i) {
         Hash256::Storage bytes{};
-        chain_input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        if (!chain_input) return Result<PackedForest>::Err("online chain-hash file is truncated");
+        const auto begin{chain_bytes.Value().begin() + static_cast<std::ptrdiff_t>(
+            i * Hash256::SIZE)};
+        std::copy_n(begin, Hash256::SIZE, bytes.begin());
         recovered_chain.emplace_back(bytes);
     }
     if (recovered_chain.empty() || recovered_chain.back() != state.Value().point.block_hash) {
@@ -2450,9 +2720,6 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
                                                 state.Value().capacity_slots,
                                                 state.Value().next)};
     if (!mapped) return Result<PackedForest>::Err(mapped.Error());
-    if (forest.m_impl->arena.LiveCount() != state.Value().live_nodes) {
-        return Result<PackedForest>::Err("online arena live-node count does not match its superblock");
-    }
     auto online{std::make_unique<OnlineStore>(directory, config, state.Value(),
                                                std::move(recovered_chain),
                                                directory_lock.Take())};
@@ -2461,6 +2728,11 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
     if (!recovered) return Result<PackedForest>::Err(recovered.Error());
     auto bookkeeping{forest.m_impl->arena.RebuildBookkeeping()};
     if (!bookkeeping) return Result<PackedForest>::Err(bookkeeping.Error());
+    if (online->CurrentLsn() == state.Value().base_lsn &&
+        forest.m_impl->arena.LiveCount() != state.Value().live_nodes) {
+        return Result<PackedForest>::Err(
+            "online arena live-node count does not match its superblock");
+    }
     auto rebuilt{forest.m_impl->RebuildIndexAndValidate()};
     if (!rebuilt) return Result<PackedForest>::Err(rebuilt.Error());
     chain_hashes = online->ChainHashes();
@@ -2568,6 +2840,7 @@ OnlineForestUsage PackedForest::OnlineUsage() const
         .redo_wal_bytes = m_impl->online->RedoWalBytes(),
         .base_lsn = m_impl->online->BaseLsn(),
         .current_lsn = m_impl->online->CurrentLsn(),
+        .wal_segment_directory_syncs = m_impl->online->WalSegmentDirectorySyncs(),
         .last_transaction_nodes = m_impl->online->LastTransactionNodes(),
         .last_transaction_wal_bytes = m_impl->online->LastTransactionWalBytes(),
         .last_transaction_serialize_us = m_impl->online->LastTransactionSerializeUs(),
@@ -2777,10 +3050,16 @@ Result<PackedForest> ReadForestOnline(std::istream& input,
 
     const auto hashes_path{temporary / "forest.hashes"};
     const auto meta_path{temporary / "forest.meta"};
-    hash_fd = ::open(hashes_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    hash_fd = ::open(hashes_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC |
+        NoFollowFlag(), 0600);
     if (hash_fd < 0) return fail(ErrnoMessage("create forest hashes"));
-    meta_fd = ::open(meta_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    auto hashes_inspected{InspectOwnedRegularFile(hash_fd, hashes_path, "forest hashes")};
+    if (!hashes_inspected) return fail(hashes_inspected.Error());
+    meta_fd = ::open(meta_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC |
+        NoFollowFlag(), 0600);
     if (meta_fd < 0) return fail(ErrnoMessage("create forest metadata"));
+    auto metadata_inspected{InspectOwnedRegularFile(meta_fd, meta_path, "forest metadata")};
+    if (!metadata_inspected) return fail(metadata_inspected.Error());
     if (::ftruncate(hash_fd, static_cast<off_t>(capacity * sizeof(Hash256))) != 0 ||
         ::ftruncate(meta_fd, static_cast<off_t>(capacity * sizeof(DiskMeta))) != 0) {
         return fail(ErrnoMessage("size native forest files"));
@@ -2854,9 +3133,15 @@ Result<PackedForest> ReadForestOnline(std::istream& input,
     }
     meta_fd = -1;
 
-    const auto chain_path{temporary / "chain.hashes"};
-    const int chain_fd{::open(chain_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600)};
+    const auto chain_path{ChainHashesPath(temporary, 0)};
+    const int chain_fd{::open(chain_path.c_str(), O_WRONLY | O_CREAT | O_EXCL |
+        O_CLOEXEC | NoFollowFlag(), 0600)};
     if (chain_fd < 0) return fail(ErrnoMessage("create online chain hashes"));
+    auto chain_inspected{InspectOwnedRegularFile(chain_fd, chain_path, "online chain hashes")};
+    if (!chain_inspected) {
+        ::close(chain_fd);
+        return fail(chain_inspected.Error());
+    }
     auto chain_written{WriteAll(chain_fd, std::as_bytes(chain_hashes))};
     if (chain_written) chain_written = SyncDescriptor(chain_fd, "online chain hashes");
     const int chain_close{::close(chain_fd)};

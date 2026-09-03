@@ -11,7 +11,8 @@ namespace utreexo::position {
 uint8_t TreeRows(uint64_t leaves)
 {
     if (leaves == 0) return 0;
-    return static_cast<uint8_t>(64U - std::countl_zero(leaves - 1));
+    return static_cast<uint8_t>(
+        64U - static_cast<unsigned int>(std::countl_zero(leaves - 1)));
 }
 
 uint8_t DetectRow(uint64_t pos, uint8_t forest_rows)
@@ -55,7 +56,11 @@ Offset DetectOffset(uint64_t pos, uint64_t leaves)
     uint8_t bigger_trees{0};
     uint64_t marker{pos};
 
-    while (((marker << node_row) & ((uint64_t{2} << tree_rows) - 1)) >=
+    // Invalid positions must not drive the unsigned row counter below zero.
+    // Valid forest positions naturally stop before tree_rows reaches node_row.
+    if (node_row > tree_rows) return Offset{0, 0, ~marker};
+    while (tree_rows > node_row &&
+           ((marker << node_row) & ((uint64_t{2} << tree_rows) - 1)) >=
            ((uint64_t{1} << tree_rows) & leaves)) {
         const uint64_t tree_size{(uint64_t{1} << tree_rows) & leaves};
         if (tree_size != 0) {

@@ -24,7 +24,9 @@ struct HttpRpcConfig {
     std::string path{"/"};
     std::string authorization;
     int timeout_seconds{30};
-    std::size_t max_response_bytes{128U * 1024U * 1024U};
+    // Verbosity-3 includes spent prevout scripts; a consensus-valid adversarial
+    // block can expand far beyond its four-megabyte wire weight in JSON.
+    std::size_t max_response_bytes{2ULL * 1024ULL * 1024ULL * 1024ULL};
 };
 
 struct RpcCallMetrics {
@@ -76,7 +78,7 @@ class RpcTransport
 {
 public:
     virtual ~RpcTransport() = default;
-    virtual Result<std::string> Post(std::string body) = 0;
+    virtual Result<std::string> Post(const std::string& body) = 0;
 };
 
 class HttpRpcTransport final : public RpcTransport
@@ -84,7 +86,7 @@ class HttpRpcTransport final : public RpcTransport
 public:
     explicit HttpRpcTransport(HttpRpcConfig config);
     ~HttpRpcTransport() override;
-    Result<std::string> Post(std::string body) override;
+    Result<std::string> Post(const std::string& body) override;
 
 private:
     struct Impl;

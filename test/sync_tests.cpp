@@ -1,4 +1,5 @@
 #include <test_framework.h>
+#include <utreexo/proof_store.h>
 #include <utreexo/sync.h>
 
 #include <array>
@@ -167,6 +168,101 @@ TEST(sequential_sync_captures_proof_before_block_mutation)
     CHECK(spent.Value().metrics.total_us >= spent.Value().metrics.prove_us);
     CHECK(spent.Value().metrics.total_us >= spent.Value().metrics.verify_us);
     CHECK_EQ(spent.Value().metrics.end_to_end_us, spent.Value().metrics.total_us);
+}
+
+TEST(sequential_sync_archives_every_post_genesis_block_and_state)
+{
+    FakeBlockSource source;
+    const Hash256 third_hash{Hash256::FromBitcoinHex(std::string(64, '4')).Value()};
+    source.hashes.push_back(third_hash);
+    source.blocks.push_back(Json(
+        "{\"hash\":\"" + third_hash.ToBitcoinHex() +
+        "\",\"height\":2,\"previousblockhash\":\"" +
+        source.hashes[1].ToBitcoinHex() + "\",\"tx\":["
+        "{\"txid\":\"" + std::string(64, '6') +
+        "\",\"vin\":[{\"coinbase\":\"00\"}],\"vout\":["
+        "{\"n\":0,\"value\":50.0,\"scriptPubKey\":{\"hex\":\"51\"}}]},"
+        "{\"txid\":\"" + std::string(64, '5') +
+        "\",\"vin\":[{\"txid\":\"" + std::string(64, '3') +
+        "\",\"vout\":0,\"prevout\":{\"generated\":true,\"height\":1,"
+        "\"value\":50.0,\"scriptPubKey\":{\"hex\":\"51\"}}}],\"vout\":[]}]}"));
+
+    const auto path{std::filesystem::temp_directory_path() /
+        ("utreexo-sync-genesis-archive-" + std::to_string(::getpid()))};
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(path, cleanup_error);
+    const ChainPoint genesis{0, source.hashes[0]};
+    auto opened{ProofStore::Open(ProofStoreConfig{
+        .directory = path,
+        .create_base = genesis,
+        .create_base_state = AccumulatorState{
+            .point = genesis,
+            .num_leaves = 0,
+            .roots = {},
+        },
+        .serializer_threads = 2,
+        .group_commit_blocks = 2,
+        .group_commit_delay_ms = 0,
+        .max_queued_blocks = 8,
+        .max_queued_bytes = 1024 * 1024,
+        .max_record_bytes = 1024 * 1024,
+    })};
+    CHECK(opened);
+    auto store{opened.Take()};
+
+    PackedForest forest;
+    SequentialSync sync{source, forest};
+    sync.SetProofGenerationPolicy([](const BlockDelta& delta) {
+        return Result<bool>::Ok(delta.point.height != 0);
+    });
+    for (uint32_t height{0}; height <= 2; ++height) {
+        auto block{sync.ProcessNext()};
+        CHECK(block);
+        if (height == 0) {
+            CHECK(!block.Value().proof);
+            continue;
+        }
+        CHECK_EQ(block.Value().delta.additions.size(), 1U);
+        CHECK(block.Value().proof);
+        AccumulatorState state{
+            .point = block.Value().delta.point,
+            .num_leaves = forest.NumLeaves(),
+            .roots = {},
+        };
+        for (const auto& root : forest.Roots()) {
+            CHECK(root.has_value());
+            state.roots.push_back(*root);
+        }
+        CHECK(store->Enqueue(block.Value().delta, std::move(*block.Value().proof),
+                             std::move(state)));
+    }
+    CHECK(store->Drain());
+    CHECK(store->Coverage().full_history);
+    CHECK_EQ(store->StateAt(0).Value()->num_leaves, 0U);
+    CHECK_EQ(store->StateAt(1).Value()->num_leaves, 1U);
+    CHECK(store->Read(source.hashes[1]).Value());
+    CHECK(store->Read(source.hashes[2]).Value());
+    auto scrubbed{store->Scrub()};
+    CHECK(scrubbed);
+    CHECK_EQ(scrubbed.Value().proofs_verified, 2U);
+    CHECK_EQ(scrubbed.Value().states_verified, 3U);
+    store.reset();
+
+    auto reopened{ProofStore::Open(ProofStoreConfig{
+        .directory = path,
+        .create_base = std::nullopt,
+        .create_base_state = std::nullopt,
+        .serializer_threads = 1,
+        .group_commit_blocks = 2,
+        .group_commit_delay_ms = 0,
+        .max_queued_blocks = 8,
+        .max_queued_bytes = 1024 * 1024,
+        .max_record_bytes = 1024 * 1024,
+    })};
+    CHECK(reopened);
+    CHECK(reopened.Value()->Coverage().full_history);
+    CHECK_EQ(reopened.Value()->DurablePoint().height, 2U);
+    std::filesystem::remove_all(path, cleanup_error);
 }
 
 TEST(sequential_sync_proof_policy_runs_before_forest_mutation)

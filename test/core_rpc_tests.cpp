@@ -20,6 +20,12 @@
 using namespace utreexo;
 
 namespace {
+#ifdef MSG_NOSIGNAL
+constexpr int SEND_FLAGS{MSG_NOSIGNAL};
+#else
+constexpr int SEND_FLAGS{0};
+#endif
+
 UniValue Json(std::string_view text)
 {
     UniValue value;
@@ -56,9 +62,9 @@ class FakeTransport final : public RpcTransport
 {
 public:
     explicit FakeTransport(std::string response) : m_response{std::move(response)} {}
-    Result<std::string> Post(std::string body) override
+    Result<std::string> Post(const std::string& body) override
     {
-        request = std::move(body);
+        request = body;
         return Result<std::string>::Ok(m_response);
     }
     std::string request;
@@ -70,20 +76,35 @@ private:
 class FlakyTransport final : public RpcTransport
 {
 public:
-    Result<std::string> Post(std::string) override
+    explicit FlakyTransport(
+        std::string error = "reading RPC response failed: Resource temporarily unavailable")
+        : m_error{std::move(error)}
+    {
+    }
+
+    Result<std::string> Post(const std::string&) override
     {
         ++calls;
-        if (calls == 1) return Result<std::string>::Err("reading RPC response failed: Resource temporarily unavailable");
+        if (calls == 1) return Result<std::string>::Err(m_error);
         return Result<std::string>::Ok("{\"result\":7,\"error\":null,\"id\":1}");
     }
     uint32_t calls{0};
+
+private:
+    std::string m_error;
 };
 
 bool SendAll(int socket, std::string_view data)
 {
+#ifdef SO_NOSIGPIPE
+    const int enabled{1};
+    if (::setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
+        return false;
+    }
+#endif
     std::size_t sent{0};
     while (sent < data.size()) {
-        const ssize_t result{::send(socket, data.data() + sent, data.size() - sent, MSG_NOSIGNAL)};
+        const ssize_t result{::send(socket, data.data() + sent, data.size() - sent, SEND_FLAGS)};
         if (result <= 0) return false;
         sent += static_cast<std::size_t>(result);
     }
@@ -173,9 +194,59 @@ TEST(rpc_client_retries_transient_transport_failure)
     CHECK_EQ(client.AggregateMetrics().retries, 1U);
 }
 
+TEST(rpc_client_retries_temporary_address_lookup_failure)
+{
+    auto transport{std::make_unique<FlakyTransport>(
+        "RPC address lookup failed: Temporary failure in name resolution")};
+    FlakyTransport* observed{transport.get()};
+    CoreRpcClient client{std::move(transport), 1};
+    const auto result{client.Call("getblockcount")};
+    CHECK(result);
+    CHECK_EQ(observed->calls, 2U);
+    CHECK_EQ(client.LastCallMetrics().attempts, 2U);
+    CHECK_EQ(client.LastCallMetrics().retries, 1U);
+}
+
+TEST(rpc_client_retries_initial_http_connect_refusal)
+{
+    const int unavailable{::socket(AF_INET, SOCK_STREAM, 0)};
+    if (unavailable < 0 && (errno == EPERM || errno == EACCES)) return;
+    if (unavailable < 0) throw std::runtime_error{"could not create loopback test socket"};
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (::bind(unavailable, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0) {
+        ::close(unavailable);
+        throw std::runtime_error{"could not bind loopback test socket"};
+    }
+    socklen_t address_size{sizeof(address)};
+    if (::getsockname(unavailable, reinterpret_cast<sockaddr*>(&address), &address_size) != 0) {
+        ::close(unavailable);
+        throw std::runtime_error{"could not inspect loopback test socket"};
+    }
+
+    HttpRpcConfig config{
+        .host = "127.0.0.1",
+        .port = ntohs(address.sin_port),
+        .path = "/",
+        .authorization = "user:password",
+        .timeout_seconds = 1,
+        .max_response_bytes = 1024 * 1024,
+    };
+    CoreRpcClient client{std::make_unique<HttpRpcTransport>(std::move(config)), 1};
+    const auto result{client.Call("getblockcount")};
+    ::close(unavailable);
+
+    CHECK(!result);
+    CHECK(result.Error().find("could not connect to Bitcoin Core RPC") != std::string::npos);
+    CHECK_EQ(client.LastCallMetrics().attempts, 2U);
+    CHECK_EQ(client.LastCallMetrics().retries, 1U);
+}
+
 TEST(rpc_client_reuses_persistent_http_connection)
 {
-    const int listener{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
+    const int listener{::socket(AF_INET, SOCK_STREAM, 0)};
     if (listener < 0 && (errno == EPERM || errno == EACCES)) return;
     if (listener < 0) throw std::runtime_error{"could not create loopback test socket"};
     sockaddr_in address{};
@@ -196,7 +267,7 @@ TEST(rpc_client_reuses_persistent_http_connection)
     std::atomic<bool> server_ok{true};
     std::string first_request;
     std::thread server{[&] {
-        const int connection{::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC)};
+        const int connection{::accept(listener, nullptr, nullptr)};
         if (connection < 0) {
             server_ok = false;
             return;

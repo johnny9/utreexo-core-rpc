@@ -65,6 +65,7 @@ struct OnlineForestUsage {
     uint64_t redo_wal_bytes{0};
     uint64_t base_lsn{0};
     uint64_t current_lsn{0};
+    uint64_t wal_segment_directory_syncs{0};
     uint64_t last_transaction_nodes{0};
     uint64_t last_transaction_wal_bytes{0};
     uint64_t last_transaction_serialize_us{0};

@@ -228,7 +228,7 @@ private:
     std::size_t m_position{0};
 };
 
-enum class Projection {
+enum class Projection : uint8_t {
     BLOCK,
     TRANSACTION,
     INPUT,
@@ -238,7 +238,7 @@ enum class Projection {
 };
 
 struct FieldProjection {
-    enum class Kind { SCALAR, OBJECT, ARRAY } kind{Kind::SCALAR};
+    enum class Kind : uint8_t { SCALAR, OBJECT, ARRAY } kind{Kind::SCALAR};
     Projection child{Projection::BLOCK};
 };
 

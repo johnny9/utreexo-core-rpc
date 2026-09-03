@@ -94,6 +94,7 @@ TEST(rustreexo_all_insertion_vectors)
     };
     for (const auto& test_case : cases) {
         std::vector<Hash256> leaves;
+        leaves.reserve(test_case.preimages.size());
         for (const uint8_t value : test_case.preimages) leaves.push_back(HashByte(value));
         PackedForest forest;
         CHECK(forest.Modify(leaves, {}));

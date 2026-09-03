@@ -76,6 +76,112 @@ TEST(checkpoint_roundtrip)
     std::filesystem::remove(path);
 }
 
+TEST(checkpoint_save_rejects_symbolic_link_temporary_file)
+{
+    const std::string suffix{std::to_string(::getpid())};
+    const auto path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-symlink-" + suffix + ".dat")};
+    const auto temporary{std::filesystem::path{path.string() + ".tmp"}};
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    std::filesystem::remove(temporary, error);
+
+    PackedForest forest;
+    const ChainPoint point{0, Hash256{}};
+    const std::array<Hash256, 1> chain{point.block_hash};
+    CHECK(SaveCheckpoint(path, point, forest, chain));
+    std::filesystem::create_symlink(path, temporary);
+    const auto saved{SaveCheckpoint(path, point, forest, chain)};
+    CHECK(!saved);
+    CHECK(saved.Error().find("symbolic link") != std::string::npos);
+    CHECK(LoadCheckpoint(path));
+
+    std::filesystem::remove(temporary, error);
+    std::filesystem::remove(path, error);
+}
+
+TEST(checkpoint_save_rejects_hard_link_temporary_alias)
+{
+    const std::string suffix{std::to_string(::getpid())};
+    const auto path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-hardlink-" + suffix + ".dat")};
+    const auto temporary{std::filesystem::path{path.string() + ".tmp"}};
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    std::filesystem::remove(temporary, error);
+
+    PackedForest forest;
+    const ChainPoint point{0, Hash256{}};
+    const std::array<Hash256, 1> chain{point.block_hash};
+    CHECK(SaveCheckpoint(path, point, forest, chain));
+    std::filesystem::create_hard_link(path, temporary);
+    const auto saved{SaveCheckpoint(path, point, forest, chain)};
+    CHECK(!saved);
+    CHECK(saved.Error().find("alias the destination") != std::string::npos);
+    CHECK(LoadCheckpoint(path));
+
+    std::filesystem::remove(temporary, error);
+    std::filesystem::remove(path, error);
+}
+
+TEST(checkpoint_save_rejects_external_hard_link_temporary_without_clobbering)
+{
+    const std::string suffix{std::to_string(::getpid())};
+    const auto path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-external-hardlink-" + suffix + ".dat")};
+    const auto temporary{std::filesystem::path{path.string() + ".tmp"}};
+    const auto sentinel{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-external-sentinel-" + suffix + ".dat")};
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    std::filesystem::remove(temporary, error);
+    std::filesystem::remove(sentinel, error);
+    {
+        std::ofstream output{sentinel, std::ios::binary};
+        output << "external checkpoint sentinel\n";
+    }
+    std::filesystem::create_hard_link(sentinel, temporary);
+
+    PackedForest forest;
+    const ChainPoint point{0, Hash256{}};
+    const std::array<Hash256, 1> chain{point.block_hash};
+    const auto saved{SaveCheckpoint(path, point, forest, chain)};
+    CHECK(!saved);
+    CHECK(saved.Error().find("hard-linked") != std::string::npos);
+    std::ifstream input{sentinel, std::ios::binary};
+    const std::string content{std::istreambuf_iterator<char>{input},
+                              std::istreambuf_iterator<char>{}};
+    CHECK_EQ(content, std::string{"external checkpoint sentinel\n"});
+    CHECK(!std::filesystem::exists(path));
+
+    std::filesystem::remove(temporary, error);
+    std::filesystem::remove(sentinel, error);
+}
+
+TEST(checkpoint_save_reclaims_unaliased_stale_temporary_file)
+{
+    const std::string suffix{std::to_string(::getpid())};
+    const auto path{std::filesystem::temp_directory_path() /
+        ("utreexo-checkpoint-stale-file-" + suffix + ".dat")};
+    const auto temporary{std::filesystem::path{path.string() + ".tmp"}};
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    std::filesystem::remove(temporary, error);
+    {
+        std::ofstream output{temporary, std::ios::binary};
+        output << "abandoned partial checkpoint\n";
+    }
+
+    PackedForest forest;
+    const ChainPoint point{0, Hash256{}};
+    const std::array<Hash256, 1> chain{point.block_hash};
+    CHECK(SaveCheckpoint(path, point, forest, chain));
+    CHECK(LoadCheckpoint(path));
+    CHECK(!std::filesystem::exists(temporary));
+
+    std::filesystem::remove(path, error);
+}
+
 TEST(checkpoint_streams_directly_to_online_state)
 {
     const auto checkpoint_path{

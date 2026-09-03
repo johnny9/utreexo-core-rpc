@@ -12,11 +12,13 @@
 #include <chrono>
 #include <cctype>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <map>
 #include <netdb.h>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <string_view>
@@ -78,6 +80,39 @@ private:
     addrinfo* m_value;
 };
 
+bool SetCloseOnExec(int descriptor)
+{
+    int flags{-1};
+    do {
+        flags = ::fcntl(descriptor, F_GETFD);
+    } while (flags < 0 && errno == EINTR);
+    if (flags < 0) return false;
+    int result{-1};
+    do {
+        result = ::fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC);
+    } while (result < 0 && errno == EINTR);
+    return result == 0;
+}
+
+bool ConfigureSocket(int descriptor)
+{
+    if (!SetCloseOnExec(descriptor)) return false;
+#ifdef SO_NOSIGPIPE
+    const int enabled{1};
+    if (::setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+                     sizeof(enabled)) != 0) {
+        return false;
+    }
+#endif
+    return true;
+}
+
+#ifdef MSG_NOSIGNAL
+constexpr int SEND_FLAGS{MSG_NOSIGNAL};
+#else
+constexpr int SEND_FLAGS{0};
+#endif
+
 std::string Base64Encode(std::string_view input)
 {
     constexpr std::string_view alphabet{"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"};
@@ -110,9 +145,11 @@ bool IsRetryableTransportError(std::string_view error)
     const std::string lower{Lower(error)};
     return lower.find("resource temporarily unavailable") != std::string::npos ||
            lower.find("temporarily unavailable") != std::string::npos ||
+           lower.find("temporary failure") != std::string::npos ||
            lower.find("timed out") != std::string::npos ||
            lower.find("connection reset") != std::string::npos ||
            lower.find("connection refused") != std::string::npos ||
+           lower.find("could not connect to bitcoin core rpc") != std::string::npos ||
            lower.find("closed a framed rpc response early") != std::string::npos;
 }
 
@@ -373,13 +410,28 @@ struct HttpRpcTransport::Impl {
         const std::string port{std::to_string(config.port)};
         const int lookup{::getaddrinfo(config.host.c_str(), port.c_str(), &hints, &raw_addresses)};
         if (lookup != 0) {
-            return Result<void>::Err("RPC address lookup failed: " + std::string{gai_strerror(lookup)});
+            const int lookup_errno{errno};
+            std::string error{"RPC address lookup failed"};
+            if (lookup == EAI_AGAIN) error += " (temporarily unavailable)";
+            error += ": " + std::string{gai_strerror(lookup)};
+            if (lookup == EAI_SYSTEM && lookup_errno != 0) {
+                error += ": " + std::string{std::strerror(lookup_errno)};
+            }
+            return Result<void>::Err(std::move(error));
         }
         AddressInfo addresses{raw_addresses};
+        int last_connect_errno{0};
         for (addrinfo* address{addresses.Get()}; address; address = address->ai_next) {
             FileDescriptor candidate{::socket(
-                address->ai_family, address->ai_socktype | SOCK_CLOEXEC, address->ai_protocol)};
-            if (!candidate) continue;
+                address->ai_family, address->ai_socktype, address->ai_protocol)};
+            if (!candidate) {
+                last_connect_errno = errno;
+                continue;
+            }
+            if (!ConfigureSocket(candidate.Get())) {
+                last_connect_errno = errno;
+                continue;
+            }
             const timeval timeout{config.timeout_seconds, 0};
             static_cast<void>(::setsockopt(
                 candidate.Get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
@@ -389,8 +441,13 @@ struct HttpRpcTransport::Impl {
                 socket = std::move(candidate);
                 return Result<void>::Ok();
             }
+            last_connect_errno = errno;
         }
-        return Result<void>::Err("could not connect to Bitcoin Core RPC");
+        std::string error{"could not connect to Bitcoin Core RPC"};
+        if (last_connect_errno != 0) {
+            error += ": " + std::string{std::strerror(last_connect_errno)};
+        }
+        return Result<void>::Err(std::move(error));
     }
 
     Result<std::string> ReadResponse()
@@ -463,7 +520,7 @@ struct HttpRpcTransport::Impl {
         }
     }
 
-    Result<std::string> Post(std::string body)
+    Result<std::string> Post(const std::string& body)
     {
         std::ostringstream request;
         request << "POST " << config.path << " HTTP/1.1\r\n"
@@ -483,7 +540,7 @@ struct HttpRpcTransport::Impl {
             std::size_t sent{0};
             while (sent < wire.size()) {
                 const ssize_t result{::send(
-                    socket.Get(), wire.data() + sent, wire.size() - sent, MSG_NOSIGNAL)};
+                    socket.Get(), wire.data() + sent, wire.size() - sent, SEND_FLAGS)};
                 if (result < 0 && errno == EINTR) continue;
                 if (result <= 0) {
                     const std::string error{
@@ -525,7 +582,7 @@ HttpRpcTransport::HttpRpcTransport(HttpRpcConfig config)
 
 HttpRpcTransport::~HttpRpcTransport() = default;
 
-Result<std::string> HttpRpcTransport::Post(std::string body) { return m_impl->Post(std::move(body)); }
+Result<std::string> HttpRpcTransport::Post(const std::string& body) { return m_impl->Post(body); }
 
 CoreRpcClient::CoreRpcClient(std::unique_ptr<RpcTransport> transport, uint32_t max_retries)
     : m_transport{std::move(transport)}, m_max_retries{max_retries}
@@ -643,6 +700,8 @@ Result<uint32_t> CoreRpcBlockSource::TipHeight()
     if (!result) return Result<uint32_t>::Err(result.Error());
     try {
         return Result<uint32_t>::Ok(result.Value().getInt<uint32_t>());
+    } catch (const std::bad_alloc&) {
+        throw;
     } catch (const std::exception& error) {
         return Result<uint32_t>::Err("invalid getblockcount result: " + std::string{error.what()});
     }
@@ -823,6 +882,8 @@ Result<BlockDelta> ParseVerboseBlock(const UniValue& block,
         delta.additions.reserve(additions.size());
         for (auto& hash : additions) if (hash) delta.additions.push_back(*hash);
         return Result<BlockDelta>::Ok(std::move(delta));
+    } catch (const std::bad_alloc&) {
+        throw;
     } catch (const std::exception& error) {
         return Result<BlockDelta>::Err("invalid getblock verbosity-3 response: " + std::string{error.what()});
     }

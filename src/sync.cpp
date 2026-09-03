@@ -278,13 +278,25 @@ Result<ProcessedBlock> SequentialSync::ProcessNext()
         metrics.verify_us = micros(verify_start);
     }
 
-    const auto modify_start{Clock::now()};
-    const auto modified{m_forest.ModifyBlock(delta.Value().additions,
-                                             delta.Value().deletions,
-                                             delta.Value().point)};
-    if (!modified) return Result<ProcessedBlock>::Err("could not apply block transition: " + modified.Error());
-    metrics.modify_us = micros(modify_start);
+    // Grow the external chain index before mutating the forest. A failed vector
+    // allocation must never leave a RAM forest one block ahead of its checkpoint
+    // point; pop_back is non-allocating if the forest transition is rejected.
     m_chain_hashes.push_back(fetched.Value().hash);
+    const auto modify_start{Clock::now()};
+    try {
+        const auto modified{m_forest.ModifyBlock(delta.Value().additions,
+                                                 delta.Value().deletions,
+                                                 delta.Value().point)};
+        if (!modified) {
+            m_chain_hashes.pop_back();
+            return Result<ProcessedBlock>::Err(
+                "could not apply block transition: " + modified.Error());
+        }
+    } catch (...) {
+        m_chain_hashes.pop_back();
+        throw;
+    }
+    metrics.modify_us = micros(modify_start);
     metrics.total_us = micros(total_start);
     metrics.end_to_end_us = metrics.total_us;
     return Result<ProcessedBlock>::Ok(ProcessedBlock{delta.Take(), metrics, std::move(proof)});

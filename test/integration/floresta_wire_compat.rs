@@ -1,8 +1,11 @@
 use bitcoin::BlockHash;
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hashes::Hash;
+use bitcoin::p2p::message_filter::CFilter;
 use floresta_chain::ScriptPubKeyKind;
 use floresta_wire::block_proof::{Bitmap, GetUtreexoProof, UtreexoProof, UtreexoProofMask};
+use floresta_wire::rustreexo::node_hash::BitcoinNodeHash;
+use floresta_wire::rustreexo::stump::Stump;
 
 fn decode_hex(value: &str) -> Vec<u8> {
     assert_eq!(value.len() % 2, 0);
@@ -55,4 +58,31 @@ fn sidecar_parser_vector_matches_current_floresta_getuproof() {
         serialize(&request),
         decode_hex(&format!("{}070000", "11".repeat(32)))
     );
+}
+
+#[test]
+fn current_floresta_decodes_sidecar_utreexo_state_cfilter() {
+    let block_hash: Vec<u8> = (0_u8..32).collect();
+    let payload = decode_hex(&format!(
+        "01{}480300000000000000{}{}",
+        block_hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "aa".repeat(32),
+        "bb".repeat(32),
+    ));
+    let cfilter: CFilter = deserialize(&payload).unwrap();
+    assert_eq!(cfilter.filter_type, 1);
+    assert_eq!(cfilter.block_hash.to_byte_array().as_slice(), block_hash);
+    assert_eq!(cfilter.filter.len(), 8 + 2 * 32);
+
+    // This is the type-1 state representation consumed by Floresta's
+    // ChainSelector: leaves followed by occupied roots in high-to-low order.
+    let leaves = u64::from_le_bytes(cfilter.filter[..8].try_into().unwrap());
+    let roots = cfilter.filter[8..]
+        .chunks_exact(32)
+        .map(BitcoinNodeHash::from)
+        .collect::<Vec<_>>();
+    let state = Stump { leaves, roots };
+    assert_eq!(state.leaves, 3);
+    assert_eq!(&*state.roots[0], &[0xaa; 32]);
+    assert_eq!(&*state.roots[1], &[0xbb; 32]);
 }

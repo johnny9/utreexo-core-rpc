@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -45,14 +46,21 @@ constexpr std::array<std::byte, 8> WAL_MAGIC{
 constexpr std::array<std::byte, 8> WAL_COMMIT{
     std::byte{'U'}, std::byte{'P'}, std::byte{'R'}, std::byte{'F'},
     std::byte{'C'}, std::byte{'M'}, std::byte{'T'}, std::byte{'1'}};
+constexpr std::string_view OWNER_FILE{"FORMAT"};
+constexpr std::string_view OWNER_CONTENT{"utreexo-proof-store-v1\n"};
 constexpr uint32_t STORE_FORMAT{ProofStore::FORMAT_VERSION};
+constexpr uint32_t LEGACY_STORE_FORMAT{1};
 constexpr std::size_t DATA_HEADER_SIZE{88};
+constexpr std::size_t STATE_PREFIX_SIZE{16};
+constexpr std::size_t MAX_STATE_BODY_SIZE{STATE_PREFIX_SIZE + 64 * Hash256::SIZE};
+constexpr std::size_t STATE_DIGEST_SIZE{Hash256::SIZE};
+constexpr std::size_t MAX_STATE_SIZE{MAX_STATE_BODY_SIZE + STATE_DIGEST_SIZE};
 constexpr std::size_t DATA_FOOTER_SIZE{Hash256::SIZE + DATA_COMMIT.size()};
 constexpr std::size_t WAL_PREFIX_SIZE{136};
 constexpr std::size_t WAL_RECORD_SIZE{WAL_PREFIX_SIZE + Hash256::SIZE + WAL_COMMIT.size()};
 constexpr uint64_t INDEX_GROWTH_ENTRIES{4'096};
 
-enum class WalKind : uint32_t { BASE = 1, CONNECT = 2, TRUNCATE = 3 };
+enum class WalKind : uint8_t { BASE = 1, CONNECT = 2, TRUNCATE = 3 };
 
 std::string ErrnoMessage(std::string_view action)
 {
@@ -184,7 +192,202 @@ uint64_t FileSize(int descriptor, bool& ok)
     return ok ? static_cast<uint64_t>(status.st_size) : 0;
 }
 
+struct OwnedFileIdentity {
+    dev_t device{};
+    ino_t inode{};
+};
+
+Result<OwnedFileIdentity> InspectOwnedFile(int descriptor,
+                                          const std::filesystem::path& path,
+                                          std::string_view description)
+{
+    struct stat descriptor_status{};
+    if (::fstat(descriptor, &descriptor_status) != 0) {
+        return Result<OwnedFileIdentity>::Err(
+            ErrnoMessage(std::string{"stat "} + std::string{description}));
+    }
+    if (!S_ISREG(descriptor_status.st_mode)) {
+        return Result<OwnedFileIdentity>::Err(
+            std::string{description} + " must be a regular file");
+    }
+
+    // Verify that the directory entry still names the object we opened.
+    // O_NOFOLLOW closes the normal symlink case where the platform provides it;
+    // this check provides the same fail-closed property where it is absent and
+    // also detects a concurrent final-component replacement.
+    struct stat path_status{};
+    if (::lstat(path.c_str(), &path_status) != 0) {
+        return Result<OwnedFileIdentity>::Err(
+            ErrnoMessage(std::string{"inspect "} + std::string{description}));
+    }
+    if (!S_ISREG(path_status.st_mode) ||
+        path_status.st_dev != descriptor_status.st_dev ||
+        path_status.st_ino != descriptor_status.st_ino) {
+        return Result<OwnedFileIdentity>::Err(
+            std::string{description} +
+            " must be an unaliased regular file in the proof-store directory");
+    }
+    if (descriptor_status.st_nlink != 1) {
+        return Result<OwnedFileIdentity>::Err(
+            std::string{description} +
+            " must not be hard-linked outside its proof-store path");
+    }
+    return Result<OwnedFileIdentity>::Ok(OwnedFileIdentity{
+        .device = descriptor_status.st_dev,
+        .inode = descriptor_status.st_ino,
+    });
+}
+
+bool SameFile(const OwnedFileIdentity& first, const OwnedFileIdentity& second)
+{
+    return first.device == second.device && first.inode == second.inode;
+}
+
+int OwnedFileOpenFlags(bool create)
+{
+    int flags{O_RDWR | O_CLOEXEC};
+    if (create) flags |= O_CREAT;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    return flags;
+}
+
+Result<bool> OwnerMarkerExists(const std::filesystem::path& directory)
+{
+    struct stat status{};
+    if (::lstat((directory / OWNER_FILE).c_str(), &status) == 0) {
+        return Result<bool>::Ok(true);
+    }
+    if (errno == ENOENT) return Result<bool>::Ok(false);
+    return Result<bool>::Err(ErrnoMessage("inspect proof-store format marker"));
+}
+
+Result<void> ValidateOwnerMarker(const std::filesystem::path& directory)
+{
+    const auto path{directory / OWNER_FILE};
+    // Re-establish the marker's durability barrier on every open. This also
+    // makes a retry safe when a prior creation wrote a complete marker but its
+    // fdatasync or containing-directory fsync reported failure.
+    int flags{O_RDWR | O_CLOEXEC};
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    const int descriptor{::open(path.c_str(), flags)};
+    if (descriptor < 0) {
+        return Result<void>::Err(ErrnoMessage("open proof-store format marker"));
+    }
+    auto identity{InspectOwnedFile(descriptor, path, "proof-store format marker")};
+    if (!identity) {
+        ::close(descriptor);
+        return Result<void>::Err(identity.Error());
+    }
+    bool size_ok{false};
+    const uint64_t size{FileSize(descriptor, size_ok)};
+    if (!size_ok) {
+        const auto error{ErrnoMessage("stat proof-store format marker")};
+        ::close(descriptor);
+        return Result<void>::Err(error);
+    }
+    if (size != OWNER_CONTENT.size()) {
+        ::close(descriptor);
+        return Result<void>::Err("proof-store format marker has an unrecognized size");
+    }
+    std::array<std::byte, OWNER_CONTENT.size()> content{};
+    auto read{PreadExact(descriptor, content, 0)};
+    if (!read) {
+        ::close(descriptor);
+        return read;
+    }
+    if (!std::equal(content.begin(), content.end(),
+                    reinterpret_cast<const std::byte*>(OWNER_CONTENT.data()))) {
+        ::close(descriptor);
+        return Result<void>::Err("proof-store format marker is unrecognized");
+    }
+    auto synced{SyncFile(descriptor, "proof-store format marker")};
+    if (synced) {
+        auto final_identity{
+            InspectOwnedFile(descriptor, path, "proof-store format marker")};
+        if (!final_identity) synced = Result<void>::Err(final_identity.Error());
+    }
+    const int close_result{::close(descriptor)};
+    if (!synced) return synced;
+    if (close_result != 0) {
+        return Result<void>::Err(ErrnoMessage("close proof-store format marker"));
+    }
+    return Result<void>::Ok();
+}
+
+Result<void> CreateOwnerMarker(const std::filesystem::path& directory)
+{
+    const auto path{directory / OWNER_FILE};
+    int flags{O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC};
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    const int descriptor{::open(path.c_str(), flags, 0600)};
+    if (descriptor < 0) {
+        return Result<void>::Err(ErrnoMessage("create proof-store format marker"));
+    }
+    auto identity{InspectOwnedFile(descriptor, path, "proof-store format marker")};
+    Result<void> result{identity ? Result<void>::Ok() :
+                                  Result<void>::Err(identity.Error())};
+    if (result) {
+        result = PwriteAll(descriptor,
+            std::as_bytes(std::span<const char>{OWNER_CONTENT.data(), OWNER_CONTENT.size()}), 0);
+    }
+    if (result) result = SyncFile(descriptor, "proof-store format marker");
+    if (result) {
+        auto final_identity{InspectOwnedFile(descriptor, path, "proof-store format marker")};
+        if (!final_identity) result = Result<void>::Err(final_identity.Error());
+    }
+    const int close_result{::close(descriptor)};
+    if (!result) return result;
+    if (close_result != 0) {
+        return Result<void>::Err(ErrnoMessage("close proof-store format marker"));
+    }
+    return SyncDirectory(directory);
+}
+
+struct MarkerlessLayout {
+    bool empty{true};
+    bool has_index{false};
+};
+
+Result<MarkerlessLayout> InspectMarkerlessLayout(const std::filesystem::path& directory)
+{
+    MarkerlessLayout layout;
+    bool has_data{false};
+    bool has_wal{false};
+    std::error_code error;
+    std::filesystem::directory_iterator entries{directory, error};
+    if (error) {
+        return Result<MarkerlessLayout>::Err(
+            "inspect markerless proof-store directory: " + error.message());
+    }
+    for (const auto& entry : entries) {
+        layout.empty = false;
+        const auto name{entry.path().filename().string()};
+        if (name == "proofs.dat") {
+            has_data = true;
+        } else if (name == "index.wal") {
+            has_wal = true;
+        } else if (name == "height.index") {
+            layout.has_index = true;
+        } else {
+            return Result<MarkerlessLayout>::Err(
+                "markerless proof-store directory contains unrelated entry: " + name);
+        }
+    }
+    if (!layout.empty && (!has_data || !has_wal)) {
+        return Result<MarkerlessLayout>::Err(
+            "markerless proof-store directory is incomplete");
+    }
+    return Result<MarkerlessLayout>::Ok(layout);
+}
+
 struct WalEvent {
+    uint32_t format_version{STORE_FORMAT};
     WalKind kind{WalKind::BASE};
     ChainPoint point;
     Hash256 previous_hash;
@@ -198,7 +401,7 @@ std::vector<std::byte> SerializeWal(const WalEvent& event)
     std::vector<std::byte> bytes;
     bytes.reserve(WAL_RECORD_SIZE);
     bytes.insert(bytes.end(), WAL_MAGIC.begin(), WAL_MAGIC.end());
-    AppendLE(bytes, STORE_FORMAT);
+    AppendLE(bytes, event.format_version);
     AppendLE(bytes, static_cast<uint32_t>(event.kind));
     AppendLE(bytes, event.point.height);
     AppendLE(bytes, uint32_t{0});
@@ -233,7 +436,7 @@ Result<WalEvent> ParseWal(std::span<const std::byte> bytes)
     uint32_t reserved{0};
     WalEvent event;
     if (!reader.ReadBytes(magic) || magic != WAL_MAGIC || !reader.ReadLE(version) ||
-        version != STORE_FORMAT || !reader.ReadLE(kind) ||
+        version < LEGACY_STORE_FORMAT || version > STORE_FORMAT || !reader.ReadLE(kind) ||
         kind < static_cast<uint32_t>(WalKind::BASE) ||
         kind > static_cast<uint32_t>(WalKind::TRUNCATE) ||
         !reader.ReadLE(event.point.height) || !reader.ReadLE(reserved) || reserved != 0 ||
@@ -243,7 +446,100 @@ Result<WalEvent> ParseWal(std::span<const std::byte> bytes)
         return Result<WalEvent>::Err("invalid proof WAL fields");
     }
     event.kind = static_cast<WalKind>(kind);
-    return Result<WalEvent>::Ok(std::move(event));
+    event.format_version = version;
+    return Result<WalEvent>::Ok(event);
+}
+
+Result<void> ValidateAccumulatorState(const AccumulatorState& state)
+{
+    if (state.roots.size() != static_cast<std::size_t>(std::popcount(state.num_leaves))) {
+        return Result<void>::Err(
+            "accumulator state root count does not match the number of occupied rows");
+    }
+    return Result<void>::Ok();
+}
+
+void AppendAccumulatorState(std::vector<std::byte>& output, const AccumulatorState& state)
+{
+    AppendLE(output, state.num_leaves);
+    AppendLE(output, static_cast<uint32_t>(state.roots.size()));
+    AppendLE(output, uint32_t{0});
+    for (const auto& root : state.roots) AppendHash(output, root);
+}
+
+Hash256 AccumulatorStateDigest(const AccumulatorState& state)
+{
+    constexpr std::array<std::byte, 8> domain{
+        std::byte{'U'}, std::byte{'P'}, std::byte{'R'}, std::byte{'F'},
+        std::byte{'S'}, std::byte{'T'}, std::byte{'A'}, std::byte{'2'}};
+    std::vector<std::byte> authenticated;
+    authenticated.reserve(domain.size() + sizeof(uint32_t) + Hash256::SIZE +
+                          STATE_PREFIX_SIZE + state.roots.size() * Hash256::SIZE);
+    authenticated.insert(authenticated.end(), domain.begin(), domain.end());
+    AppendLE(authenticated, state.point.height);
+    AppendHash(authenticated, state.point.block_hash);
+    AppendAccumulatorState(authenticated, state);
+    return Sha256(authenticated);
+}
+
+Hash256 RecordCommitment(const Hash256& record_digest, const Hash256& state_digest)
+{
+    constexpr std::array<std::byte, 8> domain{
+        std::byte{'U'}, std::byte{'P'}, std::byte{'R'}, std::byte{'F'},
+        std::byte{'C'}, std::byte{'M'}, std::byte{'T'}, std::byte{'2'}};
+    std::array<std::byte, domain.size() + 2 * Hash256::SIZE> bytes{};
+    std::copy(domain.begin(), domain.end(), bytes.begin());
+    std::copy(record_digest.Bytes().begin(), record_digest.Bytes().end(),
+              bytes.begin() + static_cast<std::ptrdiff_t>(domain.size()));
+    std::copy(state_digest.Bytes().begin(), state_digest.Bytes().end(),
+              bytes.begin() + static_cast<std::ptrdiff_t>(domain.size() + Hash256::SIZE));
+    return Sha256(bytes);
+}
+
+Result<AccumulatorState> ParseAccumulatorState(std::span<const std::byte> bytes,
+                                               const ChainPoint& point)
+{
+    ByteReader reader{bytes};
+    uint64_t num_leaves{0};
+    uint32_t root_count{0};
+    uint32_t reserved{0};
+    if (!reader.ReadLE(num_leaves) || !reader.ReadLE(root_count) ||
+        !reader.ReadLE(reserved) || reserved != 0 || root_count > 64 ||
+        bytes.size() != STATE_PREFIX_SIZE + static_cast<std::size_t>(root_count) * Hash256::SIZE) {
+        return Result<AccumulatorState>::Err("stored accumulator state is malformed");
+    }
+    AccumulatorState state{.point = point, .num_leaves = num_leaves, .roots = {}};
+    state.roots.reserve(root_count);
+    for (uint32_t i{0}; i < root_count; ++i) {
+        Hash256 root;
+        if (!reader.ReadHash(root)) {
+            return Result<AccumulatorState>::Err("stored accumulator state root is truncated");
+        }
+        state.roots.push_back(root);
+    }
+    if (!reader.Done()) return Result<AccumulatorState>::Err("stored accumulator state has trailing data");
+    auto valid{ValidateAccumulatorState(state)};
+    if (!valid) return Result<AccumulatorState>::Err(valid.Error());
+    return Result<AccumulatorState>::Ok(std::move(state));
+}
+
+Result<AccumulatorState> ParseAuthenticatedState(std::span<const std::byte> bytes,
+                                                  const ChainPoint& point)
+{
+    if (bytes.size() < STATE_PREFIX_SIZE + STATE_DIGEST_SIZE ||
+        bytes.size() > MAX_STATE_SIZE) {
+        return Result<AccumulatorState>::Err("stored authenticated state size is invalid");
+    }
+    const std::size_t body_size{bytes.size() - STATE_DIGEST_SIZE};
+    auto state{ParseAccumulatorState(bytes.first(body_size), point)};
+    if (!state) return state;
+    Hash256::Storage digest_bytes{};
+    std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(body_size),
+                STATE_DIGEST_SIZE, digest_bytes.begin());
+    if (Hash256{digest_bytes} != AccumulatorStateDigest(state.Value())) {
+        return Result<AccumulatorState>::Err("stored accumulator state checksum mismatch");
+    }
+    return state;
 }
 
 struct PreparedProof {
@@ -254,11 +550,22 @@ struct PreparedProof {
     uint64_t accounted_bytes{0};
 };
 
+struct ParsedProofRecord {
+    CachedBlockProof proof;
+    std::optional<AccumulatorState> state;
+};
+
 Result<PreparedProof> PrepareProof(BlockDelta delta, Proof proof,
+                                   const AccumulatorState& state,
                                    uint64_t accounted_bytes, uint64_t max_record_bytes)
 {
     const ChainPoint point{delta.point};
     const Hash256 previous_hash{delta.previous_block_hash};
+    if (state.point != point) {
+        return Result<PreparedProof>::Err("post-block accumulator state point does not match proof block");
+    }
+    auto valid_state{ValidateAccumulatorState(state)};
+    if (!valid_state) return Result<PreparedProof>::Err(valid_state.Error());
     CachedBlockProof cached{
         .point = point,
         .proof = std::move(proof),
@@ -273,27 +580,63 @@ Result<PreparedProof> PrepareProof(BlockDelta delta, Proof proof,
     if (!payload) return Result<PreparedProof>::Err(payload.Error());
     if (payload.Value().size() > max_record_bytes ||
         payload.Value().size() > std::numeric_limits<uint64_t>::max() -
-                                     DATA_HEADER_SIZE - DATA_FOOTER_SIZE) {
+                                     DATA_HEADER_SIZE - MAX_STATE_SIZE - DATA_FOOTER_SIZE) {
         return Result<PreparedProof>::Err("serialized block proof exceeds the proof-store record limit");
     }
     std::vector<std::byte> record;
-    record.reserve(DATA_HEADER_SIZE + payload.Value().size() + DATA_FOOTER_SIZE);
+    record.reserve(DATA_HEADER_SIZE + STATE_PREFIX_SIZE +
+                   state.roots.size() * Hash256::SIZE + STATE_DIGEST_SIZE +
+                   payload.Value().size() +
+                   DATA_FOOTER_SIZE);
     record.insert(record.end(), DATA_MAGIC.begin(), DATA_MAGIC.end());
     AppendLE(record, STORE_FORMAT);
     AppendLE(record, point.height);
     AppendHash(record, point.block_hash);
     AppendHash(record, previous_hash);
     AppendLE(record, static_cast<uint64_t>(payload.Value().size()));
+    AppendAccumulatorState(record, state);
+    const Hash256 state_digest{AccumulatorStateDigest(state)};
+    AppendHash(record, state_digest);
     record.insert(record.end(), payload.Value().begin(), payload.Value().end());
-    const Hash256 digest{Sha256(record)};
-    AppendHash(record, digest);
+    const Hash256 record_digest{Sha256(record)};
+    AppendHash(record, record_digest);
     record.insert(record.end(), DATA_COMMIT.begin(), DATA_COMMIT.end());
     return Result<PreparedProof>::Ok(PreparedProof{
         .point = point,
         .previous_hash = previous_hash,
         .record = std::move(record),
-        .digest = digest,
+        .digest = RecordCommitment(record_digest, state_digest),
         .accounted_bytes = accounted_bytes,
+    });
+}
+
+Result<PreparedProof> PrepareBaseState(const AccumulatorState& state,
+                                       uint64_t /*max_record_bytes*/)
+{
+    auto valid_state{ValidateAccumulatorState(state)};
+    if (!valid_state) return Result<PreparedProof>::Err(valid_state.Error());
+    std::vector<std::byte> record;
+    record.reserve(DATA_HEADER_SIZE + STATE_PREFIX_SIZE +
+                   state.roots.size() * Hash256::SIZE + STATE_DIGEST_SIZE +
+                   DATA_FOOTER_SIZE);
+    record.insert(record.end(), DATA_MAGIC.begin(), DATA_MAGIC.end());
+    AppendLE(record, STORE_FORMAT);
+    AppendLE(record, state.point.height);
+    AppendHash(record, state.point.block_hash);
+    AppendHash(record, Hash256{});
+    AppendLE(record, uint64_t{0});
+    AppendAccumulatorState(record, state);
+    const Hash256 state_digest{AccumulatorStateDigest(state)};
+    AppendHash(record, state_digest);
+    const Hash256 record_digest{Sha256(record)};
+    AppendHash(record, record_digest);
+    record.insert(record.end(), DATA_COMMIT.begin(), DATA_COMMIT.end());
+    return Result<PreparedProof>::Ok(PreparedProof{
+        .point = state.point,
+        .previous_hash = {},
+        .record = std::move(record),
+        .digest = RecordCommitment(record_digest, state_digest),
+        .accounted_bytes = 0,
     });
 }
 
@@ -320,7 +663,8 @@ DiskIndexEntry EntryFromEvent(const WalEvent& event)
 Hash256 EntryHash(const DiskIndexEntry& entry) { return Hash256{entry.block_hash}; }
 Hash256 EntryDigest(const DiskIndexEntry& entry) { return Hash256{entry.data_digest}; }
 
-uint64_t AccountedBytes(const BlockDelta& delta, const Proof& proof)
+uint64_t AccountedBytes(const BlockDelta& delta, const Proof& proof,
+                        const AccumulatorState& state)
 {
     uint64_t bytes{1'024};
     const auto add = [&bytes](uint64_t amount) {
@@ -332,8 +676,18 @@ uint64_t AccountedBytes(const BlockDelta& delta, const Proof& proof)
     add(static_cast<uint64_t>(delta.deletions.size()) * Hash256::SIZE);
     add(static_cast<uint64_t>(delta.proof_leaves.size()) * sizeof(CompactLeafData));
     for (const auto& leaf : delta.proof_leaves) add(leaf.script.size());
+    add(static_cast<uint64_t>(state.roots.size()) * Hash256::SIZE +
+        STATE_PREFIX_SIZE + STATE_DIGEST_SIZE);
     return bytes > std::numeric_limits<uint64_t>::max() / 4 ?
                std::numeric_limits<uint64_t>::max() : bytes * 4;
+}
+
+bool ValidProofRecordSize(uint64_t size, uint64_t max_payload)
+{
+    const uint64_t overhead{DATA_HEADER_SIZE + MAX_STATE_SIZE + DATA_FOOTER_SIZE};
+    return size >= DATA_HEADER_SIZE + DATA_FOOTER_SIZE &&
+           max_payload <= std::numeric_limits<uint64_t>::max() - overhead &&
+           size <= max_payload + overhead;
 }
 
 } // namespace
@@ -343,9 +697,17 @@ class ProofStore::Impl
 public:
     explicit Impl(ProofStoreConfig store_config) : config{std::move(store_config)} {}
 
-    ~Impl()
+    ~Impl() noexcept
     {
-        static_cast<void>(Drain());
+        // Destruction must still stop and join every worker after a pipeline failure.
+        // In particular, producing the Result error from Drain() may itself allocate
+        // while the process is already handling std::bad_alloc.
+        try {
+            static_cast<void>(Drain());
+        } catch (...) {
+            // The committed data/WAL boundary remains the recovery point.  The
+            // no-allocation shutdown below abandons only uncommitted queued work.
+        }
         {
             std::lock_guard lock{mutex};
             stopping = true;
@@ -382,24 +744,75 @@ public:
         const auto data_path{config.directory / "proofs.dat"};
         const auto wal_path{config.directory / "index.wal"};
         const auto index_path{config.directory / "height.index"};
-        data_fd = ::open(data_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        auto marker_exists{OwnerMarkerExists(config.directory)};
+        if (!marker_exists) return Result<void>::Err(marker_exists.Error());
+        MarkerlessLayout markerless_layout;
+        bool markerless_legacy{false};
+        if (marker_exists.Value()) {
+            auto marker_valid{ValidateOwnerMarker(config.directory)};
+            if (!marker_valid) return marker_valid;
+            auto marker_directory_synced{SyncDirectory(config.directory)};
+            if (!marker_directory_synced) return marker_directory_synced;
+        } else {
+            auto inspected{InspectMarkerlessLayout(config.directory)};
+            if (!inspected) return Result<void>::Err(inspected.Error());
+            markerless_layout = inspected.Take();
+            if (markerless_layout.empty) {
+                // Ownership must reach stable storage before any mutable store file
+                // can be created. A crash after this point is an owned partial store
+                // and may safely use normal tail recovery on the next open.
+                auto marker_created{CreateOwnerMarker(config.directory)};
+                if (!marker_created) return marker_created;
+            } else {
+                markerless_legacy = true;
+            }
+        }
+
+        // A markerless legacy store is opened without O_CREAT and is not changed
+        // until every committed WAL record and referenced data record has passed a
+        // strict scan. All normal/new stores already have a durable ownership marker.
+        const int owned_file_flags{OwnedFileOpenFlags(!markerless_legacy)};
+        data_fd = ::open(data_path.c_str(), owned_file_flags, 0600);
         if (data_fd < 0) return Result<void>::Err(ErrnoMessage("open proof data"));
-        wal_fd = ::open(wal_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        wal_fd = ::open(wal_path.c_str(), owned_file_flags, 0600);
         if (wal_fd < 0) return Result<void>::Err(ErrnoMessage("open proof index WAL"));
+        if (!markerless_legacy || markerless_layout.has_index) {
+            index_fd = ::open(index_path.c_str(), owned_file_flags, 0600);
+            if (index_fd < 0) return Result<void>::Err(ErrnoMessage("open proof mmap index"));
+        }
+
+        // All three paths are mutable owned state. Validate them before the first
+        // write, truncate, or mmap so a stale link cannot redirect recovery into a
+        // checkpoint (or make two store roles overwrite the same inode).
+        auto data_identity{InspectOwnedFile(data_fd, data_path, "proof data")};
+        if (!data_identity) return Result<void>::Err(data_identity.Error());
+        auto wal_identity{InspectOwnedFile(wal_fd, wal_path, "proof index WAL")};
+        if (!wal_identity) return Result<void>::Err(wal_identity.Error());
+        std::optional<OwnedFileIdentity> index_identity;
+        if (index_fd >= 0) {
+            auto inspected_index{InspectOwnedFile(index_fd, index_path, "proof mmap index")};
+            if (!inspected_index) return Result<void>::Err(inspected_index.Error());
+            index_identity = inspected_index.Take();
+        }
+        if (SameFile(data_identity.Value(), wal_identity.Value()) ||
+            (index_identity &&
+             (SameFile(data_identity.Value(), *index_identity) ||
+              SameFile(wal_identity.Value(), *index_identity)))) {
+            return Result<void>::Err(
+                "proof-store data, WAL, and mmap index must be distinct files");
+        }
         if (::flock(wal_fd, LOCK_EX | LOCK_NB) != 0) {
             return Result<void>::Err(ErrnoMessage("lock proof store"));
         }
-        index_fd = ::open(index_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-        if (index_fd < 0) return Result<void>::Err(ErrnoMessage("open proof mmap index"));
 
         bool wal_size_ok{false};
         wal_end = FileSize(wal_fd, wal_size_ok);
         if (!wal_size_ok) return Result<void>::Err(ErrnoMessage("stat proof index WAL"));
         bool data_size_ok{false};
-        const uint64_t stored_data_size{FileSize(data_fd, data_size_ok)};
+        uint64_t stored_data_size{FileSize(data_fd, data_size_ok)};
         if (!data_size_ok) return Result<void>::Err(ErrnoMessage("stat proof data"));
 
-        if (wal_end != 0 && stored_data_size == 0 && wal_end <= WAL_RECORD_SIZE) {
+        if (!markerless_legacy && wal_end != 0 && wal_end <= WAL_RECORD_SIZE) {
             bool incomplete_base{wal_end < WAL_RECORD_SIZE};
             if (!incomplete_base) {
                 std::array<std::byte, WAL_COMMIT.size()> marker{};
@@ -408,33 +821,92 @@ public:
                 incomplete_base = marker != WAL_COMMIT;
             }
             if (incomplete_base) {
+                if (stored_data_size > DATA_HEADER_SIZE + MAX_STATE_SIZE + DATA_FOOTER_SIZE) {
+                    return Result<void>::Err(
+                        "incomplete proof-store base WAL accompanies non-base proof data");
+                }
                 if (::ftruncate(wal_fd, 0) != 0) {
                     return Result<void>::Err(ErrnoMessage("truncate incomplete proof-store base"));
                 }
                 auto synced{SyncFile(wal_fd, "recovered empty proof index WAL")};
                 if (!synced) return synced;
+                if (::ftruncate(data_fd, 0) != 0) {
+                    return Result<void>::Err(ErrnoMessage("truncate incomplete proof-store base data"));
+                }
+                synced = SyncFile(data_fd, "recovered empty proof data");
+                if (!synced) return synced;
                 wal_end = 0;
+                stored_data_size = 0;
             }
         }
 
         std::vector<DiskIndexEntry> recovered;
-        if (wal_end == 0) {
+        if (markerless_legacy) {
+            // This path must remain side-effect-free until it proves that this is a
+            // complete store produced by an older sidecar. In particular, do not
+            // adopt crash debris or truncate an unrelated same-name file set.
+            auto recovered_result{RecoverWal(recovered, stored_data_size, false)};
+            if (!recovered_result) return recovered_result;
+            auto marker_created{CreateOwnerMarker(config.directory)};
+            if (!marker_created) return marker_created;
+            if (index_fd < 0) {
+                index_fd = ::open(index_path.c_str(), OwnedFileOpenFlags(true), 0600);
+                if (index_fd < 0) {
+                    return Result<void>::Err(ErrnoMessage("create proof mmap index"));
+                }
+                auto inspected_index{
+                    InspectOwnedFile(index_fd, index_path, "proof mmap index")};
+                if (!inspected_index) return Result<void>::Err(inspected_index.Error());
+                if (SameFile(data_identity.Value(), inspected_index.Value()) ||
+                    SameFile(wal_identity.Value(), inspected_index.Value())) {
+                    return Result<void>::Err(
+                        "proof-store data, WAL, and mmap index must be distinct files");
+                }
+            }
+        } else if (wal_end == 0) {
             if (!config.create_base) {
                 return Result<void>::Err("a new proof store requires a checkpoint base point");
             }
+            if (!config.create_base_state) {
+                return Result<void>::Err("a new proof store requires its base accumulator state");
+            }
+            if (config.create_base_state->point != *config.create_base) {
+                return Result<void>::Err("proof-store base state point does not match its base");
+            }
             if (stored_data_size != 0) {
-                return Result<void>::Err("proof data exists without an index WAL");
+                if (stored_data_size > DATA_HEADER_SIZE + MAX_STATE_SIZE + DATA_FOOTER_SIZE) {
+                    return Result<void>::Err("proof data exists without an index WAL");
+                }
+                if (::ftruncate(data_fd, 0) != 0) {
+                    return Result<void>::Err(
+                        ErrnoMessage("truncate uncommitted proof-store base data"));
+                }
+                auto synced{SyncFile(data_fd, "uncommitted proof-store base data")};
+                if (!synced) return synced;
             }
             base_point = *config.create_base;
             durable_point = base_point;
             enqueued_point = base_point;
+            auto prepared_base{PrepareBaseState(*config.create_base_state,
+                                                config.max_record_bytes)};
+            if (!prepared_base) return Result<void>::Err(prepared_base.Error());
+            auto data_written{PwriteAll(data_fd, prepared_base.Value().record, 0)};
+            if (!data_written) return data_written;
+            auto data_synced{SyncFile(data_fd, "proof base state")};
+            if (!data_synced) return data_synced;
+            data_end = prepared_base.Value().record.size();
+            base_data_size = prepared_base.Value().record.size();
+            base_data_digest = prepared_base.Value().digest;
+            base_state = *config.create_base_state;
+            ++data_syncs;
             WalEvent base_event{
+                .format_version = STORE_FORMAT,
                 .kind = WalKind::BASE,
                 .point = base_point,
                 .previous_hash = {},
                 .data_offset = 0,
-                .data_size = 0,
-                .data_digest = {},
+                .data_size = prepared_base.Value().record.size(),
+                .data_digest = prepared_base.Value().digest,
             };
             const auto bytes{SerializeWal(base_event)};
             auto written{PwriteAll(wal_fd, bytes, 0)};
@@ -443,14 +915,22 @@ public:
             if (!synced) return synced;
             wal_end = bytes.size();
             wal_syncs = 1;
-            auto directory_synced{SyncDirectory(config.directory)};
-            if (!directory_synced) return directory_synced;
         } else {
-            auto recovered_result{RecoverWal(recovered, stored_data_size)};
+            auto recovered_result{RecoverWal(recovered, stored_data_size, true)};
             if (!recovered_result) return recovered_result;
         }
         auto mapped{MapIndex(recovered)};
         if (!mapped) return mapped;
+        // Persist every O_CREAT entry before this store can publish a durable tip.
+        // This is also deliberately done when reopening: an empty height.index is
+        // rebuildable, and a retry after an earlier directory-sync failure must not
+        // silently skip the sync merely because the entry is now visible.
+        auto directory_synced{SyncDirectory(config.directory)};
+        if (!directory_synced) return directory_synced;
+        const auto parent{config.directory.has_parent_path() ?
+            config.directory.parent_path() : std::filesystem::path{"."}};
+        auto parent_synced{SyncDirectory(parent)};
+        if (!parent_synced) return parent_synced;
         for (uint32_t index{0}; index < recovered.size(); ++index) {
             if (EntryPresent(recovered[index])) hash_to_height.emplace(EntryHash(recovered[index]), index);
         }
@@ -461,7 +941,7 @@ public:
         return Result<void>::Ok();
     }
 
-    Result<void> Enqueue(const BlockDelta& delta, Proof proof)
+    Result<void> Enqueue(const BlockDelta& delta, Proof proof, AccumulatorState state)
     {
         const auto wait_start{std::chrono::steady_clock::now()};
         std::unique_lock operation_lock{operation_mutex};
@@ -469,29 +949,40 @@ public:
             delta.proof_leaves.size() != delta.deletions.size()) {
             return Result<void>::Err("block proof does not align with its deletion leaves");
         }
-        const uint64_t accounted{AccountedBytes(delta, proof)};
-        if (accounted > config.max_queued_bytes) {
-            return Result<void>::Err("one proof exceeds the proof pipeline byte limit");
+        if (state.point != delta.point) {
+            return Result<void>::Err("post-block accumulator state does not match the proof block");
         }
+        auto valid_state{ValidateAccumulatorState(state)};
+        if (!valid_state) return valid_state;
+        const uint64_t accounted{AccountedBytes(delta, proof, state)};
+        const uint64_t max_single_accounted{
+            config.max_record_bytes > std::numeric_limits<uint64_t>::max() / 4 ?
+                std::numeric_limits<uint64_t>::max() : config.max_record_bytes * 4};
+        if (accounted > max_single_accounted) {
+            return Result<void>::Err(
+                "one proof exceeds the proof-store record memory limit");
+        }
+        const bool oversized_single{accounted > config.max_queued_bytes};
         std::unique_lock lock{mutex};
         const auto has_capacity = [&] {
+            if (oversized_single) return queued_blocks == 0 && queued_bytes == 0;
             return queued_blocks < config.max_queued_blocks &&
                    queued_bytes <= config.max_queued_bytes - accounted;
         };
-        if (!failure && !stopping && !has_capacity() &&
+        if (!FailedLocked() && !stopping && !has_capacity() &&
             enqueued_point.height > durable_point.height) {
             ++enqueue_blocked;
             ++backpressure_flushes;
             flush_height = !flush_height ? enqueued_point.height :
                            std::max(*flush_height, enqueued_point.height);
             output_ready.notify_one();
-        } else if (!failure && !stopping && !has_capacity()) {
+        } else if (!FailedLocked() && !stopping && !has_capacity()) {
             ++enqueue_blocked;
         }
         space_available.wait(lock, [&] {
-            return failure.has_value() || stopping || has_capacity();
+            return FailedLocked() || stopping || has_capacity();
         });
-        if (failure) return Result<void>::Err(*failure);
+        if (FailedLocked()) return Result<void>::Err(FailureMessageLocked());
         if (stopping) return Result<void>::Err("proof store is stopping");
         if (delta.point.height != enqueued_point.height + 1 ||
             delta.previous_block_hash != enqueued_point.block_hash) {
@@ -510,6 +1001,7 @@ public:
                     .proof_leaves = delta.proof_leaves,
                 },
                 .proof = std::move(proof),
+                .state = std::move(state),
                 .accounted_bytes = accounted,
             });
         } catch (const std::bad_alloc&) {
@@ -543,10 +1035,32 @@ public:
         flush_height = !flush_height ? height : std::max(*flush_height, height);
         output_ready.notify_one();
         durable_changed.wait(lock, [&] {
-            return failure.has_value() || durable_point.height >= height;
+            return FailedLocked() || durable_point.height >= height;
         });
-        if (failure) return Result<void>::Err(*failure);
+        if (FailedLocked()) return Result<void>::Err(FailureMessageLocked());
         return Result<void>::Ok();
+    }
+
+    Result<bool> EnforceRecoveryWindow(uint32_t state_height, uint32_t max_lag)
+    {
+        if (max_lag == 0) {
+            return Result<bool>::Err("proof recovery window must be nonzero");
+        }
+        {
+            std::lock_guard lock{mutex};
+            if (FailedLocked()) return Result<bool>::Err(FailureMessageLocked());
+            if (state_height <= durable_point.height) return Result<bool>::Ok(false);
+            if (state_height > enqueued_point.height) {
+                return Result<bool>::Err(
+                    "durable forest state is ahead of the enqueued proof archive");
+            }
+            if (state_height - durable_point.height < max_lag) {
+                return Result<bool>::Ok(false);
+            }
+        }
+        auto durable{WaitDurable(state_height)};
+        if (!durable) return Result<bool>::Err(durable.Error());
+        return Result<bool>::Ok(true);
     }
 
     Result<void> Drain()
@@ -554,7 +1068,7 @@ public:
         uint32_t height{0};
         {
             std::lock_guard lock{mutex};
-            if (failure) return Result<void>::Err(*failure);
+            if (FailedLocked()) return Result<void>::Err(FailureMessageLocked());
             height = enqueued_point.height;
         }
         return WaitDurable(height);
@@ -610,6 +1124,7 @@ public:
                 if (EntryPresent(index_map[index])) hash_to_height.erase(EntryHash(index_map[index]));
                 index_map[index] = {};
             }
+            state_present.resize(static_cast<std::size_t>(keep));
             durable_point = point;
             enqueued_point = point;
         }
@@ -636,8 +1151,7 @@ public:
                                     EntryHash(index_map[relative - 1]);
                 ++hits;
             }
-            if (entry.data_size > config.max_record_bytes + DATA_HEADER_SIZE + DATA_FOOTER_SIZE ||
-                entry.data_size < DATA_HEADER_SIZE + DATA_FOOTER_SIZE) {
+            if (!ValidProofRecordSize(entry.data_size, config.max_record_bytes)) {
                 return Result<std::shared_ptr<const CachedBlockProof>>::Err(
                     "proof index contains an invalid record size");
             }
@@ -648,11 +1162,57 @@ public:
                                         EntryDigest(entry), bytes)};
             if (!parsed) return Result<std::shared_ptr<const CachedBlockProof>>::Err(parsed.Error());
             std::shared_ptr<const CachedBlockProof> result{
-                std::make_shared<CachedBlockProof>(parsed.Take())};
+                std::make_shared<CachedBlockProof>(std::move(parsed.Value().proof))};
             return Result<std::shared_ptr<const CachedBlockProof>>::Ok(std::move(result));
         } catch (const std::bad_alloc&) {
             return Result<std::shared_ptr<const CachedBlockProof>>::Err(
                 "proof archive allocation failed while reading a record");
+        }
+    }
+
+    Result<std::optional<AccumulatorState>> StateAt(uint32_t height) const
+    {
+        try {
+            DiskIndexEntry entry;
+            Hash256 expected_previous;
+            Hash256 block_hash;
+            bool base_record{false};
+            {
+                std::lock_guard lock{mutex};
+                if (height == base_point.height) {
+                    if (!base_state) {
+                        return Result<std::optional<AccumulatorState>>::Ok({});
+                    }
+                    entry = DiskIndexEntry{
+                        .data_offset = 0,
+                        .data_size = base_data_size,
+                        .block_hash = base_point.block_hash.Bytes(),
+                        .data_digest = base_data_digest.Bytes(),
+                    };
+                    block_hash = base_point.block_hash;
+                    expected_previous = {};
+                    base_record = true;
+                } else {
+                    if (height < base_point.height || height > durable_point.height) {
+                        return Result<std::optional<AccumulatorState>>::Ok({});
+                    }
+                    const uint64_t relative{height - base_point.height - 1};
+                    if (relative >= state_present.size() || !state_present[relative]) {
+                        return Result<std::optional<AccumulatorState>>::Ok({});
+                    }
+                    entry = index_map[relative];
+                    block_hash = EntryHash(entry);
+                    expected_previous = relative == 0 ? base_point.block_hash :
+                                        EntryHash(index_map[relative - 1]);
+                }
+            }
+            auto state{ReadStateRecord(ChainPoint{height, block_hash}, expected_previous,
+                                       entry, base_record)};
+            if (!state) return Result<std::optional<AccumulatorState>>::Err(state.Error());
+            return Result<std::optional<AccumulatorState>>::Ok(state.Take());
+        } catch (const std::bad_alloc&) {
+            return Result<std::optional<AccumulatorState>>::Err(
+                "proof archive allocation failed while reading accumulator state");
         }
     }
 
@@ -665,6 +1225,125 @@ public:
     ChainPoint BasePoint() const { std::lock_guard lock{mutex}; return base_point; }
     ChainPoint DurablePoint() const { std::lock_guard lock{mutex}; return durable_point; }
     ChainPoint EnqueuedPoint() const { std::lock_guard lock{mutex}; return enqueued_point; }
+
+    ProofStoreCoverage Coverage() const
+    {
+        std::lock_guard lock{mutex};
+        std::optional<uint32_t> start;
+        if (durable_point.height == base_point.height) {
+            if (base_state) start = base_point.height;
+        } else {
+            uint64_t relative{durable_point.height - base_point.height};
+            while (relative != 0 && relative <= state_present.size() &&
+                   state_present[relative - 1]) {
+                start = base_point.height + static_cast<uint32_t>(relative);
+                --relative;
+            }
+            if (relative == 0 && base_state) start = base_point.height;
+        }
+        const bool full{base_point.height == 0 && start && *start == 0};
+        return ProofStoreCoverage{
+            .base = base_point,
+            .durable = durable_point,
+            .state_start_height = start,
+            .full_history = full,
+        };
+    }
+
+    Result<ProofStoreScrubStats> Scrub(const std::function<bool()>& cancelled)
+    {
+        try {
+            std::unique_lock operation_lock{operation_mutex};
+            auto drained{Drain()};
+            if (!drained) return Result<ProofStoreScrubStats>::Err(drained.Error());
+            if (cancelled && cancelled()) {
+                return Result<ProofStoreScrubStats>::Err("proof archive scrub cancelled");
+            }
+
+            ChainPoint base;
+            ChainPoint tip;
+            std::optional<AccumulatorState> expected_base_state;
+            uint64_t base_size{0};
+            Hash256 base_digest;
+            std::vector<DiskIndexEntry> entries;
+            {
+                std::lock_guard lock{mutex};
+                base = base_point;
+                tip = durable_point;
+                expected_base_state = base_state;
+                base_size = base_data_size;
+                base_digest = base_data_digest;
+                entries.reserve(static_cast<std::size_t>(tip.height - base.height));
+                for (uint64_t i{0}; i < tip.height - base.height; ++i) {
+                    entries.push_back(index_map[i]);
+                }
+            }
+
+            ProofStoreScrubStats stats{.durable = tip};
+            if (expected_base_state) {
+                if (cancelled && cancelled()) {
+                    return Result<ProofStoreScrubStats>::Err(
+                        "proof archive scrub cancelled");
+                }
+                if (base_size < DATA_HEADER_SIZE + STATE_PREFIX_SIZE +
+                                        STATE_DIGEST_SIZE + DATA_FOOTER_SIZE ||
+                    base_size > DATA_HEADER_SIZE + MAX_STATE_SIZE + DATA_FOOTER_SIZE) {
+                    return Result<ProofStoreScrubStats>::Err(
+                        "proof base state has an invalid record size");
+                }
+                std::vector<std::byte> bytes(static_cast<std::size_t>(base_size));
+                auto read{PreadExact(data_fd, bytes, 0)};
+                if (!read) return Result<ProofStoreScrubStats>::Err(read.Error());
+                auto parsed{ParseBaseStateRecord(base, base_digest, bytes)};
+                if (!parsed) {
+                    return Result<ProofStoreScrubStats>::Err(
+                        "proof base state: " + parsed.Error());
+                }
+                if (parsed.Value() != *expected_base_state) {
+                    return Result<ProofStoreScrubStats>::Err(
+                        "proof base state differs from the recovered archive state");
+                }
+                ++stats.states_verified;
+                stats.bytes_verified += base_size;
+            }
+
+            Hash256 previous{base.block_hash};
+            for (std::size_t i{0}; i < entries.size(); ++i) {
+                if (cancelled && cancelled()) {
+                    return Result<ProofStoreScrubStats>::Err(
+                        "proof archive scrub cancelled");
+                }
+                const auto& entry{entries[i]};
+                const uint32_t height{base.height + 1 + static_cast<uint32_t>(i)};
+                if (!ValidProofRecordSize(entry.data_size, config.max_record_bytes)) {
+                    return Result<ProofStoreScrubStats>::Err(
+                        "proof height " + std::to_string(height) +
+                        ": invalid record size");
+                }
+                std::vector<std::byte> bytes(static_cast<std::size_t>(entry.data_size));
+                auto read{PreadExact(data_fd, bytes, entry.data_offset)};
+                if (!read) {
+                    return Result<ProofStoreScrubStats>::Err(
+                        "proof height " + std::to_string(height) + ": " + read.Error());
+                }
+                auto parsed{ParseDataRecord(height, EntryHash(entry), previous,
+                                            EntryDigest(entry), bytes)};
+                if (!parsed) {
+                    return Result<ProofStoreScrubStats>::Err(
+                        "proof height " + std::to_string(height) + ": " + parsed.Error());
+                }
+                ++stats.proofs_verified;
+                if (parsed.Value().state) ++stats.states_verified;
+                stats.bytes_verified += entry.data_size;
+                previous = EntryHash(entry);
+            }
+            stats.full_history = Coverage().full_history;
+            return Result<ProofStoreScrubStats>::Ok(stats);
+        } catch (const std::bad_alloc&) {
+            return Result<ProofStoreScrubStats>::Err(
+                "proof archive allocation failed during full scrub");
+        }
+    }
 
     ProofStoreStats Stats() const
     {
@@ -715,11 +1394,18 @@ private:
     struct WorkItem {
         BlockDelta delta;
         Proof proof;
+        AccumulatorState state;
         uint64_t accounted_bytes{0};
     };
 
-    Result<void> RecoverWal(std::vector<DiskIndexEntry>& recovered, uint64_t stored_data_size)
+    Result<void> RecoverWal(std::vector<DiskIndexEntry>& recovered,
+                            uint64_t stored_data_size,
+                            bool allow_tail_recovery)
     {
+        if (!allow_tail_recovery && wal_end % WAL_RECORD_SIZE != 0) {
+            return Result<void>::Err(
+                "markerless legacy proof store has an incomplete WAL tail");
+        }
         const uint64_t complete_wal_size{wal_end - (wal_end % WAL_RECORD_SIZE)};
         if (complete_wal_size == 0) return Result<void>::Err("proof index WAL has no complete base record");
         uint64_t offset{0};
@@ -734,6 +1420,10 @@ private:
                 WAL_COMMIT.begin(), WAL_COMMIT.end(),
                 bytes.end() - static_cast<std::ptrdiff_t>(WAL_COMMIT.size()))};
             if (!committed && offset + WAL_RECORD_SIZE == complete_wal_size) {
+                if (!allow_tail_recovery) {
+                    return Result<void>::Err(
+                        "markerless legacy proof store has an uncommitted WAL tail");
+                }
                 valid_wal_size = offset;
                 break;
             }
@@ -743,30 +1433,72 @@ private:
                                          ": " + event.Error());
             }
             if (!saw_base) {
+                const bool legacy_base{event.Value().format_version == LEGACY_STORE_FORMAT};
                 if (event.Value().kind != WalKind::BASE || event.Value().data_offset != 0 ||
-                    event.Value().data_size != 0 || !event.Value().previous_hash.IsNull() ||
-                    !event.Value().data_digest.IsNull()) {
+                    !event.Value().previous_hash.IsNull() ||
+                    (legacy_base && (event.Value().data_size != 0 ||
+                                     !event.Value().data_digest.IsNull())) ||
+                    (!legacy_base && (event.Value().data_size <
+                                          DATA_HEADER_SIZE + STATE_PREFIX_SIZE +
+                                              STATE_DIGEST_SIZE + DATA_FOOTER_SIZE ||
+                                      event.Value().data_size > stored_data_size))) {
                     return Result<void>::Err("proof index WAL does not begin with a valid base");
                 }
                 base_point = event.Value().point;
                 durable_point = base_point;
                 enqueued_point = base_point;
+                if (!legacy_base) {
+                    auto envelope{ValidateDataEnvelope(event.Value(), true)};
+                    if (!envelope) return Result<void>::Err(envelope.Error());
+                    if (!envelope.Value()) {
+                        return Result<void>::Err("proof-store base record has no accumulator state");
+                    }
+                    base_state = std::move(*envelope.Value());
+                    base_data_size = event.Value().data_size;
+                    base_data_digest = event.Value().data_digest;
+                    recovered_data_end = event.Value().data_size;
+                }
                 saw_base = true;
             } else if (event.Value().kind == WalKind::CONNECT) {
                 if (event.Value().point.height != durable_point.height + 1 ||
                     event.Value().previous_hash != durable_point.block_hash ||
                     event.Value().data_offset != recovered_data_end ||
-                    event.Value().data_size < DATA_HEADER_SIZE + DATA_FOOTER_SIZE ||
-                    event.Value().data_size > config.max_record_bytes + DATA_HEADER_SIZE + DATA_FOOTER_SIZE ||
+                    !ValidProofRecordSize(event.Value().data_size,
+                                          config.max_record_bytes) ||
                     event.Value().data_offset > stored_data_size ||
                     event.Value().data_size > stored_data_size - event.Value().data_offset) {
                     return Result<void>::Err("proof CONNECT WAL record is not contiguous");
                 }
-                auto envelope{ValidateDataEnvelope(event.Value())};
-                if (!envelope) return envelope;
+                auto envelope{ValidateDataEnvelope(event.Value(), false)};
+                if (!envelope) return Result<void>::Err(envelope.Error());
+                if (!allow_tail_recovery) {
+                    // Legacy adoption is a one-time trust boundary. Validate the
+                    // entire payload checksum and parse, not only the bounded state
+                    // envelope normally needed for fast startup.
+                    std::vector<std::byte> record(
+                        static_cast<std::size_t>(event.Value().data_size));
+                    auto record_read{PreadExact(data_fd, record,
+                                                event.Value().data_offset)};
+                    if (!record_read) return record_read;
+                    auto parsed{ParseDataRecord(
+                        event.Value().point.height,
+                        event.Value().point.block_hash,
+                        event.Value().previous_hash,
+                        event.Value().data_digest,
+                        record)};
+                    if (!parsed) {
+                        return Result<void>::Err(
+                            "markerless legacy proof data failed validation: " +
+                            parsed.Error());
+                    }
+                }
                 const uint64_t relative{event.Value().point.height - base_point.height - 1};
                 if (relative >= recovered.size()) recovered.resize(static_cast<std::size_t>(relative + 1));
                 recovered[relative] = EntryFromEvent(event.Value());
+                if (relative >= state_present.size()) {
+                    state_present.resize(static_cast<std::size_t>(relative + 1));
+                }
+                state_present[relative] = envelope.Value().has_value();
                 durable_point = event.Value().point;
                 enqueued_point = durable_point;
                 recovered_data_end += event.Value().data_size;
@@ -785,6 +1517,8 @@ private:
                     return Result<void>::Err("proof TRUNCATE WAL hash does not match active history");
                 }
                 recovered.resize(static_cast<std::size_t>(event.Value().point.height - base_point.height));
+                state_present.resize(
+                    static_cast<std::size_t>(event.Value().point.height - base_point.height));
                 durable_point = event.Value().point;
                 enqueued_point = durable_point;
             } else {
@@ -794,6 +1528,10 @@ private:
         }
         if (!saw_base) return Result<void>::Err("proof index WAL has no committed base record");
         if (valid_wal_size != wal_end) {
+            if (!allow_tail_recovery) {
+                return Result<void>::Err(
+                    "markerless legacy proof store has a recoverable WAL tail");
+            }
             if (::ftruncate(wal_fd, static_cast<off_t>(valid_wal_size)) != 0) {
                 return Result<void>::Err(ErrnoMessage("truncate incomplete proof WAL tail"));
             }
@@ -804,6 +1542,10 @@ private:
         data_end = recovered_data_end;
         if (stored_data_size < data_end) return Result<void>::Err("proof data is shorter than its durable WAL");
         if (stored_data_size != data_end) {
+            if (!allow_tail_recovery) {
+                return Result<void>::Err(
+                    "markerless legacy proof store has an uncommitted data tail");
+            }
             if (::ftruncate(data_fd, static_cast<off_t>(data_end)) != 0) {
                 return Result<void>::Err(ErrnoMessage("truncate uncommitted proof data tail"));
             }
@@ -813,11 +1555,12 @@ private:
         return Result<void>::Ok();
     }
 
-    Result<void> ValidateDataEnvelope(const WalEvent& event) const
+    Result<std::optional<AccumulatorState>> ValidateDataEnvelope(const WalEvent& event,
+                                                                 bool base) const
     {
         std::array<std::byte, DATA_HEADER_SIZE> header{};
         auto read{PreadExact(data_fd, header, event.data_offset)};
-        if (!read) return read;
+        if (!read) return Result<std::optional<AccumulatorState>>::Err(read.Error());
         ByteReader reader{header};
         std::array<std::byte, DATA_MAGIC.size()> magic{};
         uint32_t version{0};
@@ -826,24 +1569,75 @@ private:
         Hash256 previous_hash;
         uint64_t payload_size{0};
         if (!reader.ReadBytes(magic) || magic != DATA_MAGIC || !reader.ReadLE(version) ||
-            version != STORE_FORMAT || !reader.ReadLE(height) || !reader.ReadHash(block_hash) ||
+            version < LEGACY_STORE_FORMAT || version > STORE_FORMAT ||
+            version != event.format_version || !reader.ReadLE(height) || !reader.ReadHash(block_hash) ||
             !reader.ReadHash(previous_hash) || !reader.ReadLE(payload_size) || !reader.Done() ||
             height != event.point.height || block_hash != event.point.block_hash ||
-            previous_hash != event.previous_hash ||
-            payload_size + DATA_HEADER_SIZE + DATA_FOOTER_SIZE != event.data_size) {
-            return Result<void>::Err("proof data header does not match its WAL record");
+            previous_hash != event.previous_hash || (base && payload_size != 0)) {
+            return Result<std::optional<AccumulatorState>>::Err(
+                "proof data header does not match its WAL record");
+        }
+        std::optional<AccumulatorState> state;
+        if (event.data_size < DATA_HEADER_SIZE + DATA_FOOTER_SIZE) {
+            return Result<std::optional<AccumulatorState>>::Err(
+                "proof data record is shorter than its envelope");
+        }
+        const uint64_t body_size{event.data_size - DATA_HEADER_SIZE - DATA_FOOTER_SIZE};
+        if (version == LEGACY_STORE_FORMAT) {
+            if (base || payload_size != body_size) {
+                return Result<std::optional<AccumulatorState>>::Err(
+                    "legacy proof data size does not match its WAL record");
+            }
+        } else {
+            if (body_size < STATE_PREFIX_SIZE + STATE_DIGEST_SIZE ||
+                payload_size > body_size - STATE_PREFIX_SIZE - STATE_DIGEST_SIZE) {
+                return Result<std::optional<AccumulatorState>>::Err(
+                    "state-bearing proof data is truncated");
+            }
+            const uint64_t state_size{body_size - payload_size};
+            if (state_size < STATE_PREFIX_SIZE + STATE_DIGEST_SIZE ||
+                state_size > MAX_STATE_SIZE) {
+                return Result<std::optional<AccumulatorState>>::Err(
+                    "stored accumulator state size is invalid");
+            }
+            std::vector<std::byte> state_bytes(static_cast<std::size_t>(state_size));
+            auto state_read{PreadExact(data_fd, state_bytes,
+                                       event.data_offset + DATA_HEADER_SIZE)};
+            if (!state_read) {
+                return Result<std::optional<AccumulatorState>>::Err(state_read.Error());
+            }
+            auto parsed{ParseAuthenticatedState(state_bytes, event.point)};
+            if (!parsed) {
+                return Result<std::optional<AccumulatorState>>::Err(parsed.Error());
+            }
+            state = parsed.Take();
         }
         std::array<std::byte, DATA_FOOTER_SIZE> footer{};
         read = PreadExact(data_fd, footer, event.data_offset + event.data_size - DATA_FOOTER_SIZE);
-        if (!read) return read;
+        if (!read) return Result<std::optional<AccumulatorState>>::Err(read.Error());
         Hash256::Storage digest{};
         std::copy_n(footer.begin(), Hash256::SIZE, digest.begin());
-        if (Hash256{digest} != event.data_digest ||
-            !std::equal(DATA_COMMIT.begin(), DATA_COMMIT.end(),
+        const Hash256 record_digest{digest};
+        const Hash256 commitment{version == LEGACY_STORE_FORMAT ? record_digest :
+            RecordCommitment(record_digest, AccumulatorStateDigest(*state))};
+        if (commitment != event.data_digest || !std::equal(DATA_COMMIT.begin(), DATA_COMMIT.end(),
                         footer.begin() + static_cast<std::ptrdiff_t>(Hash256::SIZE))) {
-            return Result<void>::Err("proof data footer does not match its WAL record");
+            return Result<std::optional<AccumulatorState>>::Err(
+                "proof data footer does not match its WAL record");
         }
-        return Result<void>::Ok();
+        if (base) {
+            std::vector<std::byte> bytes(static_cast<std::size_t>(event.data_size));
+            auto record_read{PreadExact(data_fd, bytes, event.data_offset)};
+            if (!record_read) {
+                return Result<std::optional<AccumulatorState>>::Err(record_read.Error());
+            }
+            auto parsed{ParseBaseStateRecord(event.point, event.data_digest, bytes)};
+            if (!parsed) {
+                return Result<std::optional<AccumulatorState>>::Err(parsed.Error());
+            }
+            state = parsed.Take();
+        }
+        return Result<std::optional<AccumulatorState>>::Ok(std::move(state));
     }
 
     Result<void> MapIndex(const std::vector<DiskIndexEntry>& recovered)
@@ -898,26 +1692,174 @@ private:
         return Result<void>::Ok();
     }
 
-    Result<CachedBlockProof> ParseDataRecord(uint32_t expected_height,
-                                             const Hash256& expected_hash,
+    Result<AccumulatorState> ReadStateRecord(const ChainPoint& expected_point,
                                              const Hash256& expected_previous,
-                                             const Hash256& expected_digest,
-                                             std::span<const std::byte> bytes) const
+                                             const DiskIndexEntry& entry,
+                                             bool base) const
+    {
+        if (!ValidProofRecordSize(entry.data_size, config.max_record_bytes)) {
+            return Result<AccumulatorState>::Err(
+                "proof state index contains an invalid record size");
+        }
+        std::array<std::byte, DATA_HEADER_SIZE> header{};
+        auto read{PreadExact(data_fd, header, entry.data_offset)};
+        if (!read) return Result<AccumulatorState>::Err(read.Error());
+        ByteReader header_reader{header};
+        std::array<std::byte, DATA_MAGIC.size()> magic{};
+        uint32_t version{0};
+        uint32_t height{0};
+        Hash256 block_hash;
+        Hash256 previous;
+        uint64_t payload_size{0};
+        if (!header_reader.ReadBytes(magic) || magic != DATA_MAGIC ||
+            !header_reader.ReadLE(version) || version != STORE_FORMAT ||
+            !header_reader.ReadLE(height) || !header_reader.ReadHash(block_hash) ||
+            !header_reader.ReadHash(previous) || !header_reader.ReadLE(payload_size) ||
+            !header_reader.Done() || height != expected_point.height ||
+            block_hash != expected_point.block_hash || previous != expected_previous ||
+            payload_size > config.max_record_bytes || (base && payload_size != 0)) {
+            return Result<AccumulatorState>::Err(
+                "proof state header is inconsistent with its index");
+        }
+
+        std::array<std::byte, STATE_PREFIX_SIZE> prefix{};
+        read = PreadExact(data_fd, prefix, entry.data_offset + DATA_HEADER_SIZE);
+        if (!read) return Result<AccumulatorState>::Err(read.Error());
+        ByteReader prefix_reader{prefix};
+        uint64_t num_leaves{0};
+        uint32_t root_count{0};
+        uint32_t reserved{0};
+        if (!prefix_reader.ReadLE(num_leaves) || !prefix_reader.ReadLE(root_count) ||
+            !prefix_reader.ReadLE(reserved) || !prefix_reader.Done() || reserved != 0 ||
+            root_count > 64 ||
+            root_count != static_cast<uint32_t>(std::popcount(num_leaves))) {
+            return Result<AccumulatorState>::Err("stored accumulator state prefix is invalid");
+        }
+        const uint64_t state_size{STATE_PREFIX_SIZE +
+            static_cast<uint64_t>(root_count) * Hash256::SIZE + STATE_DIGEST_SIZE};
+        const uint64_t fixed_size{DATA_HEADER_SIZE + state_size + DATA_FOOTER_SIZE};
+        if (entry.data_size < fixed_size || payload_size != entry.data_size - fixed_size) {
+            return Result<AccumulatorState>::Err(
+                "proof state size is inconsistent with its record");
+        }
+        std::vector<std::byte> state_bytes(static_cast<std::size_t>(state_size));
+        read = PreadExact(data_fd, state_bytes, entry.data_offset + DATA_HEADER_SIZE);
+        if (!read) return Result<AccumulatorState>::Err(read.Error());
+        auto state{ParseAuthenticatedState(state_bytes, expected_point)};
+        if (!state) return state;
+
+        std::array<std::byte, DATA_FOOTER_SIZE> footer{};
+        read = PreadExact(data_fd, footer,
+                          entry.data_offset + entry.data_size - DATA_FOOTER_SIZE);
+        if (!read) return Result<AccumulatorState>::Err(read.Error());
+        Hash256::Storage record_digest_bytes{};
+        std::copy_n(footer.begin(), Hash256::SIZE, record_digest_bytes.begin());
+        const Hash256 commitment{RecordCommitment(
+            Hash256{record_digest_bytes}, AccumulatorStateDigest(state.Value()))};
+        if (commitment != EntryDigest(entry) ||
+            !std::equal(DATA_COMMIT.begin(), DATA_COMMIT.end(),
+                        footer.begin() + static_cast<std::ptrdiff_t>(Hash256::SIZE))) {
+            return Result<AccumulatorState>::Err(
+                "proof state commitment does not match its WAL record");
+        }
+        return state;
+    }
+
+    Result<ParsedProofRecord> ParseDataRecord(uint32_t expected_height,
+                                              const Hash256& expected_hash,
+                                              const Hash256& expected_previous,
+                                              const Hash256& expected_digest,
+                                              std::span<const std::byte> bytes) const
     {
         if (bytes.size() < DATA_HEADER_SIZE + DATA_FOOTER_SIZE) {
-            return Result<CachedBlockProof>::Err("stored proof record is truncated");
+            return Result<ParsedProofRecord>::Err("stored proof record is truncated");
         }
         if (!std::equal(DATA_COMMIT.begin(), DATA_COMMIT.end(), bytes.end() -
                         static_cast<std::ptrdiff_t>(DATA_COMMIT.size()))) {
-            return Result<CachedBlockProof>::Err("stored proof commit marker is missing");
+            return Result<ParsedProofRecord>::Err("stored proof commit marker is missing");
         }
         Hash256::Storage digest_bytes{};
         std::copy_n(bytes.end() - static_cast<std::ptrdiff_t>(DATA_FOOTER_SIZE),
                     Hash256::SIZE, digest_bytes.begin());
         const Hash256 stored_digest{digest_bytes};
-        if (stored_digest != expected_digest ||
-            Sha256(bytes.first(bytes.size() - DATA_FOOTER_SIZE)) != stored_digest) {
-            return Result<CachedBlockProof>::Err("stored proof checksum mismatch");
+        if (Sha256(bytes.first(bytes.size() - DATA_FOOTER_SIZE)) != stored_digest) {
+            return Result<ParsedProofRecord>::Err("stored proof checksum mismatch");
+        }
+        ByteReader reader{bytes.first(DATA_HEADER_SIZE)};
+        std::array<std::byte, DATA_MAGIC.size()> magic{};
+        uint32_t version{0};
+        uint32_t height{0};
+        Hash256 hash;
+        Hash256 previous;
+        uint64_t payload_size{0};
+        if (!reader.ReadBytes(magic) || magic != DATA_MAGIC || !reader.ReadLE(version) ||
+            version < LEGACY_STORE_FORMAT || version > STORE_FORMAT ||
+            !reader.ReadLE(height) || !reader.ReadHash(hash) ||
+            !reader.ReadHash(previous) || !reader.ReadLE(payload_size) || !reader.Done() ||
+            height != expected_height || hash != expected_hash || previous != expected_previous) {
+            return Result<ParsedProofRecord>::Err("stored proof header is inconsistent");
+        }
+        std::size_t payload_offset{DATA_HEADER_SIZE};
+        std::optional<AccumulatorState> state;
+        const std::size_t body_size{bytes.size() - DATA_HEADER_SIZE - DATA_FOOTER_SIZE};
+        if (version == LEGACY_STORE_FORMAT) {
+            if (payload_size != body_size) {
+                return Result<ParsedProofRecord>::Err("legacy proof record size is inconsistent");
+            }
+        } else {
+            if (body_size < STATE_PREFIX_SIZE + STATE_DIGEST_SIZE ||
+                payload_size > body_size - STATE_PREFIX_SIZE - STATE_DIGEST_SIZE) {
+                return Result<ParsedProofRecord>::Err("state-bearing proof record is truncated");
+            }
+            const std::size_t state_size{body_size - static_cast<std::size_t>(payload_size)};
+            if (state_size < STATE_PREFIX_SIZE + STATE_DIGEST_SIZE ||
+                state_size > MAX_STATE_SIZE) {
+                return Result<ParsedProofRecord>::Err("stored accumulator state size is invalid");
+            }
+            auto parsed_state{ParseAuthenticatedState(
+                bytes.subspan(DATA_HEADER_SIZE, state_size),
+                ChainPoint{expected_height, expected_hash})};
+            if (!parsed_state) return Result<ParsedProofRecord>::Err(parsed_state.Error());
+            state = parsed_state.Take();
+            payload_offset += state_size;
+        }
+        const Hash256 commitment{version == LEGACY_STORE_FORMAT ? stored_digest :
+            RecordCommitment(stored_digest, AccumulatorStateDigest(*state))};
+        if (commitment != expected_digest) {
+            return Result<ParsedProofRecord>::Err(
+                "stored proof commitment does not match its WAL record");
+        }
+        auto proof{ParseFullUtreexoProof(height,
+            bytes.subspan(payload_offset, static_cast<std::size_t>(payload_size)))};
+        if (!proof) return Result<ParsedProofRecord>::Err(proof.Error());
+        if (proof.Value().point.block_hash != expected_hash) {
+            return Result<ParsedProofRecord>::Err(
+                "stored proof payload hash does not match its record");
+        }
+        return Result<ParsedProofRecord>::Ok(ParsedProofRecord{
+            .proof = proof.Take(),
+            .state = std::move(state),
+        });
+    }
+
+    Result<AccumulatorState> ParseBaseStateRecord(const ChainPoint& expected_point,
+                                                   const Hash256& expected_digest,
+                                                   std::span<const std::byte> bytes) const
+    {
+        if (bytes.size() < DATA_HEADER_SIZE + STATE_PREFIX_SIZE +
+                               STATE_DIGEST_SIZE + DATA_FOOTER_SIZE) {
+            return Result<AccumulatorState>::Err("stored base-state record is truncated");
+        }
+        if (!std::equal(DATA_COMMIT.begin(), DATA_COMMIT.end(), bytes.end() -
+                        static_cast<std::ptrdiff_t>(DATA_COMMIT.size()))) {
+            return Result<AccumulatorState>::Err("stored base-state commit marker is missing");
+        }
+        Hash256::Storage digest_bytes{};
+        std::copy_n(bytes.end() - static_cast<std::ptrdiff_t>(DATA_FOOTER_SIZE),
+                    Hash256::SIZE, digest_bytes.begin());
+        const Hash256 stored_digest{digest_bytes};
+        if (Sha256(bytes.first(bytes.size() - DATA_FOOTER_SIZE)) != stored_digest) {
+            return Result<AccumulatorState>::Err("stored base-state checksum mismatch");
         }
         ByteReader reader{bytes.first(DATA_HEADER_SIZE)};
         std::array<std::byte, DATA_MAGIC.size()> magic{};
@@ -929,17 +1871,21 @@ private:
         if (!reader.ReadBytes(magic) || magic != DATA_MAGIC || !reader.ReadLE(version) ||
             version != STORE_FORMAT || !reader.ReadLE(height) || !reader.ReadHash(hash) ||
             !reader.ReadHash(previous) || !reader.ReadLE(payload_size) || !reader.Done() ||
-            height != expected_height || hash != expected_hash || previous != expected_previous ||
-            payload_size + DATA_HEADER_SIZE + DATA_FOOTER_SIZE != bytes.size()) {
-            return Result<CachedBlockProof>::Err("stored proof header is inconsistent");
+            height != expected_point.height || hash != expected_point.block_hash ||
+            !previous.IsNull() || payload_size != 0) {
+            return Result<AccumulatorState>::Err("stored base-state header is inconsistent");
         }
-        auto proof{ParseFullUtreexoProof(height,
-            bytes.subspan(DATA_HEADER_SIZE, static_cast<std::size_t>(payload_size)))};
-        if (!proof) return proof;
-        if (proof.Value().point.block_hash != expected_hash) {
-            return Result<CachedBlockProof>::Err("stored proof payload hash does not match its record");
+        auto state{ParseAuthenticatedState(
+            bytes.subspan(DATA_HEADER_SIZE,
+                          bytes.size() - DATA_HEADER_SIZE - DATA_FOOTER_SIZE),
+            expected_point)};
+        if (!state) return state;
+        if (RecordCommitment(stored_digest, AccumulatorStateDigest(state.Value())) !=
+            expected_digest) {
+            return Result<AccumulatorState>::Err(
+                "stored base-state commitment does not match its WAL record");
         }
-        return proof;
+        return state;
     }
 
     std::optional<Hash256> HashAtLocked(uint32_t height) const
@@ -955,12 +1901,31 @@ private:
     {
         {
             std::lock_guard lock{mutex};
-            if (!failure) failure = std::move(error);
+            if (!FailedLocked()) failure = std::move(error);
         }
         input_ready.notify_all();
         output_ready.notify_all();
         space_available.notify_all();
         durable_changed.notify_all();
+    }
+
+    void SetEmergencyFailure(const char* error)
+    {
+        {
+            std::lock_guard lock{mutex};
+            if (!FailedLocked()) emergency_failure = error;
+        }
+        input_ready.notify_all();
+        output_ready.notify_all();
+        space_available.notify_all();
+        durable_changed.notify_all();
+    }
+
+    bool FailedLocked() const { return failure.has_value() || emergency_failure != nullptr; }
+
+    std::string FailureMessageLocked() const
+    {
+        return failure ? *failure : std::string{emergency_failure};
     }
 
     void SerializerLoop()
@@ -969,8 +1934,8 @@ private:
             WorkItem item;
             {
                 std::unique_lock lock{mutex};
-                input_ready.wait(lock, [&] { return failure.has_value() || stopping || !input.empty(); });
-                if (failure || (stopping && input.empty())) return;
+                input_ready.wait(lock, [&] { return FailedLocked() || stopping || !input.empty(); });
+                if (FailedLocked() || (stopping && input.empty())) return;
                 item = std::move(input.front());
                 input.pop_front();
             }
@@ -978,6 +1943,7 @@ private:
                 const uint32_t height{item.delta.point.height};
                 const auto serialization_start{std::chrono::steady_clock::now()};
                 auto prepared{PrepareProof(std::move(item.delta), std::move(item.proof),
+                                           item.state,
                                            item.accounted_bytes, config.max_record_bytes)};
                 if (!prepared) {
                     SetFailure("proof serialization failed at height " +
@@ -986,7 +1952,7 @@ private:
                 }
                 {
                     std::lock_guard lock{mutex};
-                    if (failure) return;
+                    if (FailedLocked()) return;
                     ++serialized_proofs;
                     serialized_bytes += prepared.Value().record.size();
                     largest_record_bytes = std::max<uint64_t>(largest_record_bytes,
@@ -1000,10 +1966,14 @@ private:
                 }
                 output_ready.notify_one();
             } catch (const std::bad_alloc&) {
-                SetFailure("proof serializer allocation failed");
+                SetEmergencyFailure("proof serializer allocation failed");
                 return;
             } catch (const std::exception& exception) {
-                SetFailure("proof serializer exception: " + std::string{exception.what()});
+                try {
+                    SetFailure("proof serializer exception: " + std::string{exception.what()});
+                } catch (...) {
+                    SetEmergencyFailure("proof serializer exception (detail unavailable)");
+                }
                 return;
             }
         }
@@ -1020,6 +1990,19 @@ private:
         return count;
     }
 
+    std::size_t CommitThresholdLocked() const
+    {
+        uint64_t target{static_cast<uint64_t>(durable_point.height) +
+                        config.group_commit_blocks};
+        if (flush_height && *flush_height > durable_point.height) {
+            target = std::min<uint64_t>(target, *flush_height);
+        } else if (stopping && enqueued_point.height > durable_point.height) {
+            target = std::min<uint64_t>(target, enqueued_point.height);
+        }
+        return static_cast<std::size_t>(std::max<uint64_t>(
+            1, target - durable_point.height));
+    }
+
     void WriterLoop()
     {
         while (true) {
@@ -1028,22 +2011,21 @@ private:
                 {
                     std::unique_lock lock{mutex};
                     output_ready.wait(lock, [&] {
-                        return failure.has_value() ||
+                        return FailedLocked() ||
                                ready.contains(durable_point.height + 1) || stopping;
                     });
-                    if (failure) return;
+                    if (FailedLocked()) return;
                     if (stopping && durable_point.height == enqueued_point.height) return;
                     if (!ready.contains(durable_point.height + 1)) continue;
                     const auto deadline{std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(config.group_commit_delay_ms)};
-                    while (ContiguousReadyLocked() < config.group_commit_blocks &&
-                           !(flush_height && *flush_height >= durable_point.height + 1) && !stopping) {
+                    while (ContiguousReadyLocked() < CommitThresholdLocked()) {
                         if (config.group_commit_delay_ms == 0) {
                             output_ready.wait(lock);
                         } else {
                             if (output_ready.wait_until(lock, deadline) == std::cv_status::timeout) break;
                         }
-                        if (failure) return;
+                        if (FailedLocked()) return;
                     }
                     const std::size_t count{ContiguousReadyLocked()};
                     for (std::size_t i{0}; i < count; ++i) {
@@ -1059,10 +2041,14 @@ private:
                     return;
                 }
             } catch (const std::bad_alloc&) {
-                SetFailure("proof writer allocation failed");
+                SetEmergencyFailure("proof writer allocation failed");
                 return;
             } catch (const std::exception& exception) {
-                SetFailure("proof writer exception: " + std::string{exception.what()});
+                try {
+                    SetFailure("proof writer exception: " + std::string{exception.what()});
+                } catch (...) {
+                    SetEmergencyFailure("proof writer exception (detail unavailable)");
+                }
                 return;
             }
         }
@@ -1138,6 +2124,10 @@ private:
                 const uint64_t relative{event.point.height - base_point.height - 1};
                 index_map[relative] = EntryFromEvent(event);
                 hash_to_height[event.point.block_hash] = static_cast<uint32_t>(relative);
+                if (relative >= state_present.size()) {
+                    state_present.resize(static_cast<std::size_t>(relative + 1));
+                }
+                state_present[relative] = true;
                 durable_point = event.point;
                 --queued_blocks;
                 queued_bytes -= batch[i].accounted_bytes;
@@ -1176,6 +2166,8 @@ private:
     uint64_t index_bytes{0};
     uint64_t data_end{0};
     uint64_t wal_end{0};
+    uint64_t base_data_size{0};
+    Hash256 base_data_digest;
 
     mutable std::mutex mutex;
     std::mutex operation_mutex;
@@ -1189,10 +2181,13 @@ private:
     std::thread writer;
     bool stopping{false};
     std::optional<std::string> failure;
+    const char* emergency_failure{nullptr};
     std::optional<uint32_t> flush_height;
     ChainPoint base_point;
     ChainPoint durable_point;
     ChainPoint enqueued_point;
+    std::optional<AccumulatorState> base_state;
+    std::vector<bool> state_present;
     std::unordered_map<Hash256, uint32_t, Hash256Hasher> hash_to_height;
     uint64_t queued_blocks{0};
     uint64_t queued_bytes{0};
@@ -1245,18 +2240,28 @@ Result<std::shared_ptr<ProofStore>> ProofStore::Open(ProofStoreConfig config)
     }
 }
 
-Result<void> ProofStore::Enqueue(const BlockDelta& delta, Proof proof)
+Result<void> ProofStore::Enqueue(const BlockDelta& delta, Proof proof,
+                                 AccumulatorState state)
 {
-    return m_impl->Enqueue(delta, std::move(proof));
+    return m_impl->Enqueue(delta, std::move(proof), std::move(state));
 }
 
 Result<void> ProofStore::WaitDurable(uint32_t height) { return m_impl->WaitDurable(height); }
+Result<bool> ProofStore::EnforceRecoveryWindow(uint32_t state_height, uint32_t max_lag)
+{
+    return m_impl->EnforceRecoveryWindow(state_height, max_lag);
+}
 Result<void> ProofStore::Drain() { return m_impl->Drain(); }
 Result<void> ProofStore::Truncate(const ChainPoint& point) { return m_impl->Truncate(point); }
 
 Result<std::shared_ptr<const CachedBlockProof>> ProofStore::Read(const Hash256& block_hash) const
 {
     return m_impl->Read(block_hash);
+}
+
+Result<std::optional<AccumulatorState>> ProofStore::StateAt(uint32_t height) const
+{
+    return m_impl->StateAt(height);
 }
 
 Result<std::optional<Hash256>> ProofStore::HashAt(uint32_t height) const
@@ -1267,6 +2272,82 @@ Result<std::optional<Hash256>> ProofStore::HashAt(uint32_t height) const
 ChainPoint ProofStore::BasePoint() const { return m_impl->BasePoint(); }
 ChainPoint ProofStore::DurablePoint() const { return m_impl->DurablePoint(); }
 ChainPoint ProofStore::EnqueuedPoint() const { return m_impl->EnqueuedPoint(); }
+ProofStoreCoverage ProofStore::Coverage() const { return m_impl->Coverage(); }
 ProofStoreStats ProofStore::Stats() const { return m_impl->Stats(); }
+Result<ProofStoreScrubStats> ProofStore::Scrub(const std::function<bool()>& cancelled)
+{
+    return m_impl->Scrub(cancelled);
+}
+
+Result<ChainPoint> FindHighestActiveArchivePoint(
+    const ProofStore& store, const ChainPoint& lower_bound,
+    uint32_t active_tip_height,
+    const std::function<Result<Hash256>(uint32_t)>& active_hash)
+{
+    try {
+        if (!active_hash) {
+            return Result<ChainPoint>::Err("active-chain hash resolver is unavailable");
+        }
+        const ChainPoint base{store.BasePoint()};
+        const ChainPoint archive_tip{store.DurablePoint()};
+        if (lower_bound.height < base.height || lower_bound.height > archive_tip.height) {
+            return Result<ChainPoint>::Err(
+                "archive active-chain lower bound is outside the durable archive");
+        }
+        auto archived_lower{store.HashAt(lower_bound.height)};
+        if (!archived_lower) return Result<ChainPoint>::Err(archived_lower.Error());
+        if (!archived_lower.Value() || *archived_lower.Value() != lower_bound.block_hash) {
+            return Result<ChainPoint>::Err(
+                "archive active-chain lower bound does not match the archive");
+        }
+        if (archive_tip.height > active_tip_height) {
+            return Result<ChainPoint>::Err(
+                "active chain is shorter than the durable proof archive");
+        }
+
+        uint32_t candidate{archive_tip.height};
+        while (true) {
+            auto archived{store.HashAt(candidate)};
+            if (!archived) return Result<ChainPoint>::Err(archived.Error());
+            if (!archived.Value()) {
+                return Result<ChainPoint>::Err(
+                    "proof archive has a height gap during active-chain alignment");
+            }
+            auto active{active_hash(candidate)};
+            if (!active) {
+                return Result<ChainPoint>::Err(
+                    "active-chain hash lookup failed at height " +
+                    std::to_string(candidate) + ": " + active.Error());
+            }
+            if (active.Value() == *archived.Value()) {
+                const ChainPoint common{candidate, *archived.Value()};
+                // Re-read the selected point immediately before the caller may
+                // durably truncate. A concurrent Core reorg must fail closed.
+                auto confirmed{active_hash(candidate)};
+                if (!confirmed) {
+                    return Result<ChainPoint>::Err(
+                        "active-chain confirmation failed at height " +
+                        std::to_string(candidate) + ": " + confirmed.Error());
+                }
+                if (confirmed.Value() != common.block_hash) {
+                    return Result<ChainPoint>::Err(
+                        "active chain changed during proof-archive alignment");
+                }
+                return Result<ChainPoint>::Ok(common);
+            }
+            if (candidate == lower_bound.height) break;
+            --candidate;
+        }
+        return Result<ChainPoint>::Err(
+            "proof archive has no active-chain point at or above the online forest");
+    } catch (const std::bad_alloc&) {
+        return Result<ChainPoint>::Err(
+            "allocation failed during proof-archive active-chain alignment");
+    } catch (const std::exception& exception) {
+        return Result<ChainPoint>::Err(
+            "proof-archive active-chain alignment failed: " +
+            std::string{exception.what()});
+    }
+}
 
 } // namespace utreexo

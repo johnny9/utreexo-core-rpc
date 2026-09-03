@@ -1,9 +1,15 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(utreexo_bridge VERSION 0.3.0 LANGUAGES CXX)
+project(utreexo_bridge VERSION 0.4.0 LANGUAGES CXX)
 
 include(CTest)
+include(GNUInstallDirs)
 find_package(Threads REQUIRED)
+
+configure_file(
+    contrib/systemd/utreexo-bridge.service.in
+    ${CMAKE_CURRENT_BINARY_DIR}/utreexo-bridge.service
+    @ONLY)
 
 option(UTREEXO_BUILD_RPC "Build the Bitcoin Core JSON-RPC adapter" ON)
 option(UTREEXO_BUILD_BENCHMARKS "Build deterministic resource estimation tools" ON)
@@ -15,6 +21,7 @@ set(UTREEXO_SANITIZERS "" CACHE STRING
 if(UTREEXO_BUILD_FUZZERS AND NOT UTREEXO_SANITIZERS)
     set(UTREEXO_SANITIZERS "address,undefined")
 endif()
+
 set(UTREEXO_REFERENCE_BRIDGE_EXECUTABLE "" CACHE FILEPATH "Path to rpc-utreexo-bridge")
 set(FLORESTAD_EXECUTABLE "" CACHE FILEPATH "Path to florestad")
 set(UTREEXO_UNIVALUE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/univalue" CACHE PATH
@@ -59,7 +66,7 @@ function(utreexo_configure_target target)
     target_link_libraries(${target} PRIVATE utreexo_warnings utreexo_sanitizers)
 endfunction()
 
-add_library(utreexo_logging src/log.cpp)
+add_library(utreexo_logging src/log.cpp src/memory.cpp)
 target_include_directories(utreexo_logging PUBLIC include)
 target_compile_features(utreexo_logging PUBLIC cxx_std_20)
 utreexo_configure_target(utreexo_logging)
@@ -173,6 +180,7 @@ if(BUILD_TESTING)
         test/p2p_tests.cpp
         test/proof_store_tests.cpp
         test/log_tests.cpp
+        test/memory_tests.cpp
     )
     target_link_libraries(utreexo_tests PRIVATE utreexo_accumulator utreexo_checkpoint utreexo_logging utreexo_p2p)
     target_include_directories(utreexo_tests PRIVATE test)
@@ -185,17 +193,28 @@ if(BUILD_TESTING)
     set_tests_properties(mainnet_rebuild_validate_tests PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 60)
 
+    add_test(NAME checkpoint_compact_safety_tests
+        COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/checkpoint_compact_safety_tests.sh
+            $<TARGET_FILE:utreexo-checkpoint-compact>)
+    set_tests_properties(checkpoint_compact_safety_tests PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 120)
+
     if(UTREEXO_BUILD_RPC)
         add_executable(utreexo_rpc_tests
             test/test_main.cpp
             test/core_rpc_tests.cpp
             test/sync_tests.cpp
         )
-        target_link_libraries(utreexo_rpc_tests PRIVATE utreexo_core_rpc)
+        target_link_libraries(utreexo_rpc_tests PRIVATE utreexo_core_rpc utreexo_p2p)
         target_include_directories(utreexo_rpc_tests PRIVATE test)
         target_compile_features(utreexo_rpc_tests PRIVATE cxx_std_20)
         utreexo_configure_target(utreexo_rpc_tests)
         add_test(NAME utreexo_rpc_tests COMMAND utreexo_rpc_tests)
+
+        add_test(NAME utreexo_cli_path_validation_tests
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/cli_path_validation_tests.sh
+                $<TARGET_FILE:utreexo-bridge>)
+        set_tests_properties(utreexo_cli_path_validation_tests PROPERTIES TIMEOUT 30)
 
         if(UTREEXO_ENABLE_REGTEST_INTEGRATION)
             find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
@@ -210,3 +229,40 @@ if(BUILD_TESTING)
         endif()
     endif()
 endif()
+
+install(TARGETS utreexo-checkpoint-compact
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(UTREEXO_BUILD_BENCHMARKS)
+    install(TARGETS utreexo-resource-estimate
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+if(UTREEXO_BUILD_RPC)
+    install(TARGETS utreexo-bridge
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+install(FILES README.md CHANGELOG.md SECURITY.md LICENSE MAINNET_SYNC_READINESS.md
+    DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(FILES third_party/univalue/COPYING
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+    RENAME LICENSE.univalue)
+install(FILES contrib/checkpoints/mainnet-943013.json
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/utreexo-bridge/checkpoints)
+if(UTREEXO_BUILD_RPC)
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/utreexo-bridge.service
+        contrib/systemd/utreexo-bridge.conf.example
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/utreexo-bridge/systemd)
+endif()
+install(FILES contrib/tor/torrc.example contrib/tor/bitcoin.conf.example
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/utreexo-bridge/tor)
+install(FILES doc/tor.md
+    DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
+set(CPACK_PACKAGE_NAME "utreexo-bridge")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_FILE_NAME
+    "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+set(CPACK_GENERATOR "TGZ")
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
+set(CPACK_PACKAGE_CHECKSUM "SHA256")
+include(CPack)
