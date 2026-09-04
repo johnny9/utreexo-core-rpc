@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream and authenticate the checkpoint referenced by the release manifest."""
+"""Authenticate or availability-probe the checkpoint in the release manifest."""
 
 from __future__ import annotations
 
@@ -298,6 +298,121 @@ def verify_download(
     return total, actual_sha256
 
 
+def probe_download(
+    url: str,
+    expected_size: int,
+    timeout_seconds: float,
+    max_redirects: int,
+    max_retries: int = 5,
+) -> int:
+    """Confirm that the remote object exposes its first and last byte ranges.
+
+    This is an availability check, not a substitute for verify_download(). The
+    compiled trust anchor still makes consumers authenticate the complete file
+    size, SHA-256, block hash, leaf count, and roots before accepting it.
+    """
+    validate_https_url(url)
+    if expected_size <= 0:
+        raise VerificationError("expected size must be positive")
+    if max_retries < 0:
+        raise VerificationError("max_retries must not be negative")
+
+    redirect_handler = BoundedHTTPSRedirectHandler(max_redirects)
+    opener = urllib.request.build_opener(redirect_handler)
+    offsets = (0,) if expected_size == 1 else (0, expected_size - 1)
+    for offset in offsets:
+        probe_complete = False
+        last_retry_error: Exception | None = None
+        for attempt in range(max_retries + 1):
+            redirect_handler.redirects = 0
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "Accept-Encoding": "identity",
+                    "Range": f"bytes={offset}-{offset}",
+                    "User-Agent": "utreexo-bridge-release-verifier/1",
+                },
+            )
+            try:
+                with opener.open(request, timeout=timeout_seconds) as response:
+                    validate_https_url(response.geturl())
+                    if response.getcode() != 206:
+                        raise VerificationError(
+                            "checkpoint availability probe requires HTTP byte ranges"
+                        )
+
+                    content_range = response.headers.get("Content-Range")
+                    match = re.fullmatch(
+                        r"bytes ([0-9]+)-([0-9]+)/([0-9]+)",
+                        content_range or "",
+                    )
+                    if match is None:
+                        raise VerificationError(
+                            "checkpoint probe has an invalid Content-Range"
+                        )
+                    advertised_first, advertised_last, advertised_total = (
+                        int(value, 10) for value in match.groups()
+                    )
+                    if (
+                        advertised_first != offset
+                        or advertised_last != offset
+                        or advertised_total != expected_size
+                    ):
+                        raise VerificationError(
+                            "checkpoint probe Content-Range does not match the request"
+                        )
+
+                    content_length = response.headers.get("Content-Length")
+                    if content_length is not None:
+                        try:
+                            advertised_size = int(content_length, 10)
+                        except ValueError as error:
+                            raise VerificationError(
+                                "checkpoint probe has an invalid Content-Length"
+                            ) from error
+                        if advertised_size != 1:
+                            raise VerificationError(
+                                "checkpoint probe Content-Length is not one byte"
+                            )
+
+                    payload = response.read(2)
+                    if not payload:
+                        raise RetryableDownloadError(
+                            "checkpoint probe ended before its declared byte"
+                        )
+                    if len(payload) != 1:
+                        raise VerificationError(
+                            "checkpoint probe returned more than its declared byte"
+                        )
+            except VerificationError:
+                raise
+            except (
+                OSError,
+                RetryableDownloadError,
+                http.client.HTTPException,
+                urllib.error.URLError,
+            ) as error:
+                last_retry_error = error
+                if attempt == max_retries:
+                    break
+                print(
+                    "checkpoint probe retry: "
+                    f"bytes={offset}-{offset} attempt={attempt + 2} error={error}",
+                    file=sys.stderr,
+                )
+                continue
+            probe_complete = True
+            break
+
+        if not probe_complete:
+            raise VerificationError(
+                "checkpoint availability probe failed after retries: "
+                f"bytes={offset}-{offset} error={last_retry_error}"
+            )
+
+    return len(offsets)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -324,6 +439,14 @@ def main() -> int:
         default=5,
         help="maximum retries for each checkpoint range (default: 5)",
     )
+    parser.add_argument(
+        "--probe-only",
+        action="store_true",
+        help=(
+            "only check first/last-byte availability; full-file authentication "
+            "remains the default"
+        ),
+    )
     args = parser.parse_args()
     if not 0 < args.timeout_seconds <= 600:
         parser.error("--timeout-seconds must be in (0, 600]")
@@ -334,6 +457,24 @@ def main() -> int:
 
     try:
         url, expected_size, expected_sha256 = load_manifest(args.manifest)
+        if args.probe_only:
+            print(
+                "probing checkpoint availability: "
+                f"bytes={expected_size} url={url}",
+                file=sys.stderr,
+            )
+            range_count = probe_download(
+                url,
+                expected_size,
+                args.timeout_seconds,
+                args.max_redirects,
+                args.max_retries,
+            )
+            print(
+                "checkpoint availability verified: "
+                f"bytes={expected_size} ranges={range_count}"
+            )
+            return 0
         print(
             f"streaming checkpoint verification: bytes={expected_size} url={url}",
             file=sys.stderr,

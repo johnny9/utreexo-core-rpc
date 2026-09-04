@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for the release checkpoint streaming verifier."""
+"""Offline tests for the release checkpoint download verifier."""
 
 from __future__ import annotations
 
@@ -193,6 +193,63 @@ class StreamingVerifierTests(unittest.TestCase):
             opener.ranges,
             ["bytes=0-4", "bytes=0-4", "bytes=5-9"],
         )
+
+    def test_availability_probe_checks_first_and_last_bytes(self) -> None:
+        size = 10
+        opener = FakeOpener(
+            FakeResponse(
+                b"0",
+                "https://cdn.example/mainnet.chk",
+                status=206,
+                content_length=1,
+                content_range=f"bytes 0-0/{size}",
+            ),
+            FakeResponse(
+                b"9",
+                "https://cdn.example/mainnet.chk",
+                status=206,
+                content_length=1,
+                content_range=f"bytes 9-9/{size}",
+            ),
+        )
+        with mock.patch.object(
+            VERIFIER.urllib.request,
+            "build_opener",
+            return_value=opener,
+        ):
+            self.assertEqual(
+                VERIFIER.probe_download(
+                    "https://checkpoints.example/mainnet.chk",
+                    size,
+                    5.0,
+                    2,
+                ),
+                2,
+            )
+        self.assertEqual(opener.ranges, ["bytes=0-0", "bytes=9-9"])
+
+    def test_availability_probe_rejects_wrong_total_size(self) -> None:
+        response = FakeResponse(
+            b"0",
+            "https://cdn.example/mainnet.chk",
+            status=206,
+            content_length=1,
+            content_range="bytes 0-0/11",
+        )
+        with mock.patch.object(
+            VERIFIER.urllib.request,
+            "build_opener",
+            return_value=FakeOpener(response),
+        ):
+            with self.assertRaisesRegex(
+                VERIFIER.VerificationError, "does not match"
+            ):
+                VERIFIER.probe_download(
+                    "https://checkpoints.example/mainnet.chk",
+                    10,
+                    5.0,
+                    2,
+                )
 
     def test_rejects_non_https_and_credential_urls(self) -> None:
         for url in (

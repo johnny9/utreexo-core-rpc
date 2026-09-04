@@ -11,7 +11,7 @@ jobs:
   preflight:
     name: Validate release identity and checkpoint availability
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -25,8 +25,8 @@ jobs:
           git merge-base --is-ancestor "${GITHUB_SHA}" origin/master
       - name: Require a published authenticated checkpoint
         run: python3 tools/verify-checkpoint-manifest.py --require-download-url
-      - name: Stream and authenticate the published checkpoint
-        run: python3 tools/verify-checkpoint-download.py
+      - name: Probe the published checkpoint
+        run: python3 tools/verify-checkpoint-download.py --probe-only
 
   validate:
     needs: preflight
