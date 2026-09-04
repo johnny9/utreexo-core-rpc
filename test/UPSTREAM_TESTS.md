@@ -83,9 +83,9 @@ same-block parent/child spend, and an OP_RETURN transaction. It requires:
    ordinary blocks and the C++ proof-only sidecar for a newly mined
    transaction-bearing block, reaching the exact Core tip and roots.
 
-The harness also converts the C++ forest to its mmap/WAL representation, mines
-one more block, reopens the online state, applies that block through the WAL,
-flushes the native base, and repeats the independent root/leaf comparison. The
+The harness also converts the C++ forest to its mmap representation, mines
+one more block, reopens the online state, applies that block through the overlay,
+seals an immutable delta run, and repeats the independent root/leaf comparison. The
 sidecar is stopped with SIGTERM and must drain its proof WAL and preserve the
 same final state. Current Floresta still couples initial archive peer selection
 to header/block service, so initial activation is deliberately staged; header
@@ -93,7 +93,7 @@ forwarding remains an upstream peer-role concern rather than a sidecar feature.
 
 ## Utreexod durability-test review
 
-The mmap/WAL tests were reviewed against utreexod commit
+The mmap and optional-WAL tests were reviewed against utreexod commit
 `25deba281b612f8b87f734b0ac169d8a46ede988` and its accumulator dependency,
 utreexo v0.18.0 commit `9869ffeefc970ab0aa46a7408589112a8970ddea`.
 The relevant upstream patterns are the accumulator's `wal_test.go`,
@@ -102,14 +102,15 @@ tests in `blockchain/indexers/indexers_test.go`.
 
 The corresponding C++ online-storage coverage includes:
 
-- a deterministic 120-block RAM-versus-mmap differential sequence with proof
-  equality, automatic/explicit flushes, and recovery every ten blocks;
+- a deterministic 120-block RAM-versus-mmap/delta differential sequence with exact
+  proof equality, explicit seals, and recovery every ten blocks;
 - multi-block disconnect, recovery after each disconnect, and alternate-branch
   replay;
-- recovery from the older superblock plus WAL when the newest superblock is
-  corrupt;
-- rejection of a checksum-corrupt committed record and rollback of an
-  incomplete first record;
+- immutable-base checks across failed and successful seals, checksum-corrupt and
+  missing delta rejection, ignored incomplete temporary files, and atomic snapshot
+  compaction from measured obsolete records or the configured run-count cap;
+- rejection of a checksum-corrupt committed WAL record and rollback of an incomplete
+  first WAL record;
 - real WAL segment rotation, pruning, and fail-closed rollback outside the
   retained undo window; and
 - the Core/reference-bridge/Floresta integration transition described above.

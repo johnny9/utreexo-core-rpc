@@ -15,9 +15,12 @@ format-3 replay. It uses sparse recovery checkpoints, preserves and reload-valid
 the compact 900000 checkpoint, and fails closed on an exact-state mismatch.
 
 When loading a validated checkpoint, `--online-state=DIR` streams it directly into one
-native mmap generation and uses a synchronized WAL during catch-up and tip following.
-A host failure then loses no published block: restart replays committed WAL records
-over the last durable base. Preserve the validated format-3 checkpoint for deep-reorg
+native mmap generation. Catch-up and tip following keep changed node records in a
+bounded RAM overlay. The per-block forest WAL is disabled by default: after a host
+failure, restart reopens the immutable base plus the last committed sorted delta run
+and replays the missing active-chain blocks from Bitcoin Core. Delta publication uses
+a checksummed temporary file, descriptor sync, atomic rename, and directory sync;
+normal operation never rewrites the large mmap base. Preserve the validated format-3 checkpoint for deep-reorg
 recovery. `--fast-sync` is opt-in and emits a warning that it requires at least 32 GiB
 of system RAM; the unattended historical rebuild controller enables it explicitly.
 The authenticated bootstrap is immutable. RAM-mode recovery writes to
@@ -150,7 +153,7 @@ progress and samples sidecar/Core memory once per second:
 
 Attach with `./sidecar/tools/mainnet-sync.sh attach` and detach with `Ctrl-b`, then
 `d`. `SIGINT` and `SIGTERM` stop at a block boundary, drain the proof pipeline, and
-persist the applicable RAM checkpoint or mmap/WAL state before exit.
+persist the applicable RAM checkpoint or mmap state before exit.
 
 For the complete known-reference reconstruction, launch the detached controller
 once and monitor it without interacting with the sync process:
@@ -178,23 +181,33 @@ Record for every stage:
 
 ## Online-operation boundaries
 
-- Every published online block has a checksummed, synchronized redo/undo WAL record.
-- A newly created WAL segment's directory entry is synchronized before its first
-  block is published; this adds one directory fsync per segment, not per block.
-- Incomplete WAL tails are truncated; corruption inside a committed record fails closed.
-- The mapped base is updated only from coalesced node deltas and advances through an
-  alternating synchronized superblock. Its chain-height index uses a matching pair of
-  alternating snapshots, so reorg suffix replacement never mutates the chain view of
-  the currently published superblock.
-- Automatic rollback is limited to retained connect transactions (1,008 blocks by
-  default). A deeper reorganization, or one crossing the original online-generation
-  boundary without a retained connect record, requires the preserved checkpoint.
+- By default, blocks newer than the last sorted delta are disposable RAM-overlay
+  state. A crash discards that overlay and replays Bitcoin Core from the durable delta.
+  The same handles a reorg only while that point remains on Core's active chain; otherwise reimport the
+  preserved checkpoint.
+- Delta seals are triggered by the RAM-overlay ceiling or clean shutdown. There is no
+  timed seal unless `--online-flush-interval-hours=N` is set.
+- Dirty nodes are serialized once in NodeId order to an immutable run. The mmap base
+  is never dirtied by normal catch-up or tip following.
+- Minor compaction starts from measured overlap after four runs: at 50% obsolete
+  records, or at the 128-run safety cap regardless of overlap. It writes a base-relative sorted
+  snapshot and removes superseded runs; it does not rewrite the full forest.
+- `--online-wal` opts into checksummed, synchronized per-block redo/undo records. New
+  WAL segment directory entries are synchronized before use; incomplete tails are
+  truncated and corruption inside a committed record fails closed. This setting does
+  not disable the proof store's separate index WAL.
+- Every committed delta records its base identity, generation/LSN link, roots,
+  allocator counters, records, and full post-base chain suffix. Gaps and corruption
+  fail closed; an incomplete `.tmp` file is ignored.
+- In-process automatic rollback is available only with `--online-wal` and is limited
+  to retained connect transactions (1,008 blocks by default). Otherwise restart and
+  Core replay handle a reorg above the durable delta, while a deeper reorg requires the
+  preserved checkpoint.
 - Optional Bitcoin-v1 P2P serves recent proofs from RAM and durable proofs from
   `--proof-store`. Checkpoint-based stores do not claim full-history coverage; a
   canonical genesis-to-tip store additionally serves historical accumulator states.
-- Graceful signals drain and persist state for operational clarity. Correctness still
-  does not depend on a shutdown-time full checkpoint once online: committed WAL replay
-  is the crash-recovery path.
+- Graceful signals drain the proof pipeline and seal the forest delta. Correctness does
+  not depend on that shutdown seal: Core replay recovers the default WAL-free overlay.
 
 ## Go/no-go decision
 

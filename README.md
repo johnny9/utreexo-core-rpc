@@ -3,8 +3,8 @@
 This is a C++20, Bitcoin Core-compatible implementation of the low-write bridge
 bootstrap design. It reads sequential active-chain blocks from an unpruned Bitcoin
 Core node using `getblock(hash, 3)` and derives the exact Utreexo leaf hashes. A new
-checkpoint catch-up streams directly into native mmap storage and continues through a
-block-atomic write-ahead log with bounded coalesced RAM deltas. High-memory operators
+checkpoint catch-up streams directly into native mmap storage and continues through
+bounded coalesced RAM deltas plus crash-safe immutable runs. High-memory operators
 can opt into a RAM-first catch-up with `--fast-sync`. An optional ordered proof pipeline
 can retain every Floresta-compatible block proof from an AssumeUtreexo checkpoint to
 the tip. A genesis rebuild additionally records the compact post-block accumulator
@@ -31,10 +31,12 @@ the sidecar transport with it.
 - Optional sparse, atomic, fsync-and-rename checkpoints. Checkpoints include the
   32-byte-per-height block-hash index needed to derive future deletion leaves.
 - Native 48-byte-per-slot mmap online storage, a RAM-only rebuildable keyless index,
-  per-block redo/undo WAL records, bounded write-back deltas, and double-buffered
-  durable superblocks.
-- Automatic shallow-reorg rollback from retained WAL before-images. Reorgs older
-  than the configured window fail closed to the preserved validated checkpoint.
+  a bounded RAM overlay, and crash-safe immutable NodeId-sorted delta runs. The large
+  mmap base is not rewritten during normal operation. Per-block redo/undo WAL records
+  are opt-in.
+- Automatic shallow-reorg rollback when the optional WAL is enabled. The default
+  WAL-free mode can restart from the last durable delta when it remains on Core's
+  active chain; a reorg crossing it requires the retained bootstrap checkpoint.
 - A durable proof store with parallel serialization, ordered group commit,
   independently authenticated post-block states, checksummed append-only data, a
   compact index WAL, and a rebuildable mmap height index. Stores can begin at either
@@ -214,14 +216,14 @@ before publishing a package.
 full forest. Large intervals reduce restart cost while avoiding the per-block rewrite
 pattern this project is meant to eliminate.
 
-## Switch to post-sync mmap/WAL operation
+## Switch to post-sync mmap operation
 
 Pass `--online-state` when loading an existing checkpoint. This is the default
 checkpoint catch-up mode: the sidecar verifies the checkpoint checksum, streams its
 forest directly into a new native mmap generation without constructing the full RAM
-arena, validates every branch and root, and applies subsequent blocks through the WAL.
-It does not overwrite the bootstrap checkpoint, which remains the recovery source for
-a reorg deeper than the online undo window.
+arena, validates every branch and root, and keeps subsequent node changes in a compact
+RAM overlay. It does not overwrite the bootstrap checkpoint; keep that checkpoint as
+the WAL-free recovery source for a reorg crossing the durable online history.
 
 ```sh
 ./build/utreexo-bridge \
@@ -235,7 +237,7 @@ a reorg deeper than the online undo window.
 `--fast-sync` is an explicit performance option. It keeps the checkpoint forest in
 RAM while catching up, then publishes `--online-state` at Core's tip. The process emits
 a warning before loading that this mode requires at least 32 GiB of system RAM; on
-smaller hosts use the default mmap/WAL path. Loading an existing checkpoint without
+smaller hosts use the default mmap path. Loading an existing checkpoint without
 either `--online-state` or `--fast-sync` fails with an actionable error instead of
 silently choosing the high-memory path.
 
@@ -250,28 +252,63 @@ silently choosing the high-memory path.
 ```
 
 On later starts, the existing online directory takes precedence over `--checkpoint`.
-The sidecar selects the newest valid superblock, replays committed WAL records newer
-than the mapped base, rebuilds the free list and RAM-only reverse index, verifies all
-branch hashes and roots, reconciles shallow reorgs with Core, and then follows the tip.
+The sidecar opens the immutable mmap base, applies the newest valid sequence of sorted
+delta runs, rebuilds the free list and RAM-only reverse index, verifies every branch
+and root, and then replays newer blocks from Bitcoin Core. A durable proof archive that
+is ahead of the durable forest point is retained when its hashes remain on Core's
+active chain.
 
 Online defaults:
 
 - dirty delta ceiling: 128 MiB on hosts with at most 20 GiB RAM, otherwise 512 MiB;
-- WAL segments: 256 MiB;
-- before-image/reorg retention: 1,008 blocks;
-- WAL synchronization: every block before its state is published;
-- WAL directory synchronization: once when each 256 MiB segment is created;
-- base flush: at the delta ceiling, 1 GiB of unapplied redo WAL, after 24 hours in
-  follow mode, or at clean non-follow shutdown; and
-- full-forest compaction/checkpoint rewrites: never during normal tip following.
+- per-block forest WAL: disabled;
+- timed delta seal: disabled;
+- delta seal: at the dirty-memory ceiling or clean shutdown;
+- minor delta compaction: measured obsolete-record pressure or 128 runs; and
+- mmap-base/full-checkpoint rewrites: never during normal tip following.
 
-The native directory contains `forest.hashes`, `forest.meta`, two alternating
-`chain.*.hashes` snapshots paired with the two alternating `state.*` superblocks, and
-`wal-*.log` segments. The small chain index is rewritten to its inactive generation
-before the matching superblock is published, so a reorg cannot expose a mixed chain
-view after a crash. Do not copy the directory as a shared checkpoint while unapplied
-WAL exists; use the preserved format-3 checkpoint until an explicit online export
-command is added.
+The dirty overlay is the in-memory cache for updated forest sections. It stores the
+latest node record once instead of caching touched 4 KiB pages. Increase its bound with
+`--online-cache-mib=N` when more RAM is available. A seal writes those final records in
+NodeId order to a new checksummed file, synchronizes it, and atomically renames it. It
+does not dirty `forest.hashes` or `forest.meta`. A crash loses only the unsealed overlay
+and replays that suffix from Core.
+
+Starting with four runs, the bridge measures obsolete records. It writes one compact
+snapshot when at least half of stored records have been superseded, or when lookup
+depth reaches the 128-run safety cap. Compaction merges sorted streams with newest-record-wins
+semantics, includes tombstones and allocator state, then removes obsolete runs. It
+never rewrites the mmap base and is triggered by storage pressure, not elapsed time.
+
+Proof generation reads one logical forest in this order: active RAM record, newest
+sealed delta record, then mmap base record. Node IDs and roots do not change when a run
+is sealed or compacted, so current proofs are byte-identical across RAM, sealed, and
+reopened states. Each run builds a cache-resident, eight-bits-per-record blocked Bloom
+filter and a sparse 64-record fence index when opened. Almost all absent IDs require no
+run access, while a present ID searches only its small indexed window; the run itself
+stays immutable. Historical block proofs remain in the separate proof store; forest
+delta compaction neither rewrites nor discards that archive.
+
+Set `--online-flush-interval-hours=N` to add a timed delta seal when an operational
+policy requires it. Zero, the default, allows the cache limit to maximize batching. Set
+`--online-wal` to opt into the former per-block recovery and shallow-reorg behavior.
+That mode uses 256 MiB WAL segments, retains at least 1,008 blocks of before-images,
+synchronizes each transaction, and also seals after 1 GiB of unsealed redo WAL.
+This option controls only the forest WAL. The proof store keeps its smaller index WAL
+because it protects the archival proof stream and its publication order.
+
+The native directory contains the immutable `forest.hashes` and `forest.meta` base,
+its `state.*`/`chain.*.hashes` metadata, `delta-*.run` files, and possibly `wal-*.log`
+segments when `--online-wal` is enabled. Each delta contains the complete small chain
+suffix from its base, forest roots, allocator state, and a commit checksum. Do not copy
+a live directory as a shared checkpoint; use the preserved format-3 checkpoint until
+an explicit online export command is added.
+
+Run `utreexo-online-storage-benchmark` to measure update, seal, reopen, proof lookup,
+logical delta bytes, and Linux process write bytes. It reports compaction amplification
+relative to the changed-record payload separately from filesystem amplification of the
+bytes actually emitted. It also fails if the mmap base changes or a reopened proof
+differs from the RAM reference.
 
 ## Build a proof store
 
@@ -367,11 +404,10 @@ adopted, `FORMAT` is synchronized before recovery or index rebuilding can mutate
 file.
 
 The pipeline drains before a sparse checkpoint is published and before the forest
-switches to online mmap/WAL storage. During mmap catch-up, proof commits remain batched
-but the non-durable distance is never allowed to exceed the forest's retained undo
-window. Live tip following makes each proof durable before publishing that height to
-the P2P cache. After a crash, startup rolls an mmap forest back to the durable proof
-tip when necessary and replays the bounded suffix. If the archive is ahead of an older
+switches to online mmap storage. During mmap catch-up, proof commits remain batched.
+Live tip following makes each proof durable before publishing that height to the P2P
+cache. After a crash with the default WAL-free forest, startup reopens the last durable
+delta and replays the suffix from Core while reusing matching archived proofs. If the archive is ahead of an older
 online forest, Core's active-chain hashes are checked first: an active archive is kept
 for proof reuse, while only a stale branch suffix is truncated. Existing durable
 proofs are hash-checked, their compact leaves are compared with Core-derived leaves,
@@ -536,8 +572,9 @@ The sidecar emits UTC, single-line key/value records in the form
 - `debug` adds forest arena/index capacity and tombstones; 1,000-block timing windows
   split into prefetch wait, RPC, parse, archive policy, prove, verify, modify, proof
   enqueue, and durability wait; proof queue/backpressure/batch/write/fsync statistics;
-  mmap-forest WAL serialization/rotation/write/fsync timing and segment-directory
-  sync count; checkpoint timing; and
+  mmap-overlay transaction timing; optional forest-WAL serialization/write/fsync;
+  delta-seal records/bytes, compaction pressure, and phase timing;
+  checkpoint timing; and
   process RSS/HWM, CPU, faults, context switches, and I/O.
 - `trace` adds the same phase timings for every processed block plus every successful
   RPC call. It is useful for short investigations but produces substantial output
@@ -637,7 +674,8 @@ Core's exact unspendable-script boundaries; exact amount parsing; txid/wtxid and
 maximum-vout handling; same-block spends; missing-undo rejection; proof-leaf order;
 free-slot reuse; mutation prevalidation; duplicate-leaf checkpoint round trips;
 sequential sync; reorg detection; randomized RAM-versus-mmap differential
-sequences; WAL crash/corruption recovery; alternating-superblock recovery;
+sequences; WAL-free interrupted-flush restoration; optional WAL crash/corruption
+recovery; alternating-superblock recovery;
 multi-block undo/redo; WAL rotation/retention boundaries; ordered proof-pipeline
 publication; proof-WAL torn-tail and corruption recovery; mmap-index rebuild;
 proof-store v1-to-v2 migration, authenticated bounded state reads, proof-store
@@ -652,7 +690,7 @@ Rustreexo API suites.
 
 The opt-in integration harness creates an exceptional-output regtest chain in
 Bitcoin Core, independently reconstructs it with this sidecar and
-`rpc-utreexo-bridge`, switches and reopens the C++ mmap/WAL state, and compares all
+`rpc-utreexo-bridge`, switches and reopens the C++ mmap state, and compares all
 three accumulators. It also creates a compact checkpoint below the tip, streams it
 into a fresh mmap forest, builds only the checkpoint-to-tip proof suffix, and verifies
 that both stores survive a scrubbed reopen. It then constructs a C++ Genesis
