@@ -199,6 +199,11 @@ Record for every stage:
 - Every committed delta records its base identity, generation/LSN link, roots,
   allocator counters, records, and full post-base chain suffix. Gaps and corruption
   fail closed; an incomplete `.tmp` file is ignored.
+- A checksummed `validated-state.cache` saves the validated free-node set and keyless
+  leaf-index layout against the exact mmap base. Normal restart reads that compact
+  sequential cache and applies only newer delta/WAL records. A missing, stale, or
+  corrupt cache causes one full scan and atomic regeneration; beta.2 directories take
+  that fallback once after upgrading.
 - In-process automatic rollback is available only with `--online-wal` and is limited
   to retained connect transactions (1,008 blocks by default). Otherwise restart and
   Core replay handle a reorg above the durable delta, while a deeper reorg requires the

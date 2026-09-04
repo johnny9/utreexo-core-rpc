@@ -252,11 +252,15 @@ silently choosing the high-memory path.
 ```
 
 On later starts, the existing online directory takes precedence over `--checkpoint`.
-The sidecar opens the immutable mmap base, applies the newest valid sequence of sorted
-delta runs, rebuilds the free list and RAM-only reverse index, verifies every branch
-and root, and then replays newer blocks from Bitcoin Core. A durable proof archive that
-is ahead of the durable forest point is retained when its hashes remain on Core's
-active chain.
+The sidecar opens the immutable mmap base and verifies the newest valid sequence of
+sorted delta runs. It normally restores the free list and RAM-only reverse index from
+the checksummed `validated-state.cache`, applies only records newer than that validated
+anchor, and then replays newer blocks from Bitcoin Core. The cache is bound to the
+exact base state and both mmap file identities. If it is absent, stale, truncated, or
+corrupt, startup performs the complete arena/branch/root scan and atomically regenerates
+it. Consequently, an existing beta.2 directory incurs the old scan once on its first
+beta.3 open. A durable proof archive that is ahead of the durable forest point is
+retained when its hashes remain on Core's active chain.
 
 Online defaults:
 
@@ -298,17 +302,21 @@ This option controls only the forest WAL. The proof store keeps its smaller inde
 because it protects the archival proof stream and its publication order.
 
 The native directory contains the immutable `forest.hashes` and `forest.meta` base,
-its `state.*`/`chain.*.hashes` metadata, `delta-*.run` files, and possibly `wal-*.log`
-segments when `--online-wal` is enabled. Each delta contains the complete small chain
-suffix from its base, forest roots, allocator state, and a commit checksum. Do not copy
-a live directory as a shared checkpoint; use the preserved format-3 checkpoint until
-an explicit online export command is added.
+its `state.*`/`chain.*.hashes` metadata, the derived `validated-state.cache`,
+`delta-*.run` files, and possibly `wal-*.log` segments when `--online-wal` is enabled.
+The validation cache uses eight bytes per indexed leaf plus four bytes per free node;
+it contains no duplicate leaf hashes and may be deleted safely at the cost of one full
+validation scan on the next open. Each delta contains the complete small chain suffix
+from its base, forest roots, allocator state, and a commit checksum. Do not copy a live
+directory as a shared checkpoint; use the preserved format-3 checkpoint until an
+explicit online export command is added.
 
-Run `utreexo-online-storage-benchmark` to measure update, seal, reopen, proof lookup,
-logical delta bytes, and Linux process write bytes. It reports compaction amplification
-relative to the changed-record payload separately from filesystem amplification of the
-bytes actually emitted. It also fails if the mmap base changes or a reopened proof
-differs from the RAM reference.
+Run `utreexo-online-storage-benchmark` to measure update, seal, cached reopen, proof
+lookup, logical delta bytes, and Linux process write bytes. It reports startup-cache
+bytes, replayed records, and validation time; compaction amplification relative to the
+changed-record payload separately from filesystem amplification of the bytes actually
+emitted. It also fails if the cache is not used, the mmap base changes, or a reopened
+proof differs from the RAM reference.
 
 ## Build a proof store
 
@@ -573,7 +581,8 @@ The sidecar emits UTC, single-line key/value records in the form
   split into prefetch wait, RPC, parse, archive policy, prove, verify, modify, proof
   enqueue, and durability wait; proof queue/backpressure/batch/write/fsync statistics;
   mmap-overlay transaction timing; optional forest-WAL serialization/write/fsync;
-  delta-seal records/bytes, compaction pressure, and phase timing;
+  delta-seal records/bytes, compaction pressure, startup-cache/full-scan status, and
+  phase timing;
   checkpoint timing; and
   process RSS/HWM, CPU, faults, context switches, and I/O.
 - `trace` adds the same phase timings for every processed block plus every successful
