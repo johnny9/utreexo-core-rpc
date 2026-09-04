@@ -4,6 +4,37 @@ All notable changes to the Utreexo bridge sidecar are documented here. The
 project follows Semantic Versioning while the command line, checkpoint, and
 proof-store formats remain explicitly versioned.
 
+## 0.4.0-beta.2 - 2026-09-04
+
+### Changed
+
+- Normal online persistence now seals coalesced node updates into immutable,
+  NodeId-sorted delta runs instead of dirtying scattered mmap base pages.
+- Minor compaction uses measured obsolete-record or run-count pressure and writes a
+  sorted base-relative snapshot. Normal operation never rewrites the mmap base.
+- The compact RAM dirty-node overlay now seals only at its configured memory ceiling
+  or clean shutdown by default. Timed seals are opt-in.
+- The per-block forest recovery/undo WAL is now opt-in with `--online-wal`.
+  WAL-free crashes replay Bitcoin Core from the last active-chain delta; a deeper
+  reorg requires the retained bootstrap checkpoint.
+
+### Added
+
+- Exact proof-equivalence, delta corruption/gap, incomplete-publication, hard-link,
+  immutable-base, WAL reorg, and garbage/run-cap compaction tests.
+- Cache-resident blocked Bloom filters avoid disk-backed searches for almost all
+  absent node IDs; sparse 64-record fence indexes bound positive searches to one
+  small run window.
+- `utreexo-online-storage-benchmark` for delta write volume, reopen latency, proof
+  lookup performance, base immutability, and RAM-reference proof comparison.
+
+### Security
+
+- Delta runs commit their base identity, generation/LSN link, chain suffix, roots,
+  allocator state, sorted node records, checksum, and final marker before publication.
+- Seal and compaction diagnostics report logical/file bytes, run garbage, write/sync
+  timing, compaction input/output records, and process-attributed write bytes.
+
 ## 0.4.0-beta.1 - 2026-09-03
 
 ### Added

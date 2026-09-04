@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 
 project(utreexo_bridge VERSION 0.4.0 LANGUAGES CXX)
 
-set(UTREEXO_VERSION_SUFFIX "-beta.1")
+set(UTREEXO_VERSION_SUFFIX "-beta.2")
 if(NOT UTREEXO_VERSION_SUFFIX STREQUAL "" AND
    NOT UTREEXO_VERSION_SUFFIX MATCHES "^-(alpha|beta|rc)\\.[1-9][0-9]*$")
     message(FATAL_ERROR
