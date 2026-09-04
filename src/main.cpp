@@ -967,6 +967,12 @@ void LogOnlineBreakdown(std::string_view phase, uint32_t height,
         " delta_records=" + std::to_string(usage.delta_records) +
         " delta_unique_records=" + std::to_string(usage.delta_unique_records) +
         " delta_obsolete_records=" + std::to_string(usage.delta_obsolete_records) +
+        " startup_cache_bytes=" + std::to_string(usage.startup_cache_bytes) +
+        " startup_cache_replayed_records=" +
+            std::to_string(usage.startup_cache_replayed_records) +
+        " startup_validation_us=" + std::to_string(usage.startup_validation_us) +
+        " startup_cache_hit=" + std::to_string(usage.startup_cache_hit) +
+        " startup_full_scan=" + std::to_string(usage.startup_full_scan) +
         " dirty_nodes=" + std::to_string(usage.dirty_nodes) +
         " dirty_bytes=" + std::to_string(usage.dirty_bytes) +
         " wal_bytes=" + std::to_string(usage.wal_bytes) +
@@ -1335,10 +1341,21 @@ int BridgeMain(int argc, char** argv)
         }
         forest = opened.Take();
         loaded_online = true;
+        const auto startup_usage{forest.OnlineUsage()};
         utreexo::Log(utreexo::LogLevel::INFO, "online_state_loaded",
             "height=" + std::to_string(recovered_point.height) +
             " block_hash=" + recovered_point.block_hash.ToBitcoinHex() +
-            " path=" + PathField(*options.online_state));
+            " path=" + PathField(*options.online_state) +
+            " startup_cache_hit=" +
+                std::string{startup_usage.startup_cache_hit ? "true" : "false"} +
+            " startup_full_scan=" +
+                std::string{startup_usage.startup_full_scan ? "true" : "false"} +
+            " startup_cache_bytes=" +
+                std::to_string(startup_usage.startup_cache_bytes) +
+            " startup_cache_replayed_records=" +
+                std::to_string(startup_usage.startup_cache_replayed_records) +
+            " startup_validation_us=" +
+                std::to_string(startup_usage.startup_validation_us));
         LogMemoryBreakdown("online_state_loaded", recovered_point.height, forest);
         LogOnlineBreakdown("online_state_loaded", recovered_point.height, forest);
         LogProcessResources("online_state_loaded", recovered_point.height);
@@ -3293,6 +3310,12 @@ int BridgeMain(int argc, char** argv)
             " online_delta_runs=" + std::to_string(forest.OnlineUsage().delta_runs) +
             " online_wal_bytes=" + std::to_string(forest.OnlineUsage().wal_bytes) +
             " online_base_lsn=" + std::to_string(forest.OnlineUsage().base_lsn) +
+            " online_startup_cache_hit=" +
+                std::string{forest.OnlineUsage().startup_cache_hit ? "true" : "false"} +
+            " online_startup_full_scan=" +
+                std::string{forest.OnlineUsage().startup_full_scan ? "true" : "false"} +
+            " online_startup_validation_us=" +
+                std::to_string(forest.OnlineUsage().startup_validation_us) +
             (proof_store ? " proof_base_height=" +
                                std::to_string(proof_store->BasePoint().height) +
                            " proof_durable_height=" +

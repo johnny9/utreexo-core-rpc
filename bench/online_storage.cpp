@@ -257,6 +257,11 @@ int main(int argc, char** argv)
         return Fail(reopened.Error());
     }
     online = reopened.Take();
+    const auto startup_usage{online.OnlineUsage()};
+    if (!startup_usage.startup_cache_hit || startup_usage.startup_full_scan) {
+        cleanup();
+        return Fail("reopen did not use the validated startup cache");
+    }
     if (online.Roots() != reference.Roots() || recovered_chain != chain ||
         recovered_point != ChainPoint{static_cast<uint32_t>(block_count),
                                       chain.back()}) {
@@ -324,6 +329,13 @@ int main(int argc, char** argv)
               << "flush_blocks=" << flush_blocks << '\n'
               << "update_us=" << update_us << '\n'
               << "reopen_us=" << reopen_us << '\n'
+              << "startup_validation_us="
+              << startup_usage.startup_validation_us << '\n'
+              << "startup_cache_bytes=" << startup_usage.startup_cache_bytes
+              << '\n'
+              << "startup_cache_replayed_records="
+              << startup_usage.startup_cache_replayed_records << '\n'
+              << "startup_cache_hit=1\n"
               << "proof_iterations=" << PROOF_ITERATIONS << '\n'
               << "ram_proof_us=" << ram_proof_us << '\n'
               << "delta_proof_us=" << delta_proof_us << '\n'
