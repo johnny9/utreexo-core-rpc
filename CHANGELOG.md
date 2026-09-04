@@ -4,6 +4,24 @@ All notable changes to the Utreexo bridge sidecar are documented here. The
 project follows Semantic Versioning while the command line, checkpoint, and
 proof-store formats remain explicitly versioned.
 
+## 0.4.0-beta.3 - 2026-09-04
+
+### Changed
+
+- Online restart restores allocator bookkeeping and the RAM-only leaf index from a
+  checksummed, base-bound validation cache, then applies only newer delta/WAL records.
+  This replaces repeated whole-arena scans on normal startup.
+- Missing, stale, truncated, or corrupt validation caches fall back to the complete
+  branch/root scan and are regenerated atomically. Existing beta.2 state therefore
+  pays the legacy scan once after upgrade; the cache remains disposable derived state.
+
+### Added
+
+- Startup diagnostics report cache bytes, replayed records, validation time, cache-hit
+  status, and whether the fallback full scan ran.
+- Regression coverage exercises cache reuse, WAL and sealed-delta replay, corruption,
+  deletion/recreation, mmap-base identity changes, and hard-link rejection.
+
 ## 0.4.0-beta.2 - 2026-09-04
 
 ### Changed
