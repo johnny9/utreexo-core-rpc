@@ -14,6 +14,9 @@ proof-store formats remain explicitly versioned.
 - Missing, stale, truncated, or corrupt validation caches fall back to the complete
   branch/root scan and are regenerated atomically. Existing beta.2 state therefore
   pays the legacy scan once after upgrade; the cache remains disposable derived state.
+- Software-release preflight now probes the published checkpoint's first and last
+  byte ranges after matching its manifest to the compiled trust anchor. Full 14.9 GB
+  transport authentication remains explicit and the binary still verifies it before use.
 
 ### Added
 

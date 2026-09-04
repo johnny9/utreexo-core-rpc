@@ -209,8 +209,12 @@ can also stream and authenticate the published object without retaining another 
 python3 tools/verify-checkpoint-download.py
 ```
 
-The tagged-release workflow independently performs the same full-stream verification
-before publishing a package.
+The tagged-release workflow confirms that this manifest matches the compiled trust
+anchor and probes the first and last remote byte ranges before publishing a package.
+It does not re-download the 14.9 GB checkpoint for every software tag: the binary
+still authenticates the complete size and SHA-256 before deserialization and then
+checks the block hash, leaf count, and ordered roots. Run the command above when an
+independent full-stream transport check is required.
 
 `--checkpoint-interval=N` is intentionally opt-in because every checkpoint streams the
 full forest. Large intervals reduce restart cost while avoiding the per-block rewrite
