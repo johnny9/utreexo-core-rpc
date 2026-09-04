@@ -72,6 +72,16 @@ struct OnlineForestUsage {
     uint64_t delta_records{0};
     uint64_t delta_unique_records{0};
     uint64_t delta_obsolete_records{0};
+    /** Bytes in the optional validated startup cache. */
+    uint64_t startup_cache_bytes{0};
+    /** Delta/WAL node records applied after the cached validation anchor. */
+    uint64_t startup_cache_replayed_records{0};
+    /** Time spent loading the cache or performing the fallback full scan. */
+    uint64_t startup_validation_us{0};
+    /** The validated cache replaced a full arena scan on this open. */
+    bool startup_cache_hit{false};
+    /** This open performed the legacy whole-forest validation path. */
+    bool startup_full_scan{false};
     uint64_t dirty_nodes{0};
     uint64_t dirty_bytes{0};
     uint64_t wal_bytes{0};

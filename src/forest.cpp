@@ -148,6 +148,7 @@ uint64_t ElapsedMicros(std::chrono::steady_clock::time_point start)
 }
 
 Result<void> PwriteAll(int descriptor, std::span<const std::byte> bytes, uint64_t file_offset);
+Result<void> PreadAll(int descriptor, std::span<std::byte> bytes, uint64_t file_offset);
 Result<void> WriteAll(int descriptor, std::span<const std::byte> bytes);
 uint64_t Checksum(std::span<const std::byte> bytes);
 
@@ -1071,7 +1072,8 @@ public:
     }
 
     template <typename Callback>
-    void ForEachLatestDeltaRecord(Callback&& callback) const
+    void ForEachLatestDeltaRecordFrom(std::size_t first_run,
+                                      Callback&& callback) const
     {
         struct Cursor {
             NodeId id{NO_NODE};
@@ -1083,7 +1085,7 @@ public:
             return left.run_index > right.run_index;
         };
         std::priority_queue<Cursor, std::vector<Cursor>, decltype(later)> pending{later};
-        for (std::size_t run_index{0}; run_index < m_delta_runs.size();
+        for (std::size_t run_index{first_run}; run_index < m_delta_runs.size();
              ++run_index) {
             const auto& run{*m_delta_runs[run_index]};
             if (run.RecordCount() != 0) {
@@ -1117,6 +1119,12 @@ public:
             }
             if (next_id < m_next && !callback(next_id, FromDisk(*newest))) return;
         }
+    }
+
+    template <typename Callback>
+    void ForEachLatestDeltaRecord(Callback&& callback) const
+    {
+        ForEachLatestDeltaRecordFrom(0, std::forward<Callback>(callback));
     }
 
     uint64_t UniqueDeltaRecords() const
@@ -1257,18 +1265,66 @@ public:
 
     Result<void> RebuildBookkeeping()
     {
+        auto rebuilt{RebuildBookkeepingAndCountLeaves()};
+        if (!rebuilt) return Result<void>::Err(rebuilt.Error());
+        return Result<void>::Ok();
+    }
+
+    Result<uint64_t> RebuildBookkeepingAndCountLeaves()
+    {
         m_live = 0;
         m_free.clear();
         m_free_set.clear();
+        uint64_t leaves{0};
         for (uint64_t raw_id{0}; raw_id < m_next; ++raw_id) {
             const NodeId id{static_cast<NodeId>(raw_id)};
-            if (Type(id) == NodeType::FREE) {
+            const NodeType type{Type(id)};
+            if (type == NodeType::FREE) {
                 m_free.push_back(id);
                 if (Mapped()) m_free_set.insert(id);
             } else {
                 ++m_live;
+                if (type == NodeType::LEAF) ++leaves;
             }
         }
+        return Result<uint64_t>::Ok(leaves);
+    }
+
+    std::vector<NodeId> SortedFreeIds() const
+    {
+        std::vector<NodeId> ids;
+        if (Mapped()) {
+            ids.reserve(m_free_set.size());
+            for (const NodeId id : m_free_set) ids.push_back(id);
+        } else {
+            ids = m_free;
+        }
+        std::ranges::sort(ids);
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        return ids;
+    }
+
+    Result<void> LoadBookkeeping(NodeId next, std::vector<NodeId> free_ids)
+    {
+        if (!Mapped() || next >= NO_NODE ||
+            !std::ranges::is_sorted(free_ids) ||
+            std::adjacent_find(free_ids.begin(), free_ids.end()) !=
+                free_ids.end() ||
+            (!free_ids.empty() && free_ids.back() >= next)) {
+            return Result<void>::Err(
+                "validated startup cache has invalid free-node bookkeeping");
+        }
+        m_next = next;
+        m_free = std::move(free_ids);
+        m_free_set.clear();
+        try {
+            m_free_set.reserve(m_free.size() * 2);
+            for (const NodeId id : m_free) m_free_set.insert(id);
+        } catch (const std::bad_alloc&) {
+            return Result<void>::Err(
+                "could not allocate validated free-node bookkeeping");
+        }
+        m_live = static_cast<uint64_t>(m_next) - m_free.size();
         return Result<void>::Ok();
     }
 
@@ -1575,6 +1631,103 @@ public:
         return static_cast<uint64_t>(m_slots.capacity()) * sizeof(NodeId) + m_control.capacity();
     }
 
+    static uint32_t ValidationHome(const Hash256& hash)
+    {
+        // The validation-cache table has at most 2^32 buckets, so the low 32
+        // bits retain every bit used to select a home bucket.
+        return static_cast<uint32_t>(Bucket(hash));
+    }
+
+    bool LoadValidationSlot(uint32_t slot, NodeId id, bool changed)
+    {
+        if (slot >= m_slots.size() || m_control[slot] != EMPTY) return false;
+        if (changed) {
+            m_control[slot] = DELETED;
+            ++m_tombstones;
+        } else {
+            m_slots[slot] = id;
+            m_control[slot] = FULL;
+            ++m_size;
+        }
+        return true;
+    }
+
+    bool InsertValidationHome(uint32_t home, NodeId id)
+    {
+        if (m_slots.empty()) return false;
+        const std::size_t mask{m_slots.size() - 1};
+        std::size_t slot{static_cast<std::size_t>(home) & mask};
+        for (std::size_t probes{0}; probes < m_slots.size(); ++probes) {
+            if (m_control[slot] == EMPTY) {
+                m_slots[slot] = id;
+                m_control[slot] = FULL;
+                ++m_size;
+                return true;
+            }
+            slot = (slot + 1) & mask;
+        }
+        return false;
+    }
+
+    bool RepairValidationDeletions()
+    {
+        if (m_tombstones == 0) return true;
+        const std::size_t mask{m_slots.size() - 1};
+        const auto empty{std::ranges::find(m_control, EMPTY)};
+        if (empty == m_control.end()) return false;
+        std::size_t slot{
+            (static_cast<std::size_t>(empty - m_control.begin()) + 1) & mask};
+        std::size_t remaining{m_slots.size() - 1};
+        std::vector<NodeId> survivors;
+        while (remaining != 0) {
+            if (m_control[slot] == EMPTY) {
+                slot = (slot + 1) & mask;
+                --remaining;
+                continue;
+            }
+
+            const std::size_t first{slot};
+            std::size_t cluster_size{0};
+            std::size_t deleted{0};
+            survivors.clear();
+            while (remaining != 0 && m_control[slot] != EMPTY) {
+                if (m_control[slot] == FULL) survivors.push_back(m_slots[slot]);
+                else ++deleted;
+                slot = (slot + 1) & mask;
+                --remaining;
+                ++cluster_size;
+            }
+            if (deleted == 0) continue;
+
+            std::size_t clear_slot{first};
+            for (std::size_t item{0}; item < cluster_size; ++item) {
+                m_slots[clear_slot] = NO_NODE;
+                m_control[clear_slot] = EMPTY;
+                clear_slot = (clear_slot + 1) & mask;
+            }
+            m_size -= survivors.size();
+            m_tombstones -= deleted;
+            for (const NodeId id : survivors) {
+                if (!InsertValidationHome(ValidationHome(m_arena.Hash(id)), id)) {
+                    return false;
+                }
+            }
+        }
+        return m_tombstones == 0;
+    }
+
+    template <typename Callback>
+    bool ForEachValidationEntry(Callback&& callback) const
+    {
+        for (std::size_t slot{0}; slot < m_slots.size(); ++slot) {
+            if (m_control[slot] != FULL) continue;
+            if (!callback(m_slots[slot], static_cast<uint32_t>(slot))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void Clear(std::size_t capacity = 16)
     {
         capacity = std::max<std::size_t>(16, std::bit_ceil(capacity));
@@ -1793,6 +1946,25 @@ Result<void> PwriteAll(int descriptor, std::span<const std::byte> bytes, uint64_
         }
         if (written == 0) return Result<void>::Err("short positional write to online state");
         offset += static_cast<std::size_t>(written);
+    }
+    return Result<void>::Ok();
+}
+
+Result<void> PreadAll(int descriptor, std::span<std::byte> bytes,
+                      uint64_t file_offset)
+{
+    std::size_t offset{0};
+    while (offset < bytes.size()) {
+        const ssize_t count{::pread(descriptor, bytes.data() + offset,
+            bytes.size() - offset, static_cast<off_t>(file_offset + offset))};
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return Result<void>::Err(ErrnoMessage("read online-state range"));
+        }
+        if (count == 0) {
+            return Result<void>::Err("online-state file was truncated while reading");
+        }
+        offset += static_cast<std::size_t>(count);
     }
     return Result<void>::Ok();
 }
@@ -2309,6 +2481,385 @@ Result<Hash256> OnlineBaseFingerprint(const OnlineSuperblock& state,
     return Result<Hash256>::Ok(Sha512_256(bytes));
 }
 
+struct OwnedFileIdentity {
+    uint64_t device{0};
+    uint64_t inode{0};
+    uint64_t size{0};
+    uint64_t modified_seconds{0};
+    uint64_t modified_nanoseconds{0};
+    uint64_t changed_seconds{0};
+    uint64_t changed_nanoseconds{0};
+    auto operator<=>(const OwnedFileIdentity&) const = default;
+};
+
+Result<OwnedFileIdentity> ReadOwnedFileIdentity(
+    const std::filesystem::path& path, std::string_view description)
+{
+    auto opened{OpenOwnedRegularFile(path, O_RDONLY | O_NONBLOCK, description)};
+    if (!opened) return Result<OwnedFileIdentity>::Err(opened.Error());
+    struct stat status{};
+    if (::fstat(opened.Value().Get(), &status) != 0 || status.st_size < 0) {
+        return Result<OwnedFileIdentity>::Err(
+            ErrnoMessage(std::string{"stat "} + std::string{description}));
+    }
+#if defined(__APPLE__)
+    const auto modified{status.st_mtimespec};
+    const auto changed{status.st_ctimespec};
+#else
+    const auto modified{status.st_mtim};
+    const auto changed{status.st_ctim};
+#endif
+    return Result<OwnedFileIdentity>::Ok(OwnedFileIdentity{
+        .device = static_cast<uint64_t>(status.st_dev),
+        .inode = static_cast<uint64_t>(status.st_ino),
+        .size = static_cast<uint64_t>(status.st_size),
+        .modified_seconds = static_cast<uint64_t>(modified.tv_sec),
+        .modified_nanoseconds = static_cast<uint64_t>(modified.tv_nsec),
+        .changed_seconds = static_cast<uint64_t>(changed.tv_sec),
+        .changed_nanoseconds = static_cast<uint64_t>(changed.tv_nsec),
+    });
+}
+
+constexpr std::array<std::byte, 8> VALIDATED_CACHE_MAGIC{
+    std::byte{'U'}, std::byte{'T'}, std::byte{'R'}, std::byte{'V'},
+    std::byte{'A'}, std::byte{'L'}, std::byte{'0'}, std::byte{'1'}};
+constexpr std::array<std::byte, 8> VALIDATED_CACHE_COMMIT{
+    std::byte{'V'}, std::byte{'A'}, std::byte{'L'}, std::byte{'I'},
+    std::byte{'D'}, std::byte{'O'}, std::byte{'K'}, std::byte{'1'}};
+constexpr uint32_t VALIDATED_CACHE_VERSION{1};
+constexpr std::string_view VALIDATED_CACHE_NAME{"validated-state.cache"};
+constexpr std::size_t VALIDATED_CACHE_ENTRY_SIZE{
+    sizeof(NodeId) + sizeof(uint32_t)};
+constexpr std::size_t VALIDATED_CACHE_HEADER_SIZE{824};
+constexpr std::size_t VALIDATED_CACHE_TRAILER_SIZE{
+    sizeof(uint64_t) + VALIDATED_CACHE_COMMIT.size()};
+
+std::optional<uint64_t> ValidatedIndexCapacity(uint64_t entries)
+{
+    constexpr uint64_t MAX_CAPACITY{uint64_t{1} << 32};
+    if (entries > (MAX_CAPACITY * 8 - 7) / 10) return std::nullopt;
+    const uint64_t required{
+        std::max<uint64_t>(16, (entries * 10 + 7) / 8)};
+    if (required > MAX_CAPACITY) return std::nullopt;
+    return std::bit_ceil(required);
+}
+
+uint64_t MaximumValidatedIndexCapacity(NodeId next)
+{
+    return std::bit_ceil(std::max<uint64_t>(16, next));
+}
+
+struct ValidationAnchor {
+    uint64_t generation{0};
+    uint64_t lsn{0};
+    ChainPoint point;
+    uint64_t num_leaves{0};
+    NodeId next{0};
+    uint64_t live_nodes{0};
+    std::array<NodeId, 64> roots{};
+};
+
+struct ValidatedCacheHeader {
+    OnlineSuperblock base;
+    OwnedFileIdentity hashes_identity;
+    OwnedFileIdentity metadata_identity;
+    ValidationAnchor anchor;
+    uint64_t index_capacity{0};
+    uint64_t index_entries{0};
+    uint64_t free_nodes{0};
+};
+
+void AppendFileIdentity(std::vector<std::byte>& bytes,
+                        const OwnedFileIdentity& identity)
+{
+    AppendUnsigned(bytes, identity.device);
+    AppendUnsigned(bytes, identity.inode);
+    AppendUnsigned(bytes, identity.size);
+    AppendUnsigned(bytes, identity.modified_seconds);
+    AppendUnsigned(bytes, identity.modified_nanoseconds);
+    AppendUnsigned(bytes, identity.changed_seconds);
+    AppendUnsigned(bytes, identity.changed_nanoseconds);
+}
+
+bool ReadFileIdentity(ByteReader& reader, OwnedFileIdentity& identity)
+{
+    return reader.ReadUnsigned(identity.device) &&
+        reader.ReadUnsigned(identity.inode) &&
+        reader.ReadUnsigned(identity.size) &&
+        reader.ReadUnsigned(identity.modified_seconds) &&
+        reader.ReadUnsigned(identity.modified_nanoseconds) &&
+        reader.ReadUnsigned(identity.changed_seconds) &&
+        reader.ReadUnsigned(identity.changed_nanoseconds);
+}
+
+std::vector<std::byte> SerializeValidatedCacheHeader(
+    const ValidatedCacheHeader& header)
+{
+    std::vector<std::byte> bytes;
+    bytes.reserve(VALIDATED_CACHE_HEADER_SIZE);
+    bytes.insert(bytes.end(), VALIDATED_CACHE_MAGIC.begin(),
+                 VALIDATED_CACHE_MAGIC.end());
+    AppendUnsigned(bytes, VALIDATED_CACHE_VERSION);
+    AppendUnsigned(bytes, header.base.format_version);
+    AppendUnsigned(bytes, header.base.generation);
+    AppendUnsigned(bytes, header.base.base_lsn);
+    AppendUnsigned(bytes, header.base.point.height);
+    AppendHash(bytes, header.base.point.block_hash);
+    AppendUnsigned(bytes, header.base.num_leaves);
+    AppendUnsigned(bytes, header.base.next);
+    AppendUnsigned(bytes, header.base.live_nodes);
+    AppendUnsigned(bytes, header.base.capacity_slots);
+    AppendUnsigned(bytes, header.base.chain_hash_count);
+    for (const NodeId root : header.base.roots) AppendUnsigned(bytes, root);
+    AppendFileIdentity(bytes, header.hashes_identity);
+    AppendFileIdentity(bytes, header.metadata_identity);
+    AppendUnsigned(bytes, header.anchor.generation);
+    AppendUnsigned(bytes, header.anchor.lsn);
+    AppendUnsigned(bytes, header.anchor.point.height);
+    AppendHash(bytes, header.anchor.point.block_hash);
+    AppendUnsigned(bytes, header.anchor.num_leaves);
+    AppendUnsigned(bytes, header.anchor.next);
+    AppendUnsigned(bytes, header.anchor.live_nodes);
+    for (const NodeId root : header.anchor.roots) AppendUnsigned(bytes, root);
+    AppendUnsigned(bytes, header.index_capacity);
+    AppendUnsigned(bytes, header.index_entries);
+    AppendUnsigned(bytes, header.free_nodes);
+    return bytes;
+}
+
+Result<ValidatedCacheHeader> ParseValidatedCacheHeader(
+    std::span<const std::byte> bytes)
+{
+    if (bytes.size() != VALIDATED_CACHE_HEADER_SIZE) {
+        return Result<ValidatedCacheHeader>::Err(
+            "validated startup cache header has an unexpected size");
+    }
+    ByteReader reader{bytes};
+    std::array<std::byte, VALIDATED_CACHE_MAGIC.size()> magic{};
+    uint32_t version{0};
+    ValidatedCacheHeader header;
+    if (!reader.ReadBytes(magic) || magic != VALIDATED_CACHE_MAGIC ||
+        !reader.ReadUnsigned(version) || version != VALIDATED_CACHE_VERSION ||
+        !reader.ReadUnsigned(header.base.format_version) ||
+        !reader.ReadUnsigned(header.base.generation) ||
+        !reader.ReadUnsigned(header.base.base_lsn) ||
+        !reader.ReadUnsigned(header.base.point.height) ||
+        !reader.ReadHash(header.base.point.block_hash) ||
+        !reader.ReadUnsigned(header.base.num_leaves) ||
+        !reader.ReadUnsigned(header.base.next) ||
+        !reader.ReadUnsigned(header.base.live_nodes) ||
+        !reader.ReadUnsigned(header.base.capacity_slots) ||
+        !reader.ReadUnsigned(header.base.chain_hash_count)) {
+        return Result<ValidatedCacheHeader>::Err(
+            "validated startup cache header is invalid");
+    }
+    for (NodeId& root : header.base.roots) {
+        if (!reader.ReadUnsigned(root)) {
+            return Result<ValidatedCacheHeader>::Err(
+                "validated startup cache base roots are truncated");
+        }
+    }
+    if (!ReadFileIdentity(reader, header.hashes_identity) ||
+        !ReadFileIdentity(reader, header.metadata_identity) ||
+        !reader.ReadUnsigned(header.anchor.generation) ||
+        !reader.ReadUnsigned(header.anchor.lsn) ||
+        !reader.ReadUnsigned(header.anchor.point.height) ||
+        !reader.ReadHash(header.anchor.point.block_hash) ||
+        !reader.ReadUnsigned(header.anchor.num_leaves) ||
+        !reader.ReadUnsigned(header.anchor.next) ||
+        !reader.ReadUnsigned(header.anchor.live_nodes)) {
+        return Result<ValidatedCacheHeader>::Err(
+            "validated startup cache anchor is truncated");
+    }
+    for (NodeId& root : header.anchor.roots) {
+        if (!reader.ReadUnsigned(root)) {
+            return Result<ValidatedCacheHeader>::Err(
+                "validated startup cache anchor roots are truncated");
+        }
+    }
+    if (!reader.ReadUnsigned(header.index_capacity) ||
+        !reader.ReadUnsigned(header.index_entries) ||
+        !reader.ReadUnsigned(header.free_nodes) || !reader.Done()) {
+        return Result<ValidatedCacheHeader>::Err(
+            "validated startup cache fields are truncated");
+    }
+    const auto minimum_index_capacity{
+        ValidatedIndexCapacity(header.index_entries)};
+    if ((header.base.format_version != LEGACY_ONLINE_FORMAT_VERSION &&
+         header.base.format_version != ONLINE_FORMAT_VERSION) ||
+        header.base.next >= NO_NODE ||
+        header.base.live_nodes > header.base.next ||
+        header.base.capacity_slots < header.base.next ||
+        header.base.capacity_slots >= NO_NODE ||
+        header.base.chain_hash_count !=
+            static_cast<uint64_t>(header.base.point.height) + 1 ||
+        header.anchor.next >= NO_NODE ||
+        header.anchor.live_nodes > header.anchor.next ||
+        header.anchor.point.height == std::numeric_limits<uint32_t>::max() ||
+        !minimum_index_capacity ||
+        !std::has_single_bit(header.index_capacity) ||
+        header.index_capacity < *minimum_index_capacity ||
+        header.index_capacity >
+            MaximumValidatedIndexCapacity(header.anchor.next) ||
+        header.index_entries >= header.index_capacity ||
+        header.free_nodes !=
+            static_cast<uint64_t>(header.anchor.next) -
+                header.anchor.live_nodes) {
+        return Result<ValidatedCacheHeader>::Err(
+            "validated startup cache fields are inconsistent");
+    }
+    return Result<ValidatedCacheHeader>::Ok(header);
+}
+
+bool SameBaseState(const OnlineSuperblock& left,
+                   const OnlineSuperblock& right)
+{
+    return left.format_version == right.format_version &&
+        left.generation == right.generation &&
+        left.base_lsn == right.base_lsn && left.point == right.point &&
+        left.num_leaves == right.num_leaves && left.next == right.next &&
+        left.live_nodes == right.live_nodes &&
+        left.capacity_slots == right.capacity_slots &&
+        left.chain_hash_count == right.chain_hash_count &&
+        left.roots == right.roots;
+}
+
+Result<uint64_t> WriteValidatedStartupCache(
+    const std::filesystem::path& directory, const OnlineSuperblock& base,
+    const ValidationAnchor& anchor, const NodeArena& arena,
+    const KeylessLeafIndex& index)
+{
+    const auto hashes_identity{ReadOwnedFileIdentity(
+        directory / "forest.hashes", "forest hashes")};
+    if (!hashes_identity) return Result<uint64_t>::Err(hashes_identity.Error());
+    const auto metadata_identity{ReadOwnedFileIdentity(
+        directory / "forest.meta", "forest metadata")};
+    if (!metadata_identity) {
+        return Result<uint64_t>::Err(metadata_identity.Error());
+    }
+    auto free_ids{arena.SortedFreeIds()};
+    const auto minimum_index_capacity{ValidatedIndexCapacity(index.Size())};
+    if (anchor.next != arena.Next() || anchor.live_nodes != arena.LiveCount() ||
+        anchor.live_nodes + free_ids.size() != anchor.next ||
+        !minimum_index_capacity ||
+        !std::has_single_bit(index.Capacity()) ||
+        index.Capacity() < *minimum_index_capacity ||
+        index.Capacity() > MaximumValidatedIndexCapacity(anchor.next)) {
+        return Result<uint64_t>::Err(
+            "cannot cache inconsistent validated online bookkeeping");
+    }
+    const ValidatedCacheHeader header{
+        .base = base,
+        .hashes_identity = hashes_identity.Value(),
+        .metadata_identity = metadata_identity.Value(),
+        .anchor = anchor,
+        .index_capacity = index.Capacity(),
+        .index_entries = index.Size(),
+        .free_nodes = free_ids.size(),
+    };
+    const auto header_bytes{SerializeValidatedCacheHeader(header)};
+    if (header_bytes.size() != VALIDATED_CACHE_HEADER_SIZE) {
+        return Result<uint64_t>::Err(
+            "validated startup cache header size changed unexpectedly");
+    }
+    if (header.index_entries >
+            (std::numeric_limits<uint64_t>::max() -
+             VALIDATED_CACHE_HEADER_SIZE - VALIDATED_CACHE_TRAILER_SIZE) /
+                VALIDATED_CACHE_ENTRY_SIZE ||
+        header.free_nodes >
+            (std::numeric_limits<uint64_t>::max() -
+             VALIDATED_CACHE_HEADER_SIZE - VALIDATED_CACHE_TRAILER_SIZE -
+             header.index_entries * VALIDATED_CACHE_ENTRY_SIZE) /
+                sizeof(NodeId)) {
+        return Result<uint64_t>::Err(
+            "validated startup cache size overflows");
+    }
+
+    const auto final_path{directory / VALIDATED_CACHE_NAME};
+    const std::filesystem::path temporary{final_path.string() + ".tmp"};
+    auto opened{CreateFreshTemporaryFile(
+        temporary, "validated startup cache temporary file")};
+    if (!opened) return Result<uint64_t>::Err(opened.Error());
+    uint64_t checksum{CHECKSUM_OFFSET};
+    ExtendChecksum(checksum, header_bytes);
+    auto written{WriteAll(opened.Value().Get(), header_bytes)};
+    if (!written) return Result<uint64_t>::Err(written.Error());
+
+    constexpr std::size_t BUFFER_BYTES{1024 * 1024};
+    std::vector<std::byte> buffer;
+    buffer.reserve(BUFFER_BYTES);
+    const auto flush = [&]() -> Result<void> {
+        if (buffer.empty()) return Result<void>::Ok();
+        ExtendChecksum(checksum, buffer);
+        auto result{WriteAll(opened.Value().Get(), buffer)};
+        buffer.clear();
+        return result;
+    };
+    Result<void> payload_result{Result<void>::Ok()};
+    uint64_t entries_written{0};
+    index.ForEachValidationEntry([&](NodeId id, uint32_t slot) {
+        if (!payload_result) return false;
+        AppendUnsigned(buffer, id);
+        AppendUnsigned(buffer, slot);
+        ++entries_written;
+        if (buffer.size() >= BUFFER_BYTES) payload_result = flush();
+        return static_cast<bool>(payload_result);
+    });
+    if (payload_result && entries_written != header.index_entries) {
+        payload_result = Result<void>::Err(
+            "validated leaf index changed while it was cached");
+    }
+    NodeId previous{NO_NODE};
+    for (const NodeId id : free_ids) {
+        if (!payload_result) break;
+        if (id >= anchor.next || (previous != NO_NODE && id <= previous)) {
+            payload_result = Result<void>::Err(
+                "validated free-node list is not sorted and unique");
+            break;
+        }
+        AppendUnsigned(buffer, id);
+        previous = id;
+        if (buffer.size() >= BUFFER_BYTES) payload_result = flush();
+    }
+    if (payload_result) payload_result = flush();
+    if (!payload_result) return Result<uint64_t>::Err(payload_result.Error());
+
+    std::vector<std::byte> trailer;
+    trailer.reserve(VALIDATED_CACHE_TRAILER_SIZE);
+    AppendUnsigned(trailer, checksum);
+    trailer.insert(trailer.end(), VALIDATED_CACHE_COMMIT.begin(),
+                   VALIDATED_CACHE_COMMIT.end());
+    written = WriteAll(opened.Value().Get(), trailer);
+    if (written) {
+        written = SyncDescriptor(opened.Value().Get(),
+                                 "validated startup cache");
+    }
+    if (!written) return Result<uint64_t>::Err(written.Error());
+    auto inspected{InspectOwnedRegularFile(
+        opened.Value().Get(), temporary,
+        "validated startup cache temporary file")};
+    if (!inspected) return Result<uint64_t>::Err(inspected.Error());
+    auto replaceable{ValidateReplaceableOwnedFile(
+        final_path, "validated startup cache")};
+    if (!replaceable) return Result<uint64_t>::Err(replaceable.Error());
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, final_path, rename_error);
+    if (rename_error) {
+        return Result<uint64_t>::Err(
+            "publish validated startup cache: " + rename_error.message());
+    }
+    inspected = InspectOwnedRegularFile(opened.Value().Get(), final_path,
+                                        "published validated startup cache");
+    if (!inspected) return Result<uint64_t>::Err(inspected.Error());
+    auto synced{SyncDirectory(directory)};
+    if (!synced) return Result<uint64_t>::Err(synced.Error());
+    return Result<uint64_t>::Ok(
+        VALIDATED_CACHE_HEADER_SIZE +
+        header.index_entries * VALIDATED_CACHE_ENTRY_SIZE +
+        header.free_nodes * sizeof(NodeId) +
+        VALIDATED_CACHE_TRAILER_SIZE);
+}
+
 std::filesystem::path DeltaPath(const std::filesystem::path& directory,
                                 uint64_t generation)
 {
@@ -2661,6 +3212,8 @@ public:
     uint64_t BaseLsn() const { return m_durable_lsn; }
     uint64_t PhysicalBaseLsn() const { return m_base.base_lsn; }
     uint64_t CurrentLsn() const { return m_current_lsn; }
+    uint64_t DeltaGenerationValue() const { return m_delta_generation; }
+    const OnlineSuperblock& PhysicalBase() const { return m_base; }
     uint64_t DurableLiveNodes() const { return m_durable_live_nodes; }
     uint64_t DeltaBytes() const { return m_delta_bytes; }
     uint64_t DeltaRuns() const { return m_delta_runs; }
@@ -2700,6 +3253,30 @@ public:
     bool LastFlushCompacted() const { return m_last_flush_compacted; }
     bool WalEnabled() const { return m_config.sync_wal; }
     bool IsPendingPublication() const { return m_publish_target.has_value(); }
+    uint64_t StartupCacheBytes() const { return m_startup_cache_bytes; }
+    uint64_t StartupCacheReplayedRecords() const
+    {
+        return m_startup_cache_replayed_records;
+    }
+    uint64_t StartupValidationUs() const { return m_startup_validation_us; }
+    bool StartupCacheHit() const { return m_startup_cache_hit; }
+    bool StartupFullScan() const { return m_startup_full_scan; }
+
+    void SetStartupValidation(uint64_t cache_bytes, uint64_t replayed_records,
+                              uint64_t elapsed_us, bool cache_hit,
+                              bool full_scan)
+    {
+        m_startup_cache_bytes = cache_bytes;
+        m_startup_cache_replayed_records = replayed_records;
+        m_startup_validation_us = elapsed_us;
+        m_startup_cache_hit = cache_hit;
+        m_startup_full_scan = full_scan;
+    }
+
+    void SetValidationCacheBytes(uint64_t cache_bytes)
+    {
+        m_startup_cache_bytes = cache_bytes;
+    }
 
     Result<void> Publish()
     {
@@ -3331,8 +3908,66 @@ private:
     uint64_t m_last_flush_compaction_input_records{0};
     uint64_t m_last_flush_compaction_output_records{0};
     bool m_last_flush_compacted{false};
+    uint64_t m_startup_cache_bytes{0};
+    uint64_t m_startup_cache_replayed_records{0};
+    uint64_t m_startup_validation_us{0};
+    bool m_startup_cache_hit{false};
+    bool m_startup_full_scan{false};
     OnlineStateLock m_lock;
     std::optional<std::filesystem::path> m_publish_target;
+};
+
+class NodeIdBits
+{
+public:
+    explicit NodeIdBits(uint64_t size)
+        : m_size{size}, m_words(static_cast<std::size_t>((size + 63) / 64), 0)
+    {
+    }
+
+    bool Test(NodeId id) const
+    {
+        return id < m_size &&
+            (m_words[id / 64] & (uint64_t{1} << (id % 64))) != 0;
+    }
+
+    void Set(NodeId id)
+    {
+        if (id < m_size) m_words[id / 64] |= uint64_t{1} << (id % 64);
+    }
+
+    void Clear(NodeId id)
+    {
+        if (id < m_size) m_words[id / 64] &= ~(uint64_t{1} << (id % 64));
+    }
+
+    uint64_t Count() const
+    {
+        uint64_t count{0};
+        for (const uint64_t word : m_words) {
+            count += static_cast<uint64_t>(std::popcount(word));
+        }
+        return count;
+    }
+
+    template <typename Callback>
+    void ForEachSet(Callback&& callback) const
+    {
+        for (std::size_t word_index{0}; word_index < m_words.size();
+             ++word_index) {
+            uint64_t word{m_words[word_index]};
+            while (word != 0) {
+                const auto bit{static_cast<unsigned>(std::countr_zero(word))};
+                const uint64_t raw_id{word_index * 64 + bit};
+                if (raw_id < m_size) callback(static_cast<NodeId>(raw_id));
+                word &= word - 1;
+            }
+        }
+    }
+
+private:
+    uint64_t m_size{0};
+    std::vector<uint64_t> m_words;
 };
 
 } // namespace
@@ -3340,6 +3975,14 @@ private:
 class PackedForest::Impl
 {
 public:
+    struct StartupCacheLoad {
+        bool hit{false};
+        bool base_anchored{false};
+        uint64_t bytes{0};
+        uint64_t replayed_records{0};
+        uint64_t index_capacity{0};
+    };
+
     Impl() : index{arena} { roots.fill(NO_NODE); }
 
     Result<void> Add(const Hash256& hash)
@@ -3507,11 +4150,16 @@ public:
         return Result<void>::Ok();
     }
 
-    Result<void> RebuildIndexAndValidate()
+    Result<void> RebuildIndexAndValidate(
+        std::optional<uint64_t> counted_leaves = std::nullopt)
     {
-        uint64_t leaf_count{0};
-        for (uint64_t raw_id{0}; raw_id < arena.Next(); ++raw_id) {
-            if (arena.Type(static_cast<NodeId>(raw_id)) == NodeType::LEAF) ++leaf_count;
+        uint64_t leaf_count{counted_leaves.value_or(0)};
+        if (!counted_leaves) {
+            for (uint64_t raw_id{0}; raw_id < arena.Next(); ++raw_id) {
+                if (arena.Type(static_cast<NodeId>(raw_id)) == NodeType::LEAF) {
+                    ++leaf_count;
+                }
+            }
         }
         const uint64_t required{std::max<uint64_t>(16, (leaf_count * 10 + 7) / 8)};
         if (required > std::numeric_limits<std::size_t>::max()) {
@@ -3549,6 +4197,238 @@ public:
         return Result<void>::Ok();
     }
 
+    Result<StartupCacheLoad> LoadValidatedStartupCache(
+        const std::filesystem::path& directory,
+        const OnlineSuperblock& base)
+    {
+        const auto miss = [] {
+            return Result<StartupCacheLoad>::Ok(StartupCacheLoad{});
+        };
+        const auto path{directory / VALIDATED_CACHE_NAME};
+        struct stat path_status{};
+        if (::lstat(path.c_str(), &path_status) != 0) {
+            if (errno == ENOENT) return miss();
+            return Result<StartupCacheLoad>::Err(
+                ErrnoMessage("inspect validated startup cache"));
+        }
+        auto opened{OpenOwnedRegularFile(
+            path, O_RDONLY | O_NONBLOCK, "validated startup cache")};
+        if (!opened) return Result<StartupCacheLoad>::Err(opened.Error());
+        struct stat status{};
+        if (::fstat(opened.Value().Get(), &status) != 0 || status.st_size < 0 ||
+            static_cast<uint64_t>(status.st_size) <
+                VALIDATED_CACHE_HEADER_SIZE + VALIDATED_CACHE_TRAILER_SIZE) {
+            return miss();
+        }
+
+        std::array<std::byte, VALIDATED_CACHE_HEADER_SIZE> header_bytes{};
+        auto read{PreadAll(opened.Value().Get(), header_bytes, 0)};
+        if (!read) return miss();
+        auto parsed{ParseValidatedCacheHeader(header_bytes)};
+        if (!parsed || !SameBaseState(parsed.Value().base, base)) return miss();
+        const auto& header{parsed.Value()};
+        auto hashes_identity{ReadOwnedFileIdentity(
+            directory / "forest.hashes", "forest hashes")};
+        if (!hashes_identity) {
+            return Result<StartupCacheLoad>::Err(hashes_identity.Error());
+        }
+        auto metadata_identity{ReadOwnedFileIdentity(
+            directory / "forest.meta", "forest metadata")};
+        if (!metadata_identity) {
+            return Result<StartupCacheLoad>::Err(metadata_identity.Error());
+        }
+        if (hashes_identity.Value() != header.hashes_identity ||
+            metadata_identity.Value() != header.metadata_identity) {
+            return miss();
+        }
+        const uint64_t expected_size{
+            VALIDATED_CACHE_HEADER_SIZE +
+            header.index_entries * VALIDATED_CACHE_ENTRY_SIZE +
+            header.free_nodes * sizeof(NodeId) +
+            VALIDATED_CACHE_TRAILER_SIZE};
+        if (static_cast<uint64_t>(status.st_size) != expected_size) return miss();
+
+        std::size_t first_patch_run{0};
+        bool anchor_matches{false};
+        if (header.anchor.generation == 0) {
+            anchor_matches = header.anchor.lsn == base.base_lsn &&
+                header.anchor.point == base.point &&
+                header.anchor.num_leaves == base.num_leaves &&
+                header.anchor.next == base.next &&
+                header.anchor.live_nodes == base.live_nodes &&
+                header.anchor.roots == base.roots;
+        } else {
+            const auto& runs{arena.DeltaRuns()};
+            for (std::size_t run_index{0}; run_index < runs.size(); ++run_index) {
+                const auto& state{runs[run_index]->State()};
+                if (state.generation != header.anchor.generation) continue;
+                anchor_matches = header.anchor.lsn == state.end_lsn &&
+                    header.anchor.point == state.point &&
+                    header.anchor.num_leaves == state.num_leaves &&
+                    header.anchor.next == state.next &&
+                    header.anchor.live_nodes == state.live_nodes &&
+                    header.anchor.roots == state.roots;
+                first_patch_run = run_index + 1;
+                break;
+            }
+        }
+        if (!anchor_matches) return miss();
+
+        const uint64_t current_next{arena.Next()};
+        if (current_next >= NO_NODE) return miss();
+        NodeIdBits changed{current_next};
+        NodeIdBits dirty{current_next};
+        uint64_t replayed_records{0};
+        arena.ForEachLatestDeltaRecordFrom(first_patch_run,
+            [&](NodeId id, const NodeRecord&) {
+                changed.Set(id);
+                ++replayed_records;
+                return true;
+            });
+        const auto dirty_ids{arena.SortedVisibleDirtyIds()};
+        for (const NodeId id : dirty_ids) {
+            changed.Set(id);
+            dirty.Set(id);
+            ++replayed_records;
+        }
+
+        NodeIdBits seen_anchor_leaves{header.anchor.next};
+        NodeIdBits free_nodes{current_next};
+        index.Clear(static_cast<std::size_t>(header.index_capacity));
+        uint64_t checksum{CHECKSUM_OFFSET};
+        ExtendChecksum(checksum, header_bytes);
+        uint64_t offset{VALIDATED_CACHE_HEADER_SIZE};
+        constexpr uint64_t RECORDS_PER_READ{16 * 1024};
+        std::vector<std::byte> buffer;
+        uint64_t remaining{header.index_entries};
+        uint64_t entries_read{0};
+        while (remaining != 0) {
+            const uint64_t records{std::min<uint64_t>(remaining,
+                                                      RECORDS_PER_READ)};
+            buffer.resize(static_cast<std::size_t>(
+                records * VALIDATED_CACHE_ENTRY_SIZE));
+            read = PreadAll(opened.Value().Get(), buffer, offset);
+            if (!read) return miss();
+            ExtendChecksum(checksum, buffer);
+            ByteReader reader{buffer};
+            for (uint64_t record{0}; record < records; ++record) {
+                NodeId id{NO_NODE};
+                uint32_t slot{0};
+                if (!reader.ReadUnsigned(id) || !reader.ReadUnsigned(slot) ||
+                    id >= header.anchor.next || seen_anchor_leaves.Test(id)) {
+                    return miss();
+                }
+                seen_anchor_leaves.Set(id);
+                if (!index.LoadValidationSlot(
+                        slot, id, id >= current_next || changed.Test(id))) {
+                    return miss();
+                }
+                ++entries_read;
+            }
+            if (!reader.Done()) return miss();
+            offset += buffer.size();
+            remaining -= records;
+        }
+        if (entries_read != header.index_entries) return miss();
+
+        remaining = header.free_nodes;
+        NodeId previous_free{NO_NODE};
+        uint64_t free_read{0};
+        while (remaining != 0) {
+            const uint64_t records{std::min<uint64_t>(remaining,
+                                                      RECORDS_PER_READ)};
+            buffer.resize(static_cast<std::size_t>(records * sizeof(NodeId)));
+            read = PreadAll(opened.Value().Get(), buffer, offset);
+            if (!read) return miss();
+            ExtendChecksum(checksum, buffer);
+            ByteReader reader{buffer};
+            for (uint64_t record{0}; record < records; ++record) {
+                NodeId id{NO_NODE};
+                if (!reader.ReadUnsigned(id) || id >= header.anchor.next ||
+                    (previous_free != NO_NODE && id <= previous_free) ||
+                    seen_anchor_leaves.Test(id)) {
+                    return miss();
+                }
+                if (id < current_next) free_nodes.Set(id);
+                previous_free = id;
+                ++free_read;
+            }
+            if (!reader.Done()) return miss();
+            offset += buffer.size();
+            remaining -= records;
+        }
+        if (free_read != header.free_nodes) return miss();
+
+        std::array<std::byte, VALIDATED_CACHE_TRAILER_SIZE> trailer{};
+        read = PreadAll(opened.Value().Get(), trailer, offset);
+        if (!read) return miss();
+        ByteReader trailer_reader{trailer};
+        uint64_t expected_checksum{0};
+        std::array<std::byte, VALIDATED_CACHE_COMMIT.size()> commit{};
+        if (!trailer_reader.ReadUnsigned(expected_checksum) ||
+            !trailer_reader.ReadBytes(commit) || !trailer_reader.Done() ||
+            commit != VALIDATED_CACHE_COMMIT || expected_checksum != checksum) {
+            return miss();
+        }
+
+        if (!index.RepairValidationDeletions()) return miss();
+
+        for (uint64_t raw_id{header.anchor.next}; raw_id < current_next;
+             ++raw_id) {
+            free_nodes.Set(static_cast<NodeId>(raw_id));
+        }
+        bool index_valid{true};
+        arena.ForEachLatestDeltaRecordFrom(first_patch_run,
+            [&](NodeId id, const NodeRecord& record) {
+                if (record.type == NodeType::FREE) free_nodes.Set(id);
+                else free_nodes.Clear(id);
+                if (record.type == NodeType::LEAF && !dirty.Test(id)) {
+                    index_valid = index.InsertValidationHome(
+                        KeylessLeafIndex::ValidationHome(record.hash), id);
+                }
+                return index_valid;
+            });
+        if (!index_valid) return miss();
+        for (const NodeId id : dirty_ids) {
+            const NodeRecord& record{arena.DirtyRecord(id)};
+            if (record.type == NodeType::FREE) free_nodes.Set(id);
+            else free_nodes.Clear(id);
+            if (record.type == NodeType::LEAF &&
+                !index.InsertValidationHome(
+                    KeylessLeafIndex::ValidationHome(record.hash), id)) {
+                return miss();
+            }
+        }
+        const auto current_minimum_capacity{
+            ValidatedIndexCapacity(index.Size())};
+        if (!current_minimum_capacity ||
+            index.Capacity() < *current_minimum_capacity) {
+            return miss();
+        }
+
+        std::vector<NodeId> free_ids;
+        free_ids.reserve(static_cast<std::size_t>(free_nodes.Count()));
+        free_nodes.ForEachSet(
+            [&](NodeId id) { free_ids.push_back(id); });
+        auto bookkeeping{arena.LoadBookkeeping(
+            static_cast<NodeId>(current_next), std::move(free_ids))};
+        if (!bookkeeping) return miss();
+        for (const NodeId root : roots) {
+            if (root != NO_NODE &&
+                (root >= arena.Next() || !arena.Live(root) ||
+                 arena.Parent(root) != NO_NODE)) {
+                return miss();
+            }
+        }
+        return Result<StartupCacheLoad>::Ok(StartupCacheLoad{
+            .hit = true,
+            .base_anchored = header.anchor.generation == 0,
+            .bytes = expected_size,
+            .replayed_records = replayed_records,
+            .index_capacity = header.index_capacity,
+        });
+    }
+
     Result<void> ApplyPhysicalChanges(std::span<const NodeArena::NodeChange> changes,
                                       bool use_after, NodeId next)
     {
@@ -3574,6 +4454,8 @@ public:
     std::array<NodeId, 64> roots{};
     uint64_t num_leaves{0};
     std::unique_ptr<OnlineStore> online;
+    uint64_t validated_cache_capacity{0};
+    bool validated_cache_base_anchored{false};
 };
 
 PackedForest::PackedForest() : m_impl{std::make_unique<Impl>()} {}
@@ -3864,6 +4746,19 @@ Result<void> PackedForest::EnableOnline(const std::filesystem::path& directory,
     };
     auto state_written{WriteSuperblock(temporary, state)};
     if (!state_written) return state_written;
+    auto cache_written{WriteValidatedStartupCache(
+        temporary, state,
+        ValidationAnchor{
+            .generation = 0,
+            .lsn = state.base_lsn,
+            .point = state.point,
+            .num_leaves = state.num_leaves,
+            .next = state.next,
+            .live_nodes = state.live_nodes,
+            .roots = state.roots,
+        },
+        m_impl->arena, m_impl->index)};
+    if (!cache_written) return Result<void>::Err(cache_written.Error());
 
     std::error_code rename_error;
     std::filesystem::rename(temporary, directory, rename_error);
@@ -3880,6 +4775,9 @@ Result<void> PackedForest::EnableOnline(const std::filesystem::path& directory,
     std::vector<Hash256> chain_copy{chain_hashes.begin(), chain_hashes.end()};
     m_impl->online = std::make_unique<OnlineStore>(directory, config, state,
         std::move(chain_copy), prepared.ReleaseLock());
+    m_impl->validated_cache_capacity = m_impl->index.Capacity();
+    m_impl->validated_cache_base_anchored = true;
+    m_impl->online->SetValidationCacheBytes(cache_written.Value());
     return Result<void>::Ok();
 }
 
@@ -3967,7 +4865,7 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
                                                 directory / "forest.meta",
                                                 state.Value().capacity_slots,
                                                 state.Value().next,
-                                                !restore_base, restore_base)};
+                                                false, restore_base)};
     if (!mapped) return Result<PackedForest>::Err(mapped.Error());
     if (restore_base) {
         auto restored{forest.m_impl->arena.RestoreBase(
@@ -3979,8 +4877,6 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
         auto read_only{forest.m_impl->arena.ReopenBaseReadOnly(
             directory / "forest.hashes", directory / "forest.meta")};
         if (!read_only) return Result<PackedForest>::Err(read_only.Error());
-        auto bookkeeping{forest.m_impl->arena.RebuildBookkeeping()};
-        if (!bookkeeping) return Result<PackedForest>::Err(bookkeeping.Error());
     }
     auto online{std::make_unique<OnlineStore>(directory, config, state.Value(),
                                                std::move(recovered_chain),
@@ -3994,15 +4890,70 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
     auto recovered{online->Recover(forest.m_impl->arena, forest.m_impl->roots,
                                    forest.m_impl->num_leaves)};
     if (!recovered) return Result<PackedForest>::Err(recovered.Error());
-    auto bookkeeping{forest.m_impl->arena.RebuildBookkeeping()};
-    if (!bookkeeping) return Result<PackedForest>::Err(bookkeeping.Error());
-    if (online->CurrentLsn() == online->BaseLsn() &&
-        forest.m_impl->arena.LiveCount() != online->DurableLiveNodes()) {
-        return Result<PackedForest>::Err(
-            "online arena live-node count does not match its durable state");
+    const auto validation_start{std::chrono::steady_clock::now()};
+    auto cache_loaded{forest.m_impl->LoadValidatedStartupCache(
+        directory, state.Value())};
+    if (!cache_loaded) {
+        return Result<PackedForest>::Err(cache_loaded.Error());
     }
-    auto rebuilt{forest.m_impl->RebuildIndexAndValidate()};
-    if (!rebuilt) return Result<PackedForest>::Err(rebuilt.Error());
+    bool cache_hit{cache_loaded.Value().hit};
+    if (cache_hit && online->CurrentLsn() == online->BaseLsn() &&
+        forest.m_impl->arena.LiveCount() != online->DurableLiveNodes()) {
+        cache_hit = false;
+    }
+    bool full_scan{false};
+    uint64_t cache_bytes{cache_loaded.Value().bytes};
+    uint64_t replayed_records{cache_loaded.Value().replayed_records};
+    uint64_t cache_capacity{
+        cache_hit ? cache_loaded.Value().index_capacity : 0};
+    bool cache_base_anchored{
+        cache_hit && cache_loaded.Value().base_anchored};
+    if (!cache_hit) {
+        auto bookkeeping{
+            forest.m_impl->arena.RebuildBookkeepingAndCountLeaves()};
+        if (!bookkeeping) {
+            return Result<PackedForest>::Err(bookkeeping.Error());
+        }
+        if (online->CurrentLsn() == online->BaseLsn() &&
+            forest.m_impl->arena.LiveCount() != online->DurableLiveNodes()) {
+            return Result<PackedForest>::Err(
+                "online arena live-node count does not match its durable state");
+        }
+        auto rebuilt{forest.m_impl->RebuildIndexAndValidate(
+            bookkeeping.Value())};
+        if (!rebuilt) return Result<PackedForest>::Err(rebuilt.Error());
+        full_scan = true;
+
+        // A cache is derived state. Failure to publish it must not make an
+        // otherwise valid forest unavailable. WAL-replayed dirty state is not
+        // cached until it has first been sealed into a delta.
+        if (online->CurrentLsn() == online->BaseLsn() &&
+            forest.m_impl->arena.DirtyNodes() == 0) {
+            auto saved{WriteValidatedStartupCache(
+                directory, online->PhysicalBase(),
+                ValidationAnchor{
+                    .generation = online->DeltaGenerationValue(),
+                    .lsn = online->BaseLsn(),
+                    .point = online->Point(),
+                    .num_leaves = forest.m_impl->num_leaves,
+                    .next = static_cast<NodeId>(forest.m_impl->arena.Next()),
+                    .live_nodes = forest.m_impl->arena.LiveCount(),
+                    .roots = forest.m_impl->roots,
+                },
+                forest.m_impl->arena, forest.m_impl->index)};
+            if (saved) {
+                cache_bytes = saved.Value();
+                cache_capacity = forest.m_impl->index.Capacity();
+                cache_base_anchored =
+                    online->DeltaGenerationValue() == 0;
+            }
+        }
+    }
+    online->SetStartupValidation(
+        cache_bytes, replayed_records, ElapsedMicros(validation_start),
+        cache_hit, full_scan);
+    forest.m_impl->validated_cache_capacity = cache_capacity;
+    forest.m_impl->validated_cache_base_anchored = cache_base_anchored;
     chain_hashes = online->ChainHashes();
     point = online->Point();
     if (chain_hashes.size() != static_cast<std::size_t>(point.height) + 1 ||
@@ -4029,8 +4980,36 @@ Result<void> PackedForest::FlushOnline()
         m_impl->online->BaseLsn() == m_impl->online->CurrentLsn()) {
         return Result<void>::Ok();
     }
-    return m_impl->online->SealDelta(m_impl->arena, m_impl->roots,
-                                     m_impl->num_leaves);
+    auto sealed{m_impl->online->SealDelta(m_impl->arena, m_impl->roots,
+                                          m_impl->num_leaves)};
+    if (!sealed) return sealed;
+    const bool refresh_cache{
+        m_impl->validated_cache_capacity != m_impl->index.Capacity() ||
+        (!m_impl->validated_cache_base_anchored &&
+         m_impl->online->LastFlushCompacted())};
+    if (!refresh_cache) return Result<void>::Ok();
+
+    auto saved{WriteValidatedStartupCache(
+        m_impl->online->Directory(), m_impl->online->PhysicalBase(),
+        ValidationAnchor{
+            .generation = m_impl->online->DeltaGenerationValue(),
+            .lsn = m_impl->online->BaseLsn(),
+            .point = m_impl->online->Point(),
+            .num_leaves = m_impl->num_leaves,
+            .next = static_cast<NodeId>(m_impl->arena.Next()),
+            .live_nodes = m_impl->arena.LiveCount(),
+            .roots = m_impl->roots,
+        },
+        m_impl->arena, m_impl->index)};
+    if (!saved) {
+        m_impl->validated_cache_capacity = 0;
+        return Result<void>::Ok();
+    }
+    m_impl->validated_cache_capacity = m_impl->index.Capacity();
+    m_impl->validated_cache_base_anchored =
+        m_impl->online->DeltaGenerationValue() == 0;
+    m_impl->online->SetValidationCacheBytes(saved.Value());
+    return Result<void>::Ok();
 }
 
 Result<ChainPoint> PackedForest::RollbackOnlineBlock()
@@ -4114,6 +5093,12 @@ OnlineForestUsage PackedForest::OnlineUsage() const
         .delta_records = m_impl->online->DeltaRecords(),
         .delta_unique_records = m_impl->online->DeltaUniqueRecords(),
         .delta_obsolete_records = m_impl->online->DeltaObsoleteRecords(),
+        .startup_cache_bytes = m_impl->online->StartupCacheBytes(),
+        .startup_cache_replayed_records =
+            m_impl->online->StartupCacheReplayedRecords(),
+        .startup_validation_us = m_impl->online->StartupValidationUs(),
+        .startup_cache_hit = m_impl->online->StartupCacheHit(),
+        .startup_full_scan = m_impl->online->StartupFullScan(),
         .dirty_nodes = m_impl->arena.DirtyNodes(),
         .dirty_bytes = m_impl->arena.DirtyBytes(),
         .wal_bytes = m_impl->online->WalBytes(),
@@ -4471,10 +5456,26 @@ Result<PackedForest> ReadForestOnline(std::istream& input,
     }
     auto rebuilt{forest.m_impl->RebuildIndexAndValidate()};
     if (!rebuilt) return fail(rebuilt.Error());
+    auto cache_written{WriteValidatedStartupCache(
+        temporary, state,
+        ValidationAnchor{
+            .generation = 0,
+            .lsn = state.base_lsn,
+            .point = state.point,
+            .num_leaves = state.num_leaves,
+            .next = state.next,
+            .live_nodes = state.live_nodes,
+            .roots = state.roots,
+        },
+        forest.m_impl->arena, forest.m_impl->index)};
+    if (!cache_written) return fail(cache_written.Error());
 
     std::vector<Hash256> chain_copy{chain_hashes.begin(), chain_hashes.end()};
     forest.m_impl->online = std::make_unique<OnlineStore>(temporary, config, state,
         std::move(chain_copy), prepared.ReleaseLock(), directory);
+    forest.m_impl->validated_cache_capacity = forest.m_impl->index.Capacity();
+    forest.m_impl->validated_cache_base_anchored = true;
+    forest.m_impl->online->SetValidationCacheBytes(cache_written.Value());
     if (!config.defer_publish) {
         auto published{forest.PublishOnline()};
         if (!published) return Result<PackedForest>::Err(published.Error());

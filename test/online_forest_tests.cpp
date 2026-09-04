@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -54,6 +55,12 @@ std::filesystem::path WalPath(const std::filesystem::path& directory)
         if (name.starts_with("wal-") && name.ends_with(".log")) return entry.path();
     }
     return {};
+}
+
+std::filesystem::path ValidatedCachePath(
+    const std::filesystem::path& directory)
+{
+    return directory / "validated-state.cache";
 }
 
 std::filesystem::path DeltaPathForTest(const std::filesystem::path& directory,
@@ -182,6 +189,116 @@ struct TestDelta {
 TEST(online_forest_defaults_to_wal_free_overlay)
 {
     CHECK(!OnlineForestConfig{}.sync_wal);
+}
+
+TEST(online_forest_reuses_validated_startup_cache_and_replays_newer_state)
+{
+    const auto path{OnlinePath("validated-startup-cache")};
+    Cleanup(path);
+    const Hash256 genesis{OnlineHash64(890'000)};
+    const Hash256 block_one{OnlineHash64(890'001)};
+    const ChainPoint genesis_point{0, genesis};
+    const ChainPoint next_point{1, block_one};
+    const std::array<Hash256, 1> base_chain{genesis};
+    const std::array<Hash256, 8> initial{
+        OnlineHash64(891), OnlineHash64(892), OnlineHash64(893),
+        OnlineHash64(894), OnlineHash64(895), OnlineHash64(896),
+        OnlineHash64(897), OnlineHash64(898)};
+    const std::array<Hash256, 2> deletions{initial[1], initial[6]};
+    const std::array<Hash256, 2> additions{
+        OnlineHash64(899), OnlineHash64(900)};
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = true,
+    };
+
+    PackedForest reference;
+    CHECK(reference.Modify(initial, {}));
+    std::vector<Hash256> live{initial.begin(), initial.end()};
+    {
+        PackedForest online;
+        CHECK(online.Modify(initial, {}));
+        CHECK(online.EnableOnline(path, genesis_point, base_chain, config));
+    }
+
+    const auto cache_path{ValidatedCachePath(path)};
+    CHECK(std::filesystem::is_regular_file(cache_path));
+    const uint64_t initial_cache_bytes{std::filesystem::file_size(cache_path)};
+    CHECK(initial_cache_bytes > 0U);
+
+    {
+        auto online{ReopenOnline(path, base_chain, genesis_point, config)};
+        const auto usage{online.OnlineUsage()};
+        CHECK(usage.startup_cache_hit);
+        CHECK(!usage.startup_full_scan);
+        CHECK_EQ(usage.startup_cache_replayed_records, 0U);
+        CHECK_EQ(usage.startup_cache_bytes, initial_cache_bytes);
+        CheckEquivalent(reference, online, live);
+
+        CHECK(online.ModifyBlock(additions, deletions, next_point));
+        CHECK(reference.Modify(additions, deletions));
+        std::erase(live, deletions[0]);
+        std::erase(live, deletions[1]);
+        live.insert(live.end(), additions.begin(), additions.end());
+    }
+
+    const std::array<Hash256, 2> next_chain{genesis, block_one};
+    {
+        auto online{ReopenOnline(path, next_chain, next_point, config)};
+        const auto usage{online.OnlineUsage()};
+        CHECK(usage.startup_cache_hit);
+        CHECK(!usage.startup_full_scan);
+        CHECK(usage.startup_cache_replayed_records > 0U);
+        CheckEquivalent(reference, online, live);
+        CHECK(online.FlushOnline());
+    }
+    {
+        auto online{ReopenOnline(path, next_chain, next_point, config)};
+        const auto usage{online.OnlineUsage()};
+        CHECK(usage.startup_cache_hit);
+        CHECK(!usage.startup_full_scan);
+        CHECK(usage.startup_cache_replayed_records > 0U);
+        CheckEquivalent(reference, online, live);
+    }
+
+    FlipByte(cache_path, 824);
+    {
+        auto online{ReopenOnline(path, next_chain, next_point, config)};
+        const auto usage{online.OnlineUsage()};
+        CHECK(!usage.startup_cache_hit);
+        CHECK(usage.startup_full_scan);
+        CheckEquivalent(reference, online, live);
+    }
+    {
+        auto online{ReopenOnline(path, next_chain, next_point, config)};
+        CHECK(online.OnlineUsage().startup_cache_hit);
+        CHECK(!online.OnlineUsage().startup_full_scan);
+        CHECK_EQ(online.OnlineUsage().startup_cache_replayed_records, 0U);
+        CheckEquivalent(reference, online, live);
+    }
+
+    CHECK(std::filesystem::remove(cache_path));
+    {
+        auto online{ReopenOnline(path, next_chain, next_point, config)};
+        CHECK(!online.OnlineUsage().startup_cache_hit);
+        CHECK(online.OnlineUsage().startup_full_scan);
+        CHECK(std::filesystem::is_regular_file(cache_path));
+        CheckEquivalent(reference, online, live);
+    }
+
+    const auto hashes_path{path / "forest.hashes"};
+    const auto modified{std::filesystem::last_write_time(hashes_path) -
+                        std::chrono::seconds{2}};
+    std::filesystem::last_write_time(hashes_path, modified);
+    {
+        auto online{ReopenOnline(path, next_chain, next_point, config)};
+        CHECK(!online.OnlineUsage().startup_cache_hit);
+        CHECK(online.OnlineUsage().startup_full_scan);
+        CheckEquivalent(reference, online, live);
+    }
+    Cleanup(path);
 }
 
 TEST(online_forest_switch_wal_recovery_and_delta_seal)
@@ -693,7 +810,8 @@ TEST(online_forest_rejects_hard_linked_owned_files_on_recovery)
     }
     const std::vector<std::string> owned_names{
         "LOCK", "FORMAT", "state.0", "chain.0.hashes", "forest.hashes",
-        "forest.meta", DeltaPathForTest(path, 1).filename().string()};
+        "forest.meta", "validated-state.cache",
+        DeltaPathForTest(path, 1).filename().string()};
     for (const std::string& name : owned_names) {
         std::filesystem::create_hard_link(path / name, external);
         const auto size{std::filesystem::file_size(external)};
@@ -857,6 +975,8 @@ TEST(online_forest_randomized_differential_reopen_flush_and_proofs)
             if (height % 20 == 0) CHECK(online.FlushOnline());
             online = PackedForest{};
             online = ReopenOnline(path, chain, point, config);
+            CHECK(online.OnlineUsage().startup_cache_hit);
+            CHECK(!online.OnlineUsage().startup_full_scan);
             CheckEquivalent(reference, online, live);
         }
     }
@@ -864,6 +984,8 @@ TEST(online_forest_randomized_differential_reopen_flush_and_proofs)
     CHECK_EQ(online.OnlineUsage().base_lsn, 120U);
     online = PackedForest{};
     online = ReopenOnline(path, chain, ChainPoint{120, chain.back()}, config);
+    CHECK(online.OnlineUsage().startup_cache_hit);
+    CHECK(!online.OnlineUsage().startup_full_scan);
     CheckEquivalent(reference, online, live);
     Cleanup(path);
 }
