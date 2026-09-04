@@ -20,7 +20,7 @@ configure_file(
     @ONLY)
 
 option(UTREEXO_BUILD_RPC "Build the Bitcoin Core JSON-RPC adapter" ON)
-option(UTREEXO_BUILD_BENCHMARKS "Build deterministic resource estimation tools" ON)
+option(UTREEXO_BUILD_BENCHMARKS "Build deterministic resource and storage benchmarks" ON)
 option(UTREEXO_BUILD_FUZZERS "Build libFuzzer targets (requires Clang)" OFF)
 option(UTREEXO_ENABLE_REGTEST_INTEGRATION "Enable external Core/bridge/Floresta differential test" OFF)
 option(UTREEXO_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
@@ -111,6 +111,11 @@ if(UTREEXO_BUILD_BENCHMARKS)
     add_executable(utreexo-resource-estimate bench/resource_estimate.cpp)
     target_compile_features(utreexo-resource-estimate PRIVATE cxx_std_20)
     utreexo_configure_target(utreexo-resource-estimate)
+
+    add_executable(utreexo-online-storage-benchmark bench/online_storage.cpp)
+    target_link_libraries(utreexo-online-storage-benchmark PRIVATE utreexo_accumulator)
+    target_compile_features(utreexo-online-storage-benchmark PRIVATE cxx_std_20)
+    utreexo_configure_target(utreexo-online-storage-benchmark)
 endif()
 
 if(UTREEXO_BUILD_RPC)
@@ -207,6 +212,12 @@ if(BUILD_TESTING)
     set_tests_properties(checkpoint_compact_safety_tests PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 120)
 
+    if(UTREEXO_BUILD_BENCHMARKS)
+        add_test(NAME online_storage_benchmark_smoke
+            COMMAND utreexo-online-storage-benchmark 2048 64 8 8)
+        set_tests_properties(online_storage_benchmark_smoke PROPERTIES TIMEOUT 120)
+    endif()
+
     if(UTREEXO_BUILD_RPC)
         add_executable(utreexo_rpc_tests
             test/test_main.cpp
@@ -241,7 +252,7 @@ endif()
 install(TARGETS utreexo-checkpoint-compact
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(UTREEXO_BUILD_BENCHMARKS)
-    install(TARGETS utreexo-resource-estimate
+    install(TARGETS utreexo-resource-estimate utreexo-online-storage-benchmark
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(UTREEXO_BUILD_RPC)
