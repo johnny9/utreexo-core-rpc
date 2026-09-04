@@ -8,6 +8,7 @@ import hashlib
 import http.client
 import json
 import pathlib
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -20,10 +21,15 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "contrib" / "checkpoints" / "mainnet-943013.json"
 CHUNK_BYTES = 1024 * 1024
 PROGRESS_BYTES = 1024 * 1024 * 1024
+RANGE_BYTES = 128 * 1024 * 1024
 
 
 class VerificationError(RuntimeError):
     """The remote object does not match the authenticated manifest."""
+
+
+class RetryableDownloadError(RuntimeError):
+    """One bounded range could not be read completely."""
 
 
 def validate_https_url(value: object) -> str:
@@ -135,52 +141,161 @@ def verify_download(
     expected_sha256: str,
     timeout_seconds: float,
     max_redirects: int,
+    max_retries: int = 5,
+    range_bytes: int = RANGE_BYTES,
 ) -> tuple[int, str]:
     validate_https_url(url)
+    if max_retries < 0:
+        raise VerificationError("max_retries must not be negative")
+    if range_bytes <= 0:
+        raise VerificationError("range_bytes must be positive")
     redirect_handler = BoundedHTTPSRedirectHandler(max_redirects)
     opener = urllib.request.build_opener(redirect_handler)
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept-Encoding": "identity",
-            "User-Agent": "utreexo-bridge-release-verifier/1",
-        },
-    )
-    try:
-        with opener.open(request, timeout=timeout_seconds) as response:
-            final_url = response.geturl()
-            validate_https_url(final_url)
-            status = response.getcode()
-            if status != 200:
-                raise VerificationError(
-                    f"checkpoint download returned HTTP status {status}"
-                )
-            content_length = response.headers.get("Content-Length")
-            if content_length is not None:
-                try:
-                    advertised_size = int(content_length, 10)
-                except ValueError as error:
-                    raise VerificationError(
-                        "checkpoint response has an invalid Content-Length"
-                    ) from error
-                if advertised_size != expected_size:
-                    raise VerificationError(
-                        "checkpoint Content-Length mismatch: "
-                        f"expected {expected_size}, got {advertised_size}"
-                    )
-
-            return verify_stream(
-                response,
-                expected_size,
-                expected_sha256,
-                lambda count: print(
-                    f"verified {count} checkpoint bytes...", file=sys.stderr
-                ),
+    digest = hashlib.sha256()
+    total = 0
+    next_progress = PROGRESS_BYTES
+    while total < expected_size:
+        first = total
+        last = min(expected_size, first + range_bytes) - 1
+        expected_range_size = last - first + 1
+        range_complete = False
+        last_retry_error: Exception | None = None
+        for attempt in range(max_retries + 1):
+            redirect_handler.redirects = 0
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "Accept-Encoding": "identity",
+                    "Range": f"bytes={first}-{last}",
+                    "User-Agent": "utreexo-bridge-release-verifier/1",
+                },
             )
-    except VerificationError:
-        raise
-    except (OSError, http.client.HTTPException, urllib.error.URLError) as error:
-        raise VerificationError(f"checkpoint download failed: {error}") from error
+            candidate = digest.copy()
+            range_size = 0
+            try:
+                with opener.open(request, timeout=timeout_seconds) as response:
+                    validate_https_url(response.geturl())
+                    status = response.getcode()
+
+                    # Some endpoints ignore an initial Range header. Retain
+                    # support for their complete 200 response, but any resumed
+                    # request must start at the exact authenticated offset.
+                    if status == 200 and first == 0:
+                        content_length = response.headers.get("Content-Length")
+                        if content_length is not None:
+                            try:
+                                advertised_size = int(content_length, 10)
+                            except ValueError as error:
+                                raise VerificationError(
+                                    "checkpoint response has an invalid Content-Length"
+                                ) from error
+                            if advertised_size != expected_size:
+                                raise VerificationError(
+                                    "checkpoint Content-Length mismatch: "
+                                    f"expected {expected_size}, got {advertised_size}"
+                                )
+                        return verify_stream(
+                            response,
+                            expected_size,
+                            expected_sha256,
+                            lambda count: print(
+                                f"verified {count} checkpoint bytes...",
+                                file=sys.stderr,
+                            ),
+                        )
+                    if status != 206:
+                        raise VerificationError(
+                            f"checkpoint range returned HTTP status {status}"
+                        )
+
+                    content_range = response.headers.get("Content-Range")
+                    match = re.fullmatch(
+                        r"bytes ([0-9]+)-([0-9]+)/([0-9]+)",
+                        content_range or "",
+                    )
+                    if match is None:
+                        raise VerificationError(
+                            "checkpoint response has an invalid Content-Range"
+                        )
+                    advertised_first, advertised_last, advertised_total = (
+                        int(value, 10) for value in match.groups()
+                    )
+                    if (
+                        advertised_first != first
+                        or advertised_last != last
+                        or advertised_total != expected_size
+                    ):
+                        raise VerificationError(
+                            "checkpoint Content-Range does not match the request"
+                        )
+
+                    content_length = response.headers.get("Content-Length")
+                    if content_length is not None:
+                        try:
+                            advertised_size = int(content_length, 10)
+                        except ValueError as error:
+                            raise VerificationError(
+                                "checkpoint response has an invalid Content-Length"
+                            ) from error
+                        if advertised_size != expected_range_size:
+                            raise VerificationError(
+                                "checkpoint range Content-Length mismatch: "
+                                f"expected {expected_range_size}, got {advertised_size}"
+                            )
+
+                    while range_size < expected_range_size:
+                        chunk = response.read(
+                            min(CHUNK_BYTES, expected_range_size - range_size)
+                        )
+                        if not chunk:
+                            raise RetryableDownloadError(
+                                "checkpoint range ended before its declared size"
+                            )
+                        range_size += len(chunk)
+                        candidate.update(chunk)
+                    if response.read(1):
+                        raise VerificationError(
+                            "checkpoint range is larger than its declared size"
+                        )
+            except VerificationError:
+                raise
+            except (
+                OSError,
+                RetryableDownloadError,
+                http.client.HTTPException,
+                urllib.error.URLError,
+            ) as error:
+                last_retry_error = error
+                if attempt == max_retries:
+                    break
+                print(
+                    "checkpoint range retry: "
+                    f"bytes={first}-{last} attempt={attempt + 2} error={error}",
+                    file=sys.stderr,
+                )
+                continue
+
+            digest = candidate
+            total += range_size
+            range_complete = True
+            if total >= next_progress:
+                print(f"verified {total} checkpoint bytes...", file=sys.stderr)
+                next_progress = ((total // PROGRESS_BYTES) + 1) * PROGRESS_BYTES
+            break
+
+        if not range_complete:
+            raise VerificationError(
+                "checkpoint download failed after retries: "
+                f"bytes={first}-{last} error={last_retry_error}"
+            )
+
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise VerificationError(
+            "checkpoint SHA-256 mismatch: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+    return total, actual_sha256
 
 
 def main() -> int:
@@ -203,11 +318,19 @@ def main() -> int:
         default=5,
         help="maximum HTTPS redirects (default: 5)",
     )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="maximum retries for each checkpoint range (default: 5)",
+    )
     args = parser.parse_args()
     if not 0 < args.timeout_seconds <= 600:
         parser.error("--timeout-seconds must be in (0, 600]")
     if not 0 <= args.max_redirects <= 10:
         parser.error("--max-redirects must be between 0 and 10")
+    if not 0 <= args.max_retries <= 10:
+        parser.error("--max-retries must be between 0 and 10")
 
     try:
         url, expected_size, expected_sha256 = load_manifest(args.manifest)
@@ -221,6 +344,7 @@ def main() -> int:
             expected_sha256,
             args.timeout_seconds,
             args.max_redirects,
+            args.max_retries,
         )
     except VerificationError as error:
         print(f"checkpoint download verification error: {error}", file=sys.stderr)

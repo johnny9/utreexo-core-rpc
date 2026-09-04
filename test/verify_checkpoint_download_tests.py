@@ -23,7 +23,12 @@ SPEC.loader.exec_module(VERIFIER)
 
 class FakeResponse(io.BytesIO):
     def __init__(
-        self, payload: bytes, url: str, status: int = 200, content_length: int | None = None
+        self,
+        payload: bytes,
+        url: str,
+        status: int = 200,
+        content_length: int | None = None,
+        content_range: str | None = None,
     ) -> None:
         super().__init__(payload)
         self._url = url
@@ -31,6 +36,8 @@ class FakeResponse(io.BytesIO):
         self.headers = {}
         if content_length is not None:
             self.headers["Content-Length"] = str(content_length)
+        if content_range is not None:
+            self.headers["Content-Range"] = content_range
 
     def __enter__(self) -> "FakeResponse":
         return self
@@ -46,14 +53,16 @@ class FakeResponse(io.BytesIO):
 
 
 class FakeOpener:
-    def __init__(self, response: FakeResponse) -> None:
-        self.response = response
+    def __init__(self, *responses: FakeResponse) -> None:
+        self.responses = list(responses)
+        self.ranges: list[str | None] = []
 
     def open(
         self, request: object, timeout: float | None = None
     ) -> FakeResponse:
-        del request, timeout
-        return self.response
+        del timeout
+        self.ranges.append(request.get_header("Range"))  # type: ignore[attr-defined]
+        return self.responses.pop(0)
 
 
 class StreamingVerifierTests(unittest.TestCase):
@@ -136,6 +145,54 @@ class StreamingVerifierTests(unittest.TestCase):
                     5.0,
                     2,
                 )
+
+    def test_download_retries_a_short_range_without_rehashing_it(self) -> None:
+        payload = b"0123456789"
+        expected = hashlib.sha256(payload).hexdigest()
+        opener = FakeOpener(
+            FakeResponse(
+                payload[:2],
+                "https://cdn.example/mainnet.chk",
+                status=206,
+                content_length=5,
+                content_range="bytes 0-4/10",
+            ),
+            FakeResponse(
+                payload[:5],
+                "https://cdn.example/mainnet.chk",
+                status=206,
+                content_length=5,
+                content_range="bytes 0-4/10",
+            ),
+            FakeResponse(
+                payload[5:],
+                "https://cdn.example/mainnet.chk",
+                status=206,
+                content_length=5,
+                content_range="bytes 5-9/10",
+            ),
+        )
+        with mock.patch.object(
+            VERIFIER.urllib.request,
+            "build_opener",
+            return_value=opener,
+        ):
+            self.assertEqual(
+                VERIFIER.verify_download(
+                    "https://checkpoints.example/mainnet.chk",
+                    len(payload),
+                    expected,
+                    5.0,
+                    2,
+                    max_retries=1,
+                    range_bytes=5,
+                ),
+                (len(payload), expected),
+            )
+        self.assertEqual(
+            opener.ranges,
+            ["bytes=0-4", "bytes=0-4", "bytes=5-9"],
+        )
 
     def test_rejects_non_https_and_credential_urls(self) -> None:
         for url in (
