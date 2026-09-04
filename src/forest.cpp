@@ -1102,7 +1102,7 @@ public:
             const NodeId next_id{pending.top().id};
             const DeltaDiskRecord* newest{nullptr};
             std::size_t newest_run{0};
-            while (!pending.empty() && pending.top().id == next_id) {
+            do {
                 Cursor cursor{pending.top()};
                 pending.pop();
                 const auto& run{*m_delta_runs[cursor.run_index]};
@@ -1116,7 +1116,7 @@ public:
                     cursor.id = run.Record(cursor.record_index).id;
                     pending.push(cursor);
                 }
-            }
+            } while (!pending.empty() && pending.top().id == next_id);
             if (next_id < m_next && !callback(next_id, FromDisk(*newest))) return;
         }
     }
