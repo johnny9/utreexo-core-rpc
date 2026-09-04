@@ -111,7 +111,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
       - name: Run Clang-Tidy
-        run: run-clang-tidy -j 2 -p build -quiet '.*/(src|test|bench)/.*\.cpp$'
+        run: run-clang-tidy -j 1 -p build -quiet '.*/(src|test|bench)/.*\.cpp$'
       - name: Check shell scripts
         run: shellcheck tools/*.sh test/*.sh
       - name: Check Python syntax
