@@ -14,9 +14,12 @@
 #include <fstream>
 #include <iomanip>
 #include <istream>
+#include <iterator>
 #include <limits>
 #include <map>
+#include <new>
 #include <ostream>
+#include <queue>
 #include <set>
 #include <string>
 #include <string_view>
@@ -57,6 +60,69 @@ static_assert(sizeof(DiskMeta) == 16);
 static_assert(std::endian::native == std::endian::little,
               "native online forest storage currently requires little endian");
 
+constexpr std::array<std::byte, 8> DELTA_MAGIC{
+    std::byte{'U'}, std::byte{'T'}, std::byte{'R'}, std::byte{'D'},
+    std::byte{'E'}, std::byte{'L'}, std::byte{'T'}, std::byte{'1'}};
+constexpr std::array<std::byte, 8> DELTA_COMMIT{
+    std::byte{'D'}, std::byte{'E'}, std::byte{'L'}, std::byte{'T'},
+    std::byte{'A'}, std::byte{'O'}, std::byte{'K'}, std::byte{'1'}};
+constexpr uint32_t DELTA_FORMAT_VERSION{1};
+constexpr uint32_t DELTA_FLAG_SNAPSHOT{1U};
+constexpr std::size_t DELTA_HEADER_SIZE{432};
+constexpr std::size_t DELTA_TRAILER_SIZE{sizeof(uint64_t) + DELTA_COMMIT.size()};
+constexpr std::size_t DELTA_FENCE_RECORDS{64};
+
+struct DeltaDiskRecord {
+    NodeId id{NO_NODE};
+    Hash256 hash;
+    NodeId parent{NO_NODE};
+    NodeId left{NO_NODE};
+    NodeId right{NO_NODE};
+    uint8_t type{0};
+    std::array<uint8_t, 3> reserved{};
+};
+
+static_assert(sizeof(DeltaDiskRecord) == 52);
+static_assert(std::is_trivially_copyable_v<DeltaDiskRecord>);
+
+uint64_t MixDeltaNodeId(uint64_t value)
+{
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+uint64_t DeltaBloomMask(NodeId id)
+{
+    const uint64_t hash{MixDeltaNodeId(
+        static_cast<uint64_t>(id) ^ 0xd6e8feb86659fd93ULL)};
+    uint64_t mask{0};
+    for (uint32_t probe{0}; probe < 6; ++probe) {
+        mask |= uint64_t{1} << ((hash >> (probe * 10)) & 63U);
+    }
+    return mask;
+}
+
+struct DeltaState {
+    bool snapshot{false};
+    uint64_t generation{0};
+    uint64_t previous_generation{0};
+    uint64_t base_generation{0};
+    uint64_t physical_base_lsn{0};
+    Hash256 base_fingerprint;
+    uint64_t previous_lsn{0};
+    uint64_t end_lsn{0};
+    uint64_t base_chain_count{0};
+    ChainPoint point;
+    uint64_t num_leaves{0};
+    NodeId next{0};
+    uint64_t live_nodes{0};
+    uint64_t chain_hash_count{0};
+    uint64_t record_count{0};
+    std::array<NodeId, 64> roots{};
+};
+
 std::string ErrnoMessage(std::string_view operation)
 {
     return std::string{operation} + ": " + std::strerror(errno);
@@ -83,6 +149,7 @@ uint64_t ElapsedMicros(std::chrono::steady_clock::time_point start)
 
 Result<void> PwriteAll(int descriptor, std::span<const std::byte> bytes, uint64_t file_offset);
 Result<void> WriteAll(int descriptor, std::span<const std::byte> bytes);
+uint64_t Checksum(std::span<const std::byte> bytes);
 
 class ScopedDescriptor
 {
@@ -306,6 +373,15 @@ private:
     int m_descriptor{-1};
 };
 
+struct MappedSyncStats {
+    uint64_t hash_pages{0};
+    uint64_t meta_pages{0};
+    uint64_t ranges{0};
+    uint64_t span_bytes{0};
+    uint64_t msync_us{0};
+    uint64_t descriptor_sync_us{0};
+};
+
 class MappedArenaFiles
 {
 public:
@@ -316,16 +392,18 @@ public:
 
     Result<void> Open(const std::filesystem::path& hashes_path,
                       const std::filesystem::path& meta_path,
-                      uint64_t capacity_slots)
+                      uint64_t capacity_slots, bool writable = false)
     {
         Close();
         if (capacity_slots == 0 || capacity_slots >= NO_NODE) {
             return Result<void>::Err("invalid mapped arena capacity");
         }
-        auto hash_opened{OpenOwnedRegularFile(hashes_path, O_RDWR, "forest hashes")};
+        auto hash_opened{OpenOwnedRegularFile(
+            hashes_path, writable ? O_RDWR : O_RDONLY, "forest hashes")};
         if (!hash_opened) return Result<void>::Err(hash_opened.Error());
         m_hash_fd = hash_opened.Value().Release();
-        auto meta_opened{OpenOwnedRegularFile(meta_path, O_RDWR, "forest metadata")};
+        auto meta_opened{OpenOwnedRegularFile(
+            meta_path, writable ? O_RDWR : O_RDONLY, "forest metadata")};
         if (!meta_opened) {
             Close();
             return Result<void>::Err(meta_opened.Error());
@@ -345,8 +423,9 @@ public:
             return Result<void>::Err("mapped arena files have unexpected sizes");
         }
         m_capacity = capacity_slots;
+        const int protection{PROT_READ | (writable ? PROT_WRITE : 0)};
         m_hashes = static_cast<Hash256*>(::mmap(nullptr, static_cast<std::size_t>(hash_bytes),
-                                                PROT_READ | PROT_WRITE, MAP_SHARED, m_hash_fd, 0));
+                                                protection, MAP_SHARED, m_hash_fd, 0));
         if (m_hashes == MAP_FAILED) {
             m_hashes = nullptr;
             const auto error{ErrnoMessage("mmap forest hashes")};
@@ -354,36 +433,15 @@ public:
             return Result<void>::Err(error);
         }
         m_meta = static_cast<DiskMeta*>(::mmap(nullptr, static_cast<std::size_t>(meta_bytes),
-                                               PROT_READ | PROT_WRITE, MAP_SHARED, m_meta_fd, 0));
+                                               protection, MAP_SHARED, m_meta_fd, 0));
         if (m_meta == MAP_FAILED) {
             m_meta = nullptr;
             const auto error{ErrnoMessage("mmap forest metadata")};
             Close();
             return Result<void>::Err(error);
         }
+        m_writable = writable;
         return Result<void>::Ok();
-    }
-
-    Result<void> Resize(const std::filesystem::path& hashes_path,
-                        const std::filesystem::path& meta_path,
-                        uint64_t capacity_slots)
-    {
-        Close();
-        auto hash_opened{OpenOwnedRegularFile(hashes_path, O_RDWR,
-                                              "forest hashes for resize")};
-        if (!hash_opened) return Result<void>::Err(hash_opened.Error());
-        auto meta_opened{OpenOwnedRegularFile(meta_path, O_RDWR,
-                                              "forest metadata for resize")};
-        if (!meta_opened) return Result<void>::Err(meta_opened.Error());
-        const int hash_fd{hash_opened.Value().Get()};
-        const int meta_fd{meta_opened.Value().Get()};
-        const uint64_t hash_bytes{capacity_slots * sizeof(Hash256)};
-        const uint64_t meta_bytes{capacity_slots * sizeof(DiskMeta)};
-        if (::ftruncate(hash_fd, static_cast<off_t>(hash_bytes)) != 0 ||
-            ::ftruncate(meta_fd, static_cast<off_t>(meta_bytes)) != 0) {
-            return Result<void>::Err(ErrnoMessage("resize mapped arena"));
-        }
-        return Open(hashes_path, meta_path, capacity_slots);
     }
 
     const Hash256& Hash(NodeId id) const { return m_hashes[id]; }
@@ -391,41 +449,71 @@ public:
     Hash256& Hash(NodeId id) { return m_hashes[id]; }
     DiskMeta& Meta(NodeId id) { return m_meta[id]; }
     uint64_t Capacity() const { return m_capacity; }
+    bool Writable() const { return m_writable; }
     uint64_t Bytes() const { return m_capacity * (sizeof(Hash256) + sizeof(DiskMeta)); }
 
     Result<void> SyncPages(std::span<const NodeId> ids)
     {
+        m_last_sync = {};
         if (ids.empty()) return Result<void>::Ok();
+        if (!std::ranges::is_sorted(ids)) {
+            return Result<void>::Err("mapped arena sync node IDs are unsorted");
+        }
         const long raw_page_size{::sysconf(_SC_PAGESIZE)};
         if (raw_page_size <= 0) return Result<void>::Err("could not determine system page size");
         const uint64_t page_size{static_cast<uint64_t>(raw_page_size)};
-        const auto sync_mapping = [&](void* mapping, uint64_t element_size) -> Result<void> {
+        const auto sync_mapping = [&](void* mapping, uint64_t element_size,
+                                      uint64_t& page_count) -> Result<void> {
             std::vector<uint64_t> pages;
-            pages.reserve(ids.size());
-            for (const NodeId id : ids) pages.push_back(static_cast<uint64_t>(id) * element_size / page_size);
-            std::ranges::sort(pages);
-            pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+            const uint64_t mapping_pages{
+                (m_capacity * element_size + page_size - 1) / page_size};
+            pages.reserve(static_cast<std::size_t>(std::min<uint64_t>(
+                ids.size(), mapping_pages)));
+            uint64_t previous_page{std::numeric_limits<uint64_t>::max()};
+            for (const NodeId id : ids) {
+                const uint64_t page{
+                    static_cast<uint64_t>(id) * element_size / page_size};
+                if (page != previous_page) pages.push_back(page);
+                previous_page = page;
+            }
+            page_count = pages.size();
             std::size_t begin{0};
+            // A large forest can have hundreds of thousands of one-page runs.
+            // Synchronizing each run separately turns a legacy base restoration into the same
+            // number of blocking syscalls.  Including a small clean gap does not
+            // dirty or write those pages, and collapses the syscall count without
+            // weakening the MS_SYNC durability boundary.
+            constexpr uint64_t MAX_CLEAN_GAP_PAGES{16};
             while (begin < pages.size()) {
                 std::size_t end{begin + 1};
-                while (end < pages.size() && pages[end] == pages[end - 1] + 1) ++end;
+                while (end < pages.size() &&
+                       pages[end] - pages[end - 1] <= MAX_CLEAN_GAP_PAGES + 1) {
+                    ++end;
+                }
                 const uint64_t offset{pages[begin] * page_size};
                 const uint64_t length{(pages[end - 1] - pages[begin] + 1) * page_size};
+                const auto sync_start{std::chrono::steady_clock::now()};
                 if (::msync(static_cast<std::byte*>(mapping) + offset,
                             static_cast<std::size_t>(length), MS_SYNC) != 0) {
                     return Result<void>::Err(ErrnoMessage("msync mapped arena"));
                 }
+                m_last_sync.msync_us += ElapsedMicros(sync_start);
+                ++m_last_sync.ranges;
+                m_last_sync.span_bytes += length;
                 begin = end;
             }
             return Result<void>::Ok();
         };
-        auto hashes{sync_mapping(m_hashes, sizeof(Hash256))};
+        auto hashes{sync_mapping(m_hashes, sizeof(Hash256), m_last_sync.hash_pages)};
         if (!hashes) return hashes;
-        auto meta{sync_mapping(m_meta, sizeof(DiskMeta))};
+        auto meta{sync_mapping(m_meta, sizeof(DiskMeta), m_last_sync.meta_pages)};
         if (!meta) return meta;
+        const auto descriptor_start{std::chrono::steady_clock::now()};
         auto hash_sync{SyncDescriptor(m_hash_fd, "forest hashes")};
         if (!hash_sync) return hash_sync;
-        return SyncDescriptor(m_meta_fd, "forest metadata");
+        auto meta_sync{SyncDescriptor(m_meta_fd, "forest metadata")};
+        m_last_sync.descriptor_sync_us = ElapsedMicros(descriptor_start);
+        return meta_sync;
     }
 
 private:
@@ -443,6 +531,7 @@ private:
         if (m_meta_fd >= 0) ::close(m_meta_fd);
         m_hash_fd = m_meta_fd = -1;
         m_capacity = 0;
+        m_writable = false;
     }
 
     int m_hash_fd{-1};
@@ -450,6 +539,312 @@ private:
     Hash256* m_hashes{nullptr};
     DiskMeta* m_meta{nullptr};
     uint64_t m_capacity{0};
+    bool m_writable{false};
+    MappedSyncStats m_last_sync;
+};
+
+/** One immutable, checksummed run of NodeId-sorted overrides. */
+class MappedDeltaRun
+{
+public:
+    MappedDeltaRun() = default;
+    ~MappedDeltaRun() { Close(); }
+    MappedDeltaRun(const MappedDeltaRun&) = delete;
+    MappedDeltaRun& operator=(const MappedDeltaRun&) = delete;
+
+    static Result<std::unique_ptr<MappedDeltaRun>> Open(
+        const std::filesystem::path& path)
+    {
+        auto opened{OpenOwnedRegularFile(path, O_RDONLY, "forest delta run")};
+        if (!opened) {
+            return Result<std::unique_ptr<MappedDeltaRun>>::Err(opened.Error());
+        }
+        struct stat status{};
+        if (::fstat(opened.Value().Get(), &status) != 0 || status.st_size < 0 ||
+            static_cast<uint64_t>(status.st_size) >
+                std::numeric_limits<std::size_t>::max()) {
+            return Result<std::unique_ptr<MappedDeltaRun>>::Err(
+                "could not size forest delta run: " + path.string());
+        }
+        const auto size{static_cast<std::size_t>(status.st_size)};
+        if (size < DELTA_HEADER_SIZE + DELTA_TRAILER_SIZE) {
+            return Result<std::unique_ptr<MappedDeltaRun>>::Err(
+                "forest delta run is truncated: " + path.string());
+        }
+        void* mapping{::mmap(nullptr, size, PROT_READ, MAP_SHARED,
+                             opened.Value().Get(), 0)};
+        if (mapping == MAP_FAILED) {
+            return Result<std::unique_ptr<MappedDeltaRun>>::Err(
+                ErrnoMessage("mmap forest delta run"));
+        }
+        auto run{std::unique_ptr<MappedDeltaRun>{new MappedDeltaRun}};
+        run->m_descriptor = opened.Value().Release();
+        run->m_mapping = static_cast<const std::byte*>(mapping);
+        run->m_size = size;
+        run->m_path = path;
+        auto parsed{run->Parse()};
+        if (!parsed) {
+            return Result<std::unique_ptr<MappedDeltaRun>>::Err(
+                path.string() + ": " + parsed.Error());
+        }
+#ifdef MADV_RANDOM
+        static_cast<void>(::madvise(mapping, size, MADV_RANDOM));
+#endif
+        return Result<std::unique_ptr<MappedDeltaRun>>::Ok(std::move(run));
+    }
+
+    const DeltaState& State() const { return m_state; }
+    uint64_t FileBytes() const { return m_size; }
+    uint64_t FilterBytes() const
+    {
+        return m_filter.capacity() * sizeof(uint64_t);
+    }
+    uint64_t IndexBytes() const
+    {
+        return m_fences.capacity() * sizeof(NodeId);
+    }
+    const std::filesystem::path& Path() const { return m_path; }
+    std::size_t RecordCount() const
+    {
+        return static_cast<std::size_t>(m_state.record_count);
+    }
+    const DeltaDiskRecord& Record(std::size_t index) const
+    {
+        return m_records[index];
+    }
+    const DeltaDiskRecord* Find(NodeId id) const
+    {
+        if (!MayContain(id)) return nullptr;
+        const auto upper{std::upper_bound(m_fences.begin(), m_fences.end(), id)};
+        if (upper == m_fences.begin()) return nullptr;
+        const std::size_t fence{static_cast<std::size_t>(
+            std::distance(m_fences.begin(), upper) - 1)};
+        std::size_t first{fence * DELTA_FENCE_RECORDS};
+        std::size_t last{std::min(first + DELTA_FENCE_RECORDS, RecordCount())};
+        while (first < last) {
+            const std::size_t middle{first + (last - first) / 2};
+            if (m_records[middle].id < id) first = middle + 1;
+            else last = middle;
+        }
+        if (first == RecordCount() || m_records[first].id != id) return nullptr;
+        return &m_records[first];
+    }
+    Hash256 ChainSuffixHash(std::size_t index) const
+    {
+        Hash256::Storage storage{};
+        const auto* begin{m_chain_suffix + index * Hash256::SIZE};
+        std::copy_n(begin, Hash256::SIZE, storage.begin());
+        return Hash256{storage};
+    }
+
+private:
+    bool MayContain(NodeId id) const
+    {
+        if (m_filter.empty()) return false;
+        const uint64_t hash{MixDeltaNodeId(static_cast<uint64_t>(id))};
+        const auto index{static_cast<std::size_t>(
+            hash % static_cast<uint64_t>(m_filter.size()))};
+        const uint64_t mask{DeltaBloomMask(id)};
+        return (m_filter[index] & mask) == mask;
+    }
+
+    Result<void> InitializeLookupIndex()
+    {
+        if (m_state.record_count == 0) return Result<void>::Ok();
+        // Eight bits per record in a blocked Bloom filter keep one negative
+        // lookup to one small, cache-resident word instead of faulting through
+        // a disk-backed binary search. Six probes give a roughly 2% false
+        // positive rate at the average occupancy.
+        const uint64_t words{(m_state.record_count + 7) / 8};
+        if (words > std::numeric_limits<std::size_t>::max() /
+                        sizeof(uint64_t)) {
+            return Result<void>::Err("forest delta filter size overflows this platform");
+        }
+        const uint64_t fences{
+            (m_state.record_count + DELTA_FENCE_RECORDS - 1) /
+            DELTA_FENCE_RECORDS};
+        if (fences > std::numeric_limits<std::size_t>::max() /
+                         sizeof(NodeId)) {
+            return Result<void>::Err("forest delta fence index overflows this platform");
+        }
+        try {
+            m_filter.assign(static_cast<std::size_t>(words), 0);
+            m_fences.reserve(static_cast<std::size_t>(fences));
+        } catch (const std::bad_alloc&) {
+            return Result<void>::Err("could not allocate forest delta lookup index");
+        }
+        return Result<void>::Ok();
+    }
+
+    template <typename T>
+    bool ReadUnsigned(std::size_t& offset, T& value) const
+    {
+        static_assert(std::is_unsigned_v<T>);
+        if (offset + sizeof(T) > DELTA_HEADER_SIZE) return false;
+        uint64_t accumulator{0};
+        for (std::size_t i{0}; i < sizeof(T); ++i) {
+            accumulator |= static_cast<uint64_t>(
+                std::to_integer<uint8_t>(m_mapping[offset + i])) << (i * 8);
+        }
+        value = static_cast<T>(accumulator);
+        offset += sizeof(T);
+        return true;
+    }
+
+    bool ReadHash(std::size_t& offset, Hash256& hash) const
+    {
+        if (offset + Hash256::SIZE > DELTA_HEADER_SIZE) return false;
+        Hash256::Storage storage{};
+        std::copy_n(m_mapping + offset, Hash256::SIZE, storage.begin());
+        hash = Hash256{storage};
+        offset += Hash256::SIZE;
+        return true;
+    }
+
+    Result<void> Parse()
+    {
+        const std::span<const std::byte> bytes{m_mapping, m_size};
+        if (!std::equal(DELTA_COMMIT.begin(), DELTA_COMMIT.end(),
+                        bytes.end() - static_cast<std::ptrdiff_t>(DELTA_COMMIT.size()))) {
+            return Result<void>::Err("forest delta commit marker is missing");
+        }
+        const std::size_t checksum_offset{m_size - DELTA_TRAILER_SIZE};
+        uint64_t expected_checksum{0};
+        std::size_t checksum_cursor{checksum_offset};
+        for (std::size_t i{0}; i < sizeof(expected_checksum); ++i) {
+            expected_checksum |= static_cast<uint64_t>(
+                std::to_integer<uint8_t>(m_mapping[checksum_cursor++])) << (i * 8);
+        }
+        if (Checksum(bytes.first(checksum_offset)) != expected_checksum) {
+            return Result<void>::Err("forest delta checksum mismatch");
+        }
+
+        std::size_t offset{0};
+        std::array<std::byte, DELTA_MAGIC.size()> magic{};
+        std::copy_n(m_mapping, magic.size(), magic.begin());
+        offset += magic.size();
+        uint32_t version{0};
+        uint32_t flags{0};
+        if (magic != DELTA_MAGIC || !ReadUnsigned(offset, version) ||
+            !ReadUnsigned(offset, flags) || version != DELTA_FORMAT_VERSION ||
+            (flags & ~DELTA_FLAG_SNAPSHOT) != 0 ||
+            !ReadUnsigned(offset, m_state.generation) ||
+            !ReadUnsigned(offset, m_state.previous_generation) ||
+            !ReadUnsigned(offset, m_state.base_generation) ||
+            !ReadUnsigned(offset, m_state.physical_base_lsn) ||
+            !ReadHash(offset, m_state.base_fingerprint) ||
+            !ReadUnsigned(offset, m_state.previous_lsn) ||
+            !ReadUnsigned(offset, m_state.end_lsn) ||
+            !ReadUnsigned(offset, m_state.base_chain_count) ||
+            !ReadUnsigned(offset, m_state.point.height) ||
+            !ReadHash(offset, m_state.point.block_hash) ||
+            !ReadUnsigned(offset, m_state.num_leaves) ||
+            !ReadUnsigned(offset, m_state.next) ||
+            !ReadUnsigned(offset, m_state.live_nodes) ||
+            !ReadUnsigned(offset, m_state.chain_hash_count) ||
+            !ReadUnsigned(offset, m_state.record_count)) {
+            return Result<void>::Err("forest delta header is invalid");
+        }
+        m_state.snapshot = (flags & DELTA_FLAG_SNAPSHOT) != 0;
+        for (NodeId& root : m_state.roots) {
+            if (!ReadUnsigned(offset, root)) {
+                return Result<void>::Err("forest delta roots are truncated");
+            }
+        }
+        if (offset != DELTA_HEADER_SIZE || m_state.generation == 0 ||
+            m_state.previous_generation >= m_state.generation ||
+            m_state.previous_lsn > m_state.end_lsn || m_state.next >= NO_NODE ||
+            m_state.live_nodes > m_state.next ||
+            m_state.base_chain_count == 0 ||
+            m_state.chain_hash_count < m_state.base_chain_count ||
+            m_state.chain_hash_count !=
+                static_cast<uint64_t>(m_state.point.height) + 1) {
+            return Result<void>::Err("forest delta fields are inconsistent");
+        }
+        const uint64_t suffix_count{
+            m_state.chain_hash_count - m_state.base_chain_count};
+        if (m_state.record_count >
+                (std::numeric_limits<std::size_t>::max() - DELTA_HEADER_SIZE -
+                 DELTA_TRAILER_SIZE) / sizeof(DeltaDiskRecord) ||
+            suffix_count >
+                (std::numeric_limits<std::size_t>::max() - DELTA_HEADER_SIZE -
+                 DELTA_TRAILER_SIZE -
+                 static_cast<std::size_t>(m_state.record_count) *
+                     sizeof(DeltaDiskRecord)) /
+                    Hash256::SIZE) {
+            return Result<void>::Err("forest delta size overflows this platform");
+        }
+        const std::size_t records_bytes{
+            static_cast<std::size_t>(m_state.record_count) *
+            sizeof(DeltaDiskRecord)};
+        const std::size_t expected_size{DELTA_HEADER_SIZE + records_bytes +
+            static_cast<std::size_t>(suffix_count) * Hash256::SIZE +
+            DELTA_TRAILER_SIZE};
+        if (expected_size != m_size) {
+            return Result<void>::Err("forest delta size is inconsistent");
+        }
+        m_records = reinterpret_cast<const DeltaDiskRecord*>(
+            m_mapping + DELTA_HEADER_SIZE);
+        m_chain_suffix = m_mapping + DELTA_HEADER_SIZE + records_bytes;
+        auto initialized_index{InitializeLookupIndex()};
+        if (!initialized_index) return initialized_index;
+        NodeId previous{NO_NODE};
+        for (std::size_t i{0}; i < RecordCount(); ++i) {
+            const auto& record{m_records[i]};
+            const auto valid_link{[this](NodeId link) {
+                return link == NO_NODE || link < m_state.next;
+            }};
+            if (record.id >= m_state.next ||
+                (previous != NO_NODE && record.id <= previous) ||
+                record.type > static_cast<uint8_t>(NodeType::BRANCH) ||
+                record.reserved != std::array<uint8_t, 3>{} ||
+                !valid_link(record.parent) || !valid_link(record.left) ||
+                !valid_link(record.right)) {
+                return Result<void>::Err(
+                    "forest delta records are invalid or unsorted");
+            }
+            if (i % DELTA_FENCE_RECORDS == 0) m_fences.push_back(record.id);
+            const uint64_t hash{MixDeltaNodeId(static_cast<uint64_t>(record.id))};
+            const auto filter_index{static_cast<std::size_t>(
+                hash % static_cast<uint64_t>(m_filter.size()))};
+            m_filter[filter_index] |= DeltaBloomMask(record.id);
+            previous = record.id;
+        }
+        for (const NodeId root : m_state.roots) {
+            if (root != NO_NODE && root >= m_state.next) {
+                return Result<void>::Err("forest delta root is out of range");
+            }
+        }
+        if (suffix_count != 0 &&
+            ChainSuffixHash(static_cast<std::size_t>(suffix_count - 1)) !=
+                m_state.point.block_hash) {
+            return Result<void>::Err("forest delta chain suffix has the wrong tip");
+        }
+        return Result<void>::Ok();
+    }
+
+    void Close()
+    {
+        if (m_mapping != nullptr) {
+            ::munmap(const_cast<std::byte*>(m_mapping), m_size);
+            m_mapping = nullptr;
+        }
+        if (m_descriptor >= 0) ::close(m_descriptor);
+        m_descriptor = -1;
+        m_size = 0;
+        m_records = nullptr;
+        m_chain_suffix = nullptr;
+    }
+
+    int m_descriptor{-1};
+    const std::byte* m_mapping{nullptr};
+    std::size_t m_size{0};
+    std::filesystem::path m_path;
+    DeltaState m_state;
+    const DeltaDiskRecord* m_records{nullptr};
+    const std::byte* m_chain_suffix{nullptr};
+    std::vector<uint64_t> m_filter;
+    std::vector<NodeId> m_fences;
 };
 
 class NodeArena
@@ -526,7 +921,11 @@ public:
     {
         if (Mapped()) {
             const auto dirty{m_dirty.find(id)};
-            return dirty == m_dirty.end() ? m_files.Hash(id) : dirty->second.hash;
+            if (dirty != m_dirty.end()) return dirty->second.hash;
+            if (const auto* delta{FindDeltaRecord(id)}) return delta->hash;
+            if (id < m_base_next) return m_files.Hash(id);
+            static const Hash256 EMPTY_HASH{};
+            return EMPTY_HASH;
         }
         return Get(id).hashes[id & CHUNK_MASK];
     }
@@ -558,7 +957,8 @@ public:
     uint64_t LiveCount() const { return m_live; }
     uint64_t Capacity() const
     {
-        return Mapped() ? m_files.Capacity() : static_cast<uint64_t>(m_chunks.size()) * CHUNK_SIZE;
+        return Mapped() ? std::max<uint64_t>(m_files.Capacity(), m_next) :
+            static_cast<uint64_t>(m_chunks.size()) * CHUNK_SIZE;
     }
     uint64_t FreeCount() const { return Mapped() ? m_free_set.size() : m_free.size(); }
 
@@ -568,7 +968,8 @@ public:
         if (Mapped()) {
             return static_cast<uint64_t>(m_dirty.size()) * sizeof(NodeRecord) +
                    static_cast<uint64_t>(m_free.capacity()) * sizeof(NodeId) +
-                   static_cast<uint64_t>(m_free_set.size()) * (sizeof(NodeId) * 3);
+                   static_cast<uint64_t>(m_free_set.size()) * (sizeof(NodeId) * 3) +
+                   DeltaFilterBytes() + DeltaIndexBytes();
         }
         return static_cast<uint64_t>(m_chunks.size()) * CHUNK_SIZE * bytes_per_slot +
                static_cast<uint64_t>(m_free.capacity()) * sizeof(NodeId);
@@ -604,8 +1005,149 @@ public:
 
     bool Mapped() const { return m_mapped; }
     uint64_t BaseBytes() const { return Mapped() ? m_files.Bytes() : 0; }
+    uint64_t DeltaBytes() const
+    {
+        uint64_t bytes{0};
+        for (const auto& run : m_delta_runs) bytes += run->FileBytes();
+        return bytes;
+    }
+    uint64_t DeltaFilterBytes() const
+    {
+        uint64_t bytes{0};
+        for (const auto& run : m_delta_runs) bytes += run->FilterBytes();
+        return bytes;
+    }
+    uint64_t DeltaIndexBytes() const
+    {
+        uint64_t bytes{0};
+        for (const auto& run : m_delta_runs) bytes += run->IndexBytes();
+        return bytes;
+    }
+    uint64_t DeltaRecords() const
+    {
+        uint64_t records{0};
+        for (const auto& run : m_delta_runs) records += run->State().record_count;
+        return records;
+    }
+    uint64_t DeltaRunCount() const { return m_delta_runs.size(); }
     uint64_t DirtyNodes() const { return m_dirty.size(); }
     uint64_t DirtyBytes() const { return static_cast<uint64_t>(m_dirty.size()) * 80; }
+    std::vector<NodeId> SortedDirtyIds() const
+    {
+        std::vector<NodeId> ids;
+        ids.reserve(m_dirty.size());
+        for (const auto& [id, record] : m_dirty) {
+            static_cast<void>(record);
+            ids.push_back(id);
+        }
+        std::ranges::sort(ids);
+        return ids;
+    }
+
+    std::vector<NodeId> SortedVisibleDirtyIds() const
+    {
+        auto ids{SortedDirtyIds()};
+        const auto end{std::lower_bound(ids.begin(), ids.end(), m_next)};
+        ids.erase(end, ids.end());
+        return ids;
+    }
+
+    const NodeRecord& DirtyRecord(NodeId id) const { return m_dirty.at(id); }
+
+    const std::vector<std::unique_ptr<MappedDeltaRun>>& DeltaRuns() const
+    {
+        return m_delta_runs;
+    }
+
+    void AppendDeltaRun(std::unique_ptr<MappedDeltaRun> run)
+    {
+        m_delta_runs.push_back(std::move(run));
+    }
+
+    void ReplaceDeltaRuns(std::unique_ptr<MappedDeltaRun> run)
+    {
+        m_delta_runs.clear();
+        m_delta_runs.push_back(std::move(run));
+    }
+
+    template <typename Callback>
+    void ForEachLatestDeltaRecord(Callback&& callback) const
+    {
+        struct Cursor {
+            NodeId id{NO_NODE};
+            std::size_t run_index{0};
+            std::size_t record_index{0};
+        };
+        const auto later = [](const Cursor& left, const Cursor& right) {
+            if (left.id != right.id) return left.id > right.id;
+            return left.run_index > right.run_index;
+        };
+        std::priority_queue<Cursor, std::vector<Cursor>, decltype(later)> pending{later};
+        for (std::size_t run_index{0}; run_index < m_delta_runs.size();
+             ++run_index) {
+            const auto& run{*m_delta_runs[run_index]};
+            if (run.RecordCount() != 0) {
+                pending.push(Cursor{run.Record(0).id, run_index, 0});
+            }
+        }
+
+        // Runs and their records are oldest-to-newest and NodeId-sorted. Keep
+        // one cursor per run, consume every occurrence of the smallest NodeId,
+        // and emit only the occurrence from the newest run. This bounds merge
+        // memory by the run count and avoids O(unique_records * run_count)
+        // overlap accounting at the safety cap.
+        while (!pending.empty()) {
+            const NodeId next_id{pending.top().id};
+            const DeltaDiskRecord* newest{nullptr};
+            std::size_t newest_run{0};
+            while (!pending.empty() && pending.top().id == next_id) {
+                Cursor cursor{pending.top()};
+                pending.pop();
+                const auto& run{*m_delta_runs[cursor.run_index]};
+                const auto& record{run.Record(cursor.record_index)};
+                if (newest == nullptr || cursor.run_index > newest_run) {
+                    newest = &record;
+                    newest_run = cursor.run_index;
+                }
+                ++cursor.record_index;
+                if (cursor.record_index < run.RecordCount()) {
+                    cursor.id = run.Record(cursor.record_index).id;
+                    pending.push(cursor);
+                }
+            }
+            if (next_id < m_next && !callback(next_id, FromDisk(*newest))) return;
+        }
+    }
+
+    uint64_t UniqueDeltaRecords() const
+    {
+        uint64_t records{0};
+        ForEachLatestDeltaRecord(
+            [&records](NodeId, const NodeRecord&) {
+                ++records;
+                return true;
+            });
+        return records;
+    }
+
+    bool EqualsPhysicalBase(NodeId id, const NodeRecord& record) const
+    {
+        const NodeRecord base{ReadPhysicalBase(id)};
+        if (record.type == NodeType::FREE && base.type == NodeType::FREE) return true;
+        return record == base;
+    }
+
+    Result<NodeRecord> BaseRecord(NodeId id) const
+    {
+        if (!Mapped() || id >= m_base_next) {
+            return Result<NodeRecord>::Err(
+                "base forest node is outside the mapped arena");
+        }
+        const auto& meta{m_files.Meta(id)};
+        return Result<NodeRecord>::Ok(NodeRecord{
+            m_files.Hash(id), meta.parent, meta.left, meta.right,
+            static_cast<NodeType>(meta.type)});
+    }
 
     Result<void> WriteNative(const std::filesystem::path& hashes_path,
                              const std::filesystem::path& meta_path,
@@ -688,18 +1230,29 @@ public:
         m_chunks.clear();
         m_chunks.shrink_to_fit();
         m_mapped = true;
+        m_base_next = m_next;
         return Result<void>::Ok();
     }
 
     Result<void> OpenMapped(const std::filesystem::path& hashes_path,
                             const std::filesystem::path& meta_path,
-                            uint64_t capacity_slots, NodeId next)
+                            uint64_t capacity_slots, NodeId next,
+                            bool rebuild_bookkeeping = true,
+                            bool writable = false)
     {
-        auto opened{m_files.Open(hashes_path, meta_path, capacity_slots)};
+        auto opened{m_files.Open(hashes_path, meta_path, capacity_slots, writable)};
         if (!opened) return opened;
         m_mapped = true;
+        m_base_next = next;
         m_next = next;
-        return RebuildBookkeeping();
+        return rebuild_bookkeeping ? RebuildBookkeeping() : Result<void>::Ok();
+    }
+
+    Result<void> ReopenBaseReadOnly(const std::filesystem::path& hashes_path,
+                                    const std::filesystem::path& meta_path)
+    {
+        if (!Mapped()) return Result<void>::Err("forest is not mapped");
+        return m_files.Open(hashes_path, meta_path, m_files.Capacity(), false);
     }
 
     Result<void> RebuildBookkeeping()
@@ -741,6 +1294,11 @@ public:
         return changes;
     }
 
+    uint64_t TransactionNodeCount() const
+    {
+        return m_transaction ? static_cast<uint64_t>(m_transaction->size()) : 0;
+    }
+
     void CommitTransaction()
     {
         m_transaction.reset();
@@ -768,25 +1326,30 @@ public:
         CommitTransaction();
     }
 
-    Result<void> WriteDirtyToBase(const std::filesystem::path& hashes_path,
-                                  const std::filesystem::path& meta_path)
+    Result<void> RestoreBase(
+        std::span<const std::pair<NodeId, NodeRecord>> ordered_records)
     {
-        if (!Mapped()) return Result<void>::Err("forest is not mapped");
-        if (m_next > m_files.Capacity()) {
-            uint64_t capacity{std::max<uint64_t>(CHUNK_SIZE, m_files.Capacity())};
-            while (capacity < m_next) capacity += CHUNK_SIZE;
-            auto resized{m_files.Resize(hashes_path, meta_path, capacity)};
-            if (!resized) return resized;
+        if (!Mapped() || !m_files.Writable()) {
+            return Result<void>::Err("forest mmap base is read-only");
         }
         std::vector<NodeId> ids;
-        ids.reserve(m_dirty.size());
-        for (const auto& [id, record] : m_dirty) {
+        ids.reserve(ordered_records.size());
+        NodeId previous{NO_NODE};
+        for (const auto& [id, record] : ordered_records) {
+            static_cast<void>(record);
+            if (id >= m_files.Capacity() || (previous != NO_NODE && id <= previous)) {
+                return Result<void>::Err("flush undo records are outside the base or unsorted");
+            }
+            ids.push_back(id);
+            previous = id;
+        }
+        for (const auto& [id, record] : ordered_records) {
             m_files.Hash(id) = record.hash;
+        }
+        for (const auto& [id, record] : ordered_records) {
             m_files.Meta(id) = DiskMeta{record.parent, record.left, record.right,
                                         static_cast<uint8_t>(record.type), {}};
-            ids.push_back(id);
         }
-        std::ranges::sort(ids);
         return m_files.SyncPages(ids);
     }
 
@@ -834,9 +1397,8 @@ public:
         if (Mapped()) {
             const auto dirty{m_dirty.find(id)};
             if (dirty != m_dirty.end()) return dirty->second;
-            const auto& meta{m_files.Meta(id)};
-            return NodeRecord{m_files.Hash(id), meta.parent, meta.left, meta.right,
-                              static_cast<NodeType>(meta.type)};
+            if (const auto* delta{FindDeltaRecord(id)}) return FromDisk(*delta);
+            return ReadPhysicalBase(id);
         }
         const auto& chunk{Get(id)};
         const std::size_t offset{id & CHUNK_MASK};
@@ -886,6 +1448,28 @@ private:
         throw std::logic_error{"Mutable called for RAM arena"};
     }
 
+    static NodeRecord FromDisk(const DeltaDiskRecord& record)
+    {
+        return NodeRecord{record.hash, record.parent, record.left, record.right,
+                          static_cast<NodeType>(record.type)};
+    }
+
+    const DeltaDiskRecord* FindDeltaRecord(NodeId id) const
+    {
+        for (auto run{m_delta_runs.rbegin()}; run != m_delta_runs.rend(); ++run) {
+            if (const auto* record{(*run)->Find(id)}) return record;
+        }
+        return nullptr;
+    }
+
+    NodeRecord ReadPhysicalBase(NodeId id) const
+    {
+        if (id >= m_base_next || id >= m_files.Capacity()) return NodeRecord{};
+        const auto& meta{m_files.Meta(id)};
+        return NodeRecord{m_files.Hash(id), meta.parent, meta.left, meta.right,
+                          static_cast<NodeType>(meta.type)};
+    }
+
     Chunk& Get(NodeId id) { return *m_chunks.at(id >> CHUNK_SHIFT); }
     const Chunk& Get(NodeId id) const { return *m_chunks.at(id >> CHUNK_SHIFT); }
 
@@ -894,12 +1478,14 @@ private:
     std::unordered_set<NodeId> m_free_set;
     MappedArenaFiles m_files;
     std::unordered_map<NodeId, NodeRecord> m_dirty;
+    std::vector<std::unique_ptr<MappedDeltaRun>> m_delta_runs;
     std::optional<std::unordered_map<NodeId, OriginalRecord>> m_transaction;
     std::vector<std::pair<bool, NodeId>> m_free_operations;
     NodeId m_transaction_next{0};
     uint64_t m_transaction_live{0};
     NodeId m_next{0};
     uint64_t m_live{0};
+    NodeId m_base_next{0};
     bool m_mapped{false};
 };
 
@@ -1162,15 +1748,21 @@ private:
     std::size_t m_offset{0};
 };
 
-uint64_t Checksum(std::span<const std::byte> bytes)
+constexpr uint64_t CHECKSUM_OFFSET{14695981039346656037ULL};
+constexpr uint64_t CHECKSUM_PRIME{1099511628211ULL};
+
+void ExtendChecksum(uint64_t& value, std::span<const std::byte> bytes)
 {
-    constexpr uint64_t OFFSET{14695981039346656037ULL};
-    constexpr uint64_t PRIME{1099511628211ULL};
-    uint64_t value{OFFSET};
     for (const std::byte byte : bytes) {
         value ^= std::to_integer<uint8_t>(byte);
-        value *= PRIME;
+        value *= CHECKSUM_PRIME;
     }
+}
+
+uint64_t Checksum(std::span<const std::byte> bytes)
+{
+    uint64_t value{CHECKSUM_OFFSET};
+    ExtendChecksum(value, bytes);
     return value;
 }
 
@@ -1525,6 +2117,128 @@ Result<std::vector<std::byte>> ReadFile(const std::filesystem::path& path)
     return Result<std::vector<std::byte>>::Ok(std::move(read.Value().bytes));
 }
 
+constexpr std::array<std::byte, 8> FLUSH_UNDO_MAGIC{
+    std::byte{'U'}, std::byte{'T'}, std::byte{'R'}, std::byte{'F'},
+    std::byte{'L'}, std::byte{'S'}, std::byte{'H'}, std::byte{'1'}};
+constexpr std::array<std::byte, 8> FLUSH_UNDO_COMMIT{
+    std::byte{'F'}, std::byte{'L'}, std::byte{'U'}, std::byte{'S'},
+    std::byte{'H'}, std::byte{'E'}, std::byte{'D'}, std::byte{'1'}};
+constexpr uint32_t FLUSH_UNDO_VERSION{1};
+constexpr std::string_view FLUSH_UNDO_NAME{"flush.undo"};
+constexpr std::size_t FLUSH_UNDO_HEADER_SIZE{
+    FLUSH_UNDO_MAGIC.size() + sizeof(uint32_t) + sizeof(uint64_t) * 3 +
+    sizeof(uint32_t) + Hash256::SIZE + sizeof(uint64_t)};
+constexpr std::size_t FLUSH_UNDO_RECORD_SIZE{sizeof(NodeId) + 48};
+constexpr std::size_t FLUSH_UNDO_TRAILER_SIZE{
+    sizeof(uint64_t) + FLUSH_UNDO_COMMIT.size()};
+
+struct FlushUndoFile {
+    ScopedDescriptor descriptor;
+    uint64_t base_generation{0};
+    uint64_t target_generation{0};
+    uint64_t target_base_lsn{0};
+    ChainPoint target_point;
+    std::vector<std::pair<NodeId, NodeRecord>> records;
+};
+
+Result<std::optional<FlushUndoFile>> ReadFlushUndo(
+    const std::filesystem::path& directory)
+{
+    const auto path{directory / FLUSH_UNDO_NAME};
+    struct stat status{};
+    if (::lstat(path.c_str(), &status) != 0) {
+        if (errno == ENOENT) {
+            return Result<std::optional<FlushUndoFile>>::Ok(std::nullopt);
+        }
+        return Result<std::optional<FlushUndoFile>>::Err(
+            ErrnoMessage("inspect flush undo journal"));
+    }
+    auto owned{ReadOwnedFile(path)};
+    if (!owned) return Result<std::optional<FlushUndoFile>>::Err(owned.Error());
+    const auto& bytes{owned.Value().bytes};
+    if (bytes.size() < FLUSH_UNDO_HEADER_SIZE + FLUSH_UNDO_TRAILER_SIZE) {
+        return Result<std::optional<FlushUndoFile>>::Err(
+            "flush undo journal is truncated");
+    }
+    std::array<std::byte, FLUSH_UNDO_COMMIT.size()> commit{};
+    std::copy(bytes.end() - static_cast<std::ptrdiff_t>(commit.size()),
+              bytes.end(), commit.begin());
+    if (commit != FLUSH_UNDO_COMMIT) {
+        return Result<std::optional<FlushUndoFile>>::Err(
+            "flush undo journal commit marker is missing");
+    }
+    const std::size_t checksum_offset{bytes.size() - FLUSH_UNDO_TRAILER_SIZE};
+    uint64_t expected_checksum{0};
+    ByteReader checksum_reader{
+        std::span<const std::byte>{bytes}.subspan(checksum_offset, sizeof(uint64_t))};
+    if (!checksum_reader.ReadUnsigned(expected_checksum) ||
+        Checksum(std::span<const std::byte>{bytes}.first(checksum_offset)) !=
+            expected_checksum) {
+        return Result<std::optional<FlushUndoFile>>::Err(
+            "flush undo journal checksum mismatch");
+    }
+
+    ByteReader reader{std::span<const std::byte>{bytes}.first(checksum_offset)};
+    std::array<std::byte, FLUSH_UNDO_MAGIC.size()> magic{};
+    uint32_t version{0};
+    uint64_t record_count{0};
+    FlushUndoFile journal;
+    if (!reader.ReadBytes(magic) || magic != FLUSH_UNDO_MAGIC ||
+        !reader.ReadUnsigned(version) || version != FLUSH_UNDO_VERSION ||
+        !reader.ReadUnsigned(journal.base_generation) ||
+        !reader.ReadUnsigned(journal.target_generation) ||
+        !reader.ReadUnsigned(journal.target_base_lsn) ||
+        !reader.ReadUnsigned(journal.target_point.height) ||
+        !reader.ReadHash(journal.target_point.block_hash) ||
+        !reader.ReadUnsigned(record_count) || record_count >= NO_NODE ||
+        journal.target_generation != journal.base_generation + 1) {
+        return Result<std::optional<FlushUndoFile>>::Err(
+            "flush undo journal header is invalid");
+    }
+    if (record_count >
+        (std::numeric_limits<std::size_t>::max() - FLUSH_UNDO_HEADER_SIZE -
+         FLUSH_UNDO_TRAILER_SIZE) / FLUSH_UNDO_RECORD_SIZE ||
+        bytes.size() != FLUSH_UNDO_HEADER_SIZE +
+            static_cast<std::size_t>(record_count) * FLUSH_UNDO_RECORD_SIZE +
+            FLUSH_UNDO_TRAILER_SIZE) {
+        return Result<std::optional<FlushUndoFile>>::Err(
+            "flush undo journal size is inconsistent");
+    }
+    journal.records.reserve(static_cast<std::size_t>(record_count));
+    NodeId previous{NO_NODE};
+    for (uint64_t index{0}; index < record_count; ++index) {
+        NodeId id{NO_NODE};
+        NodeRecord record;
+        if (!reader.ReadUnsigned(id) || !reader.ReadRecord(record) ||
+            (previous != NO_NODE && id <= previous)) {
+            return Result<std::optional<FlushUndoFile>>::Err(
+                "flush undo journal records are invalid or unsorted");
+        }
+        journal.records.emplace_back(id, record);
+        previous = id;
+    }
+    if (!reader.Done()) {
+        return Result<std::optional<FlushUndoFile>>::Err(
+            "flush undo journal has trailing payload data");
+    }
+    journal.descriptor = std::move(owned.Value().descriptor);
+    return Result<std::optional<FlushUndoFile>>::Ok(
+        std::optional<FlushUndoFile>{std::move(journal)});
+}
+
+Result<void> RemoveFlushUndo(const std::filesystem::path& directory,
+                             const FlushUndoFile& journal)
+{
+    const auto path{directory / FLUSH_UNDO_NAME};
+    auto inspected{InspectOwnedRegularFile(journal.descriptor.Get(), path,
+                                           "flush undo journal")};
+    if (!inspected) return inspected;
+    if (::unlink(path.c_str()) != 0) {
+        return Result<void>::Err(ErrnoMessage("remove flush undo journal"));
+    }
+    return SyncDirectory(directory);
+}
+
 Result<OnlineSuperblock> ReadBestSuperblock(const std::filesystem::path& directory)
 {
     std::optional<OnlineSuperblock> best;
@@ -1576,6 +2290,223 @@ Result<OnlineSuperblock> ReadBestSuperblock(const std::filesystem::path& directo
     }
     if (!best) return Result<OnlineSuperblock>::Err("no valid online superblock: " + errors);
     return Result<OnlineSuperblock>::Ok(*best);
+}
+
+Result<Hash256> OnlineBaseFingerprint(const OnlineSuperblock& state,
+                                      const NodeArena& arena)
+{
+    auto bytes{SerializeSuperblock(state)};
+    bytes.reserve(bytes.size() + state.roots.size() * Hash256::SIZE);
+    for (const NodeId root : state.roots) {
+        if (root == NO_NODE) {
+            bytes.insert(bytes.end(), Hash256::SIZE, std::byte{0});
+            continue;
+        }
+        auto record{arena.BaseRecord(root)};
+        if (!record) return Result<Hash256>::Err(record.Error());
+        AppendHash(bytes, record.Value().hash);
+    }
+    return Result<Hash256>::Ok(Sha512_256(bytes));
+}
+
+std::filesystem::path DeltaPath(const std::filesystem::path& directory,
+                                uint64_t generation)
+{
+    std::ostringstream name;
+    name << "delta-" << std::setw(20) << std::setfill('0') << generation
+         << ".run";
+    return directory / name.str();
+}
+
+std::optional<uint64_t> DeltaGeneration(std::string_view name)
+{
+    constexpr std::size_t PREFIX_SIZE{6};
+    constexpr std::size_t DIGITS{20};
+    constexpr std::string_view SUFFIX{".run"};
+    if (name.size() != PREFIX_SIZE + DIGITS + SUFFIX.size() ||
+        !name.starts_with("delta-") || !name.ends_with(SUFFIX)) {
+        return std::nullopt;
+    }
+    uint64_t generation{0};
+    for (const char digit : name.substr(PREFIX_SIZE, DIGITS)) {
+        if (digit < '0' || digit > '9') return std::nullopt;
+        const uint64_t value{static_cast<uint64_t>(digit - '0')};
+        if (generation > (std::numeric_limits<uint64_t>::max() - value) / 10) {
+            return std::nullopt;
+        }
+        generation = generation * 10 + value;
+    }
+    return generation == 0 ? std::nullopt : std::optional<uint64_t>{generation};
+}
+
+std::vector<std::byte> SerializeDeltaHeader(const DeltaState& state)
+{
+    std::vector<std::byte> bytes;
+    bytes.reserve(DELTA_HEADER_SIZE);
+    bytes.insert(bytes.end(), DELTA_MAGIC.begin(), DELTA_MAGIC.end());
+    AppendUnsigned(bytes, DELTA_FORMAT_VERSION);
+    AppendUnsigned(bytes, state.snapshot ? DELTA_FLAG_SNAPSHOT : 0U);
+    AppendUnsigned(bytes, state.generation);
+    AppendUnsigned(bytes, state.previous_generation);
+    AppendUnsigned(bytes, state.base_generation);
+    AppendUnsigned(bytes, state.physical_base_lsn);
+    AppendHash(bytes, state.base_fingerprint);
+    AppendUnsigned(bytes, state.previous_lsn);
+    AppendUnsigned(bytes, state.end_lsn);
+    AppendUnsigned(bytes, state.base_chain_count);
+    AppendUnsigned(bytes, state.point.height);
+    AppendHash(bytes, state.point.block_hash);
+    AppendUnsigned(bytes, state.num_leaves);
+    AppendUnsigned(bytes, state.next);
+    AppendUnsigned(bytes, state.live_nodes);
+    AppendUnsigned(bytes, state.chain_hash_count);
+    AppendUnsigned(bytes, state.record_count);
+    for (const NodeId root : state.roots) AppendUnsigned(bytes, root);
+    return bytes;
+}
+
+struct DeltaWriteMetrics {
+    uint64_t file_bytes{0};
+    uint64_t chain_bytes{0};
+    uint64_t write_us{0};
+    uint64_t sync_us{0};
+};
+
+struct WrittenDelta {
+    std::unique_ptr<MappedDeltaRun> run;
+    DeltaWriteMetrics metrics;
+};
+
+template <typename VisitRecords>
+Result<WrittenDelta> WriteDeltaRun(const std::filesystem::path& directory,
+                                   const DeltaState& state,
+                                   std::span<const Hash256> chain_hashes,
+                                   VisitRecords&& visit_records)
+{
+    if (state.generation == 0 || state.record_count >= NO_NODE ||
+        state.base_chain_count == 0 ||
+        state.chain_hash_count != chain_hashes.size() ||
+        state.base_chain_count > chain_hashes.size() || chain_hashes.empty() ||
+        chain_hashes.back() != state.point.block_hash) {
+        return Result<WrittenDelta>::Err("invalid forest delta publication state");
+    }
+    const auto final_path{DeltaPath(directory, state.generation)};
+    const std::filesystem::path temporary{final_path.string() + ".tmp"};
+    struct stat existing{};
+    if (::lstat(final_path.c_str(), &existing) == 0) {
+        return Result<WrittenDelta>::Err(
+            "forest delta generation already exists: " + final_path.string());
+    }
+    if (errno != ENOENT) {
+        return Result<WrittenDelta>::Err(
+            ErrnoMessage("inspect forest delta destination"));
+    }
+    auto opened{CreateFreshTemporaryFile(temporary,
+                                         "forest delta temporary file")};
+    if (!opened) return Result<WrittenDelta>::Err(opened.Error());
+
+    const auto write_start{std::chrono::steady_clock::now()};
+    const auto header{SerializeDeltaHeader(state)};
+    if (header.size() != DELTA_HEADER_SIZE) {
+        return Result<WrittenDelta>::Err(
+            "forest delta header has an unexpected size");
+    }
+    uint64_t checksum{CHECKSUM_OFFSET};
+    ExtendChecksum(checksum, header);
+    auto written{WriteAll(opened.Value().Get(), header)};
+    if (!written) return Result<WrittenDelta>::Err(written.Error());
+
+    constexpr std::size_t RECORD_BUFFER_BYTES{1024 * 1024};
+    std::vector<DeltaDiskRecord> buffer;
+    buffer.reserve(RECORD_BUFFER_BYTES / sizeof(DeltaDiskRecord));
+    uint64_t records_written{0};
+    NodeId previous{NO_NODE};
+    Result<void> record_result{Result<void>::Ok()};
+    const auto flush_records = [&]() -> Result<void> {
+        if (buffer.empty()) return Result<void>::Ok();
+        const auto bytes{std::as_bytes(std::span<const DeltaDiskRecord>{buffer})};
+        ExtendChecksum(checksum, bytes);
+        auto result{WriteAll(opened.Value().Get(), bytes)};
+        buffer.clear();
+        return result;
+    };
+    visit_records([&](NodeId id, const NodeRecord& record) {
+        if (!record_result) return false;
+        if (id >= state.next || (previous != NO_NODE && id <= previous)) {
+            record_result = Result<void>::Err(
+                "forest delta records are outside the arena or unsorted");
+            return false;
+        }
+        buffer.push_back(DeltaDiskRecord{
+            .id = id,
+            .hash = record.hash,
+            .parent = record.parent,
+            .left = record.left,
+            .right = record.right,
+            .type = static_cast<uint8_t>(record.type),
+            .reserved = {},
+        });
+        previous = id;
+        ++records_written;
+        if (buffer.size() * sizeof(DeltaDiskRecord) >= RECORD_BUFFER_BYTES) {
+            record_result = flush_records();
+        }
+        return static_cast<bool>(record_result);
+    });
+    if (record_result) record_result = flush_records();
+    if (!record_result) {
+        return Result<WrittenDelta>::Err(record_result.Error());
+    }
+    if (records_written != state.record_count) {
+        return Result<WrittenDelta>::Err(
+            "forest delta record count changed during publication");
+    }
+
+    const auto suffix{chain_hashes.subspan(
+        static_cast<std::size_t>(state.base_chain_count))};
+    const auto suffix_bytes{std::as_bytes(suffix)};
+    ExtendChecksum(checksum, suffix_bytes);
+    written = WriteAll(opened.Value().Get(), suffix_bytes);
+    if (!written) return Result<WrittenDelta>::Err(written.Error());
+    std::vector<std::byte> trailer;
+    trailer.reserve(DELTA_TRAILER_SIZE);
+    AppendUnsigned(trailer, checksum);
+    trailer.insert(trailer.end(), DELTA_COMMIT.begin(), DELTA_COMMIT.end());
+    written = WriteAll(opened.Value().Get(), trailer);
+    if (!written) return Result<WrittenDelta>::Err(written.Error());
+    DeltaWriteMetrics metrics{
+        .file_bytes = DELTA_HEADER_SIZE +
+            state.record_count * sizeof(DeltaDiskRecord) + suffix_bytes.size() +
+            DELTA_TRAILER_SIZE,
+        .chain_bytes = suffix_bytes.size(),
+        .write_us = ElapsedMicros(write_start),
+    };
+
+    const auto sync_start{std::chrono::steady_clock::now()};
+    auto synced{SyncDescriptor(opened.Value().Get(), "forest delta run")};
+    if (!synced) return Result<WrittenDelta>::Err(synced.Error());
+    auto inspected{InspectOwnedRegularFile(opened.Value().Get(), temporary,
+                                           "forest delta temporary file")};
+    if (!inspected) return Result<WrittenDelta>::Err(inspected.Error());
+    std::error_code rename_error;
+    std::filesystem::rename(temporary, final_path, rename_error);
+    if (rename_error) {
+        return Result<WrittenDelta>::Err(
+            "publish forest delta run: " + rename_error.message());
+    }
+    inspected = InspectOwnedRegularFile(opened.Value().Get(), final_path,
+                                        "published forest delta run");
+    if (!inspected) return Result<WrittenDelta>::Err(inspected.Error());
+    synced = SyncDirectory(directory);
+    metrics.sync_us = ElapsedMicros(sync_start);
+    if (!synced) return Result<WrittenDelta>::Err(synced.Error());
+
+    auto mapped{MappedDeltaRun::Open(final_path)};
+    if (!mapped) return Result<WrittenDelta>::Err(mapped.Error());
+    return Result<WrittenDelta>::Ok(WrittenDelta{
+        .run = mapped.Take(),
+        .metrics = metrics,
+    });
 }
 
 enum class WalKind : uint8_t { CONNECT = 1, DISCONNECT = 2 };
@@ -1707,7 +2638,9 @@ public:
                 std::optional<std::filesystem::path> publish_target = std::nullopt)
         : m_directory{std::move(directory)}, m_config{config}, m_base{base},
           m_point{base.point}, m_chain_hashes{std::move(chain_hashes)},
-          m_current_lsn{base.base_lsn}, m_lock{std::move(lock)},
+          m_current_lsn{base.base_lsn}, m_durable_lsn{base.base_lsn},
+          m_durable_live_nodes{base.live_nodes},
+          m_lock{std::move(lock)},
           m_publish_target{std::move(publish_target)}
     {
     }
@@ -1725,8 +2658,18 @@ public:
     const OnlineForestConfig& Config() const { return m_config; }
     const ChainPoint& Point() const { return m_point; }
     const std::vector<Hash256>& ChainHashes() const { return m_chain_hashes; }
-    uint64_t BaseLsn() const { return m_base.base_lsn; }
+    uint64_t BaseLsn() const { return m_durable_lsn; }
+    uint64_t PhysicalBaseLsn() const { return m_base.base_lsn; }
     uint64_t CurrentLsn() const { return m_current_lsn; }
+    uint64_t DurableLiveNodes() const { return m_durable_live_nodes; }
+    uint64_t DeltaBytes() const { return m_delta_bytes; }
+    uint64_t DeltaRuns() const { return m_delta_runs; }
+    uint64_t DeltaRecords() const { return m_delta_records; }
+    uint64_t DeltaUniqueRecords() const { return m_delta_unique_records; }
+    uint64_t DeltaObsoleteRecords() const
+    {
+        return m_delta_records - m_delta_unique_records;
+    }
     uint64_t WalBytes() const { return m_wal_bytes; }
     uint64_t RedoWalBytes() const { return m_redo_wal_bytes; }
     uint64_t WalSegmentDirectorySyncs() const { return m_wal_segment_directory_syncs; }
@@ -1738,6 +2681,24 @@ public:
     uint64_t LastTransactionSyncUs() const { return m_last_transaction_sync_us; }
     uint64_t LastTransactionPublishUs() const { return m_last_transaction_publish_us; }
     uint64_t LastTransactionTotalUs() const { return m_last_transaction_total_us; }
+    uint64_t LastFlushDirtyNodes() const { return m_last_flush_dirty_nodes; }
+    uint64_t LastFlushSortUs() const { return m_last_flush_sort_us; }
+    uint64_t LastFlushCleanupUs() const { return m_last_flush_cleanup_us; }
+    uint64_t LastFlushTotalUs() const { return m_last_flush_total_us; }
+    uint64_t LastFlushDeltaBytes() const { return m_last_flush_delta_bytes; }
+    uint64_t LastFlushChainBytes() const { return m_last_flush_chain_bytes; }
+    uint64_t LastFlushWriteUs() const { return m_last_flush_write_us; }
+    uint64_t LastFlushSyncUs() const { return m_last_flush_sync_us; }
+    uint64_t LastFlushCompactionInputRecords() const
+    {
+        return m_last_flush_compaction_input_records;
+    }
+    uint64_t LastFlushCompactionOutputRecords() const
+    {
+        return m_last_flush_compaction_output_records;
+    }
+    bool LastFlushCompacted() const { return m_last_flush_compacted; }
+    bool WalEnabled() const { return m_config.sync_wal; }
     bool IsPendingPublication() const { return m_publish_target.has_value(); }
 
     Result<void> Publish()
@@ -1763,7 +2724,7 @@ public:
         return SyncDirectory(parent);
     }
 
-    Result<void> Append(WalTransaction& transaction)
+    Result<void> Append(WalTransaction& transaction, uint64_t changed_nodes)
     {
         const auto total_start{std::chrono::steady_clock::now()};
         const bool chain_valid{transaction.previous == m_point &&
@@ -1780,28 +2741,33 @@ public:
         }
         transaction.lsn = m_current_lsn + 1;
         const auto serialize_start{std::chrono::steady_clock::now()};
-        const auto bytes{SerializeWal(transaction)};
+        const auto bytes{m_config.sync_wal ? SerializeWal(transaction) :
+                                            std::vector<std::byte>{}};
         const uint64_t serialize_us{ElapsedMicros(serialize_start)};
-        const auto segment_start{std::chrono::steady_clock::now()};
-        auto opened{OpenAppendSegment(bytes.size())};
-        if (!opened) return opened;
-        const uint64_t segment_us{ElapsedMicros(segment_start)};
-        const auto write_start{std::chrono::steady_clock::now()};
-        auto written{WriteAll(m_wal_fd, bytes)};
-        if (!written) return written;
-        const uint64_t write_us{ElapsedMicros(write_start)};
+        uint64_t segment_us{0};
+        uint64_t write_us{0};
         uint64_t sync_us{0};
         if (m_config.sync_wal) {
+            const auto segment_start{std::chrono::steady_clock::now()};
+            auto opened{OpenAppendSegment(bytes.size())};
+            if (!opened) return opened;
+            segment_us = ElapsedMicros(segment_start);
+            const auto write_start{std::chrono::steady_clock::now()};
+            auto written{WriteAll(m_wal_fd, bytes)};
+            if (!written) return written;
+            write_us = ElapsedMicros(write_start);
             const auto sync_start{std::chrono::steady_clock::now()};
             auto synced{SyncDescriptor(m_wal_fd, "forest WAL")};
             if (!synced) return synced;
             sync_us = ElapsedMicros(sync_start);
         }
         const auto publish_start{std::chrono::steady_clock::now()};
-        m_wal_segment_size += bytes.size();
-        m_wal_bytes += bytes.size();
-        m_redo_wal_bytes += bytes.size();
-        m_last_transaction_nodes = transaction.changes.size();
+        if (m_config.sync_wal) {
+            m_wal_segment_size += bytes.size();
+            m_wal_bytes += bytes.size();
+            m_redo_wal_bytes += bytes.size();
+        }
+        m_last_transaction_nodes = changed_nodes;
         m_last_transaction_wal_bytes = bytes.size();
         m_current_lsn = transaction.lsn;
         m_point = transaction.point;
@@ -1858,6 +2824,116 @@ public:
         return Result<WalTransaction>::Ok(std::move(*match));
     }
 
+    Result<void> RecoverDeltas(NodeArena& arena,
+                               std::array<NodeId, 64>& roots,
+                               uint64_t& num_leaves)
+    {
+        std::vector<std::pair<uint64_t, std::filesystem::path>> paths;
+        std::error_code iterator_error;
+        for (std::filesystem::directory_iterator iterator{m_directory, iterator_error}, end;
+             !iterator_error && iterator != end; iterator.increment(iterator_error)) {
+            const auto name{iterator->path().filename().string()};
+            if (!name.starts_with("delta-") || !name.ends_with(".run")) continue;
+            const auto generation{DeltaGeneration(name)};
+            if (!generation) {
+                return Result<void>::Err(
+                    "forest delta filename is malformed: " + name);
+            }
+            paths.emplace_back(*generation, iterator->path());
+        }
+        if (iterator_error) {
+            return Result<void>::Err(
+                "scan forest delta directory: " + iterator_error.message());
+        }
+        std::ranges::sort(paths, {}, &std::pair<uint64_t,
+                                                std::filesystem::path>::first);
+        std::vector<std::unique_ptr<MappedDeltaRun>> runs;
+        runs.reserve(paths.size());
+        std::optional<std::size_t> latest_snapshot;
+        uint64_t prior_generation{0};
+        for (const auto& [generation, path] : paths) {
+            if (generation == prior_generation) {
+                return Result<void>::Err("duplicate forest delta generation");
+            }
+            auto run{MappedDeltaRun::Open(path)};
+            if (!run) return Result<void>::Err(run.Error());
+            if (run.Value()->State().generation != generation) {
+                return Result<void>::Err(
+                    "forest delta filename does not match its generation");
+            }
+            if (run.Value()->State().snapshot) latest_snapshot = runs.size();
+            runs.push_back(run.Take());
+            prior_generation = generation;
+        }
+        if (runs.empty()) return Result<void>::Ok();
+        auto base_fingerprint{OnlineBaseFingerprint(m_base, arena)};
+        if (!base_fingerprint) {
+            return Result<void>::Err(base_fingerprint.Error());
+        }
+
+        const std::size_t first{latest_snapshot.value_or(0)};
+        uint64_t expected_generation{0};
+        uint64_t expected_lsn{m_base.base_lsn};
+        for (std::size_t index{first}; index < runs.size(); ++index) {
+            const auto& state{runs[index]->State()};
+            if (state.base_generation != m_base.generation ||
+                state.physical_base_lsn != m_base.base_lsn ||
+                state.end_lsn < m_base.base_lsn ||
+                state.base_fingerprint != base_fingerprint.Value() ||
+                state.base_chain_count != m_base.chain_hash_count) {
+                return Result<void>::Err(
+                    "forest delta is anchored to a different mmap base");
+            }
+            if (index == first && state.snapshot) {
+                // A compacted snapshot is complete relative to the physical
+                // base, so predecessors may already have been unlinked.
+            } else if (state.previous_generation != expected_generation ||
+                       state.generation != expected_generation + 1 ||
+                       state.previous_lsn != expected_lsn) {
+                return Result<void>::Err(
+                    "forest delta generations or LSNs are not contiguous");
+            }
+            if (index != first && state.snapshot) {
+                return Result<void>::Err(
+                    "unexpected forest delta snapshot after recovery start");
+            }
+
+            std::vector<Hash256> recovered_chain{
+                m_chain_hashes.begin(),
+                m_chain_hashes.begin() +
+                    static_cast<std::ptrdiff_t>(m_base.chain_hash_count)};
+            const uint64_t suffix_count{
+                state.chain_hash_count - state.base_chain_count};
+            recovered_chain.reserve(
+                static_cast<std::size_t>(state.chain_hash_count));
+            for (uint64_t suffix{0}; suffix < suffix_count; ++suffix) {
+                recovered_chain.push_back(runs[index]->ChainSuffixHash(
+                    static_cast<std::size_t>(suffix)));
+            }
+            if (recovered_chain.empty() ||
+                recovered_chain.back() != state.point.block_hash ||
+                (suffix_count == 0 && state.point != m_base.point)) {
+                return Result<void>::Err(
+                    "forest delta chain does not extend its mmap base");
+            }
+
+            roots = state.roots;
+            num_leaves = state.num_leaves;
+            arena.SetRecoveredNext(state.next);
+            m_chain_hashes = std::move(recovered_chain);
+            m_point = state.point;
+            m_current_lsn = state.end_lsn;
+            m_durable_lsn = state.end_lsn;
+            m_durable_live_nodes = state.live_nodes;
+            m_delta_generation = state.generation;
+            expected_generation = state.generation;
+            expected_lsn = state.end_lsn;
+            arena.AppendDeltaRun(std::move(runs[index]));
+        }
+        RefreshDeltaStats(arena);
+        return Result<void>::Ok();
+    }
+
     Result<void> Recover(NodeArena& arena, std::array<NodeId, 64>& roots,
                          uint64_t& num_leaves)
     {
@@ -1870,47 +2946,181 @@ public:
         }
         if (iterator_error) return Result<void>::Err("scan WAL directory: " + iterator_error.message());
         std::ranges::sort(segments);
-        uint64_t last_seen_lsn{m_base.base_lsn};
+        uint64_t last_seen_lsn{m_durable_lsn};
         for (const auto& path : segments) {
             auto recovered{RecoverSegment(path, arena, roots, num_leaves, last_seen_lsn)};
             if (!recovered) return recovered;
         }
-        m_current_lsn = std::max(m_base.base_lsn, last_seen_lsn);
+        m_current_lsn = std::max(m_durable_lsn, last_seen_lsn);
         return Result<void>::Ok();
     }
 
-    Result<void> FlushBase(NodeArena& arena, const std::array<NodeId, 64>& roots,
+    Result<void> SealDelta(NodeArena& arena,
+                           const std::array<NodeId, 64>& roots,
                            uint64_t num_leaves)
     {
-        OnlineSuperblock next{
-            .generation = m_base.generation + 1,
-            .base_lsn = m_current_lsn,
+        const auto total_start{std::chrono::steady_clock::now()};
+        ResetFlushMetrics(arena.DirtyNodes());
+        const auto sort_start{std::chrono::steady_clock::now()};
+        const auto ordered_ids{arena.SortedVisibleDirtyIds()};
+        m_last_flush_sort_us = ElapsedMicros(sort_start);
+        auto base_fingerprint{OnlineBaseFingerprint(m_base, arena)};
+        if (!base_fingerprint) {
+            return Result<void>::Err(base_fingerprint.Error());
+        }
+        const DeltaState state{
+            .snapshot = false,
+            .generation = m_delta_generation + 1,
+            .previous_generation = m_delta_generation,
+            .base_generation = m_base.generation,
+            .physical_base_lsn = m_base.base_lsn,
+            .base_fingerprint = base_fingerprint.Value(),
+            .previous_lsn = m_durable_lsn,
+            .end_lsn = m_current_lsn,
+            .base_chain_count = m_base.chain_hash_count,
             .point = m_point,
             .num_leaves = num_leaves,
             .next = static_cast<NodeId>(arena.Next()),
             .live_nodes = arena.LiveCount(),
-            .capacity_slots = arena.Capacity(),
             .chain_hash_count = m_chain_hashes.size(),
+            .record_count = ordered_ids.size(),
             .roots = roots,
         };
-        auto forest_written{arena.WriteDirtyToBase(m_directory / "forest.hashes",
-                                                    m_directory / "forest.meta")};
-        if (!forest_written) return forest_written;
-        // Chain entries can change at existing heights after a reorg, so an
-        // in-place rewrite cannot be made atomic with a separately published
-        // superblock. Write the inactive generation in full and synchronize its
-        // directory entry before publishing the matching superblock.
-        auto chain_written{WriteChainHashes(next.generation)};
-        if (!chain_written) return chain_written;
-        auto state_written{WriteSuperblock(m_directory, next)};
-        if (!state_written) return state_written;
+        auto written{WriteDeltaRun(m_directory, state, m_chain_hashes,
+            [&](auto&& emit) {
+                for (const NodeId id : ordered_ids) {
+                    if (!emit(id, arena.DirtyRecord(id))) break;
+                }
+            })};
+        if (!written) return Result<void>::Err(written.Error());
+        AccumulateDeltaWriteMetrics(written.Value().metrics);
+        arena.AppendDeltaRun(std::move(written.Value().run));
         arena.ClearDirty();
-        m_base = next;
+        m_delta_generation = state.generation;
+        m_durable_lsn = state.end_lsn;
+        m_durable_live_nodes = state.live_nodes;
         m_redo_wal_bytes = 0;
-        return PruneWal();
+        RefreshDeltaStats(arena);
+
+        const bool run_pressure{m_delta_runs >= m_config.max_delta_runs};
+        const bool garbage_pressure{
+            m_delta_runs >= m_config.delta_compaction_min_runs &&
+            m_delta_records != 0 &&
+            static_cast<long double>(DeltaObsoleteRecords()) * 100.0L >=
+                static_cast<long double>(m_delta_records) *
+                    m_config.delta_compaction_garbage_percent};
+        if (run_pressure || garbage_pressure) {
+            auto compacted{CompactDeltas(arena, roots, num_leaves)};
+            if (!compacted) return compacted;
+        }
+        const auto cleanup_start{std::chrono::steady_clock::now()};
+        auto pruned{PruneWal()};
+        m_last_flush_cleanup_us += ElapsedMicros(cleanup_start);
+        m_last_flush_total_us = ElapsedMicros(total_start);
+        return pruned;
     }
 
 private:
+    void ResetFlushMetrics(uint64_t dirty_nodes)
+    {
+        m_last_flush_dirty_nodes = dirty_nodes;
+        m_last_flush_sort_us = 0;
+        m_last_flush_cleanup_us = 0;
+        m_last_flush_total_us = 0;
+        m_last_flush_delta_bytes = 0;
+        m_last_flush_chain_bytes = 0;
+        m_last_flush_write_us = 0;
+        m_last_flush_sync_us = 0;
+        m_last_flush_compaction_input_records = 0;
+        m_last_flush_compaction_output_records = 0;
+        m_last_flush_compacted = false;
+    }
+
+    void AccumulateDeltaWriteMetrics(const DeltaWriteMetrics& metrics)
+    {
+        m_last_flush_delta_bytes += metrics.file_bytes;
+        m_last_flush_chain_bytes += metrics.chain_bytes;
+        m_last_flush_write_us += metrics.write_us;
+        m_last_flush_sync_us += metrics.sync_us;
+    }
+
+    void RefreshDeltaStats(const NodeArena& arena)
+    {
+        m_delta_bytes = arena.DeltaBytes();
+        m_delta_runs = arena.DeltaRunCount();
+        m_delta_records = arena.DeltaRecords();
+        m_delta_unique_records = arena.UniqueDeltaRecords();
+    }
+
+    Result<void> CompactDeltas(NodeArena& arena,
+                               const std::array<NodeId, 64>& roots,
+                               uint64_t num_leaves)
+    {
+        const uint64_t input_records{m_delta_records};
+        uint64_t output_records{0};
+        arena.ForEachLatestDeltaRecord(
+            [&](NodeId id, const NodeRecord& record) {
+                if (!arena.EqualsPhysicalBase(id, record)) ++output_records;
+                return true;
+            });
+        auto base_fingerprint{OnlineBaseFingerprint(m_base, arena)};
+        if (!base_fingerprint) {
+            return Result<void>::Err(base_fingerprint.Error());
+        }
+        const DeltaState snapshot{
+            .snapshot = true,
+            .generation = m_delta_generation + 1,
+            .previous_generation = m_delta_generation,
+            .base_generation = m_base.generation,
+            .physical_base_lsn = m_base.base_lsn,
+            .base_fingerprint = base_fingerprint.Value(),
+            .previous_lsn = m_durable_lsn,
+            .end_lsn = m_durable_lsn,
+            .base_chain_count = m_base.chain_hash_count,
+            .point = m_point,
+            .num_leaves = num_leaves,
+            .next = static_cast<NodeId>(arena.Next()),
+            .live_nodes = arena.LiveCount(),
+            .chain_hash_count = m_chain_hashes.size(),
+            .record_count = output_records,
+            .roots = roots,
+        };
+        std::vector<std::filesystem::path> obsolete_paths;
+        obsolete_paths.reserve(arena.DeltaRuns().size());
+        for (const auto& run : arena.DeltaRuns()) {
+            obsolete_paths.push_back(run->Path());
+        }
+        auto written{WriteDeltaRun(m_directory, snapshot, m_chain_hashes,
+            [&](auto&& emit) {
+                arena.ForEachLatestDeltaRecord(
+                    [&](NodeId id, const NodeRecord& record) {
+                        return arena.EqualsPhysicalBase(id, record) ||
+                            emit(id, record);
+                    });
+            })};
+        if (!written) return Result<void>::Err(written.Error());
+        AccumulateDeltaWriteMetrics(written.Value().metrics);
+        arena.ReplaceDeltaRuns(std::move(written.Value().run));
+        m_delta_generation = snapshot.generation;
+        m_last_flush_compacted = true;
+        m_last_flush_compaction_input_records = input_records;
+        m_last_flush_compaction_output_records = output_records;
+        RefreshDeltaStats(arena);
+
+        bool removed_any{false};
+        for (const auto& path : obsolete_paths) {
+            auto owned{OpenOwnedRegularFile(path, O_RDONLY | O_NONBLOCK,
+                                            "obsolete forest delta run")};
+            if (!owned) return Result<void>::Err(owned.Error());
+            if (::unlink(path.c_str()) != 0) {
+                return Result<void>::Err(
+                    ErrnoMessage("remove obsolete forest delta run"));
+            }
+            removed_any = true;
+        }
+        return removed_any ? SyncDirectory(m_directory) : Result<void>::Ok();
+    }
+
     Result<void> OpenAppendSegment(std::size_t record_size)
     {
         if (m_wal_fd >= 0 &&
@@ -1977,7 +3187,7 @@ private:
             auto transaction{ParseWal(std::span<const std::byte>{bytes}.subspan(
                 offset, static_cast<std::size_t>(total_size)))};
             if (!transaction) return Result<void>::Err(path.string() + ": " + transaction.Error());
-            if (transaction.Value().lsn > m_base.base_lsn) {
+            if (transaction.Value().lsn > m_durable_lsn) {
                 if (transaction.Value().lsn != last_seen_lsn + 1) {
                     return Result<void>::Err("non-contiguous WAL LSN after durable base");
                 }
@@ -2023,40 +3233,13 @@ private:
         return Result<void>::Ok();
     }
 
-    Result<void> WriteChainHashes(uint64_t generation)
-    {
-        const auto path{ChainHashesPath(m_directory, generation)};
-        const std::filesystem::path temporary{path.string() + ".tmp"};
-        auto opened{CreateFreshTemporaryFile(temporary,
-                                             "online chain-hash temporary file")};
-        if (!opened) return Result<void>::Err(opened.Error());
-        auto written{WriteAll(opened.Value().Get(),
-            std::as_bytes(std::span<const Hash256>{m_chain_hashes}))};
-        if (written) written = SyncDescriptor(opened.Value().Get(), "online chain hashes");
-        if (!written) return written;
-        auto inspected{InspectOwnedRegularFile(opened.Value().Get(), temporary,
-                                               "online chain-hash temporary file")};
-        if (!inspected) return inspected;
-        auto replaceable{ValidateReplaceableOwnedFile(path, "online chain-hash snapshot")};
-        if (!replaceable) return replaceable;
-        std::error_code rename_error;
-        std::filesystem::rename(temporary, path, rename_error);
-        if (rename_error) {
-            return Result<void>::Err(
-                "publish online chain-hash snapshot: " + rename_error.message());
-        }
-        inspected = InspectOwnedRegularFile(opened.Value().Get(), path,
-                                            "published online chain-hash snapshot");
-        if (!inspected) return inspected;
-        return SyncDirectory(m_directory);
-    }
-
     Result<void> PruneWal()
     {
         // Retain complete segments covering the reorg window. Segment-granular
         // pruning avoids rewriting live WAL data merely to save a partial file.
         const uint32_t floor{m_point.height > m_config.undo_depth ?
             m_point.height - m_config.undo_depth : 0};
+        bool removed_any{false};
         std::error_code iterator_error;
         for (std::filesystem::directory_iterator iterator{m_directory, iterator_error}, end;
              !iterator_error && iterator != end; iterator.increment(iterator_error)) {
@@ -2097,16 +3280,18 @@ private:
                 max_lsn = std::max(max_lsn, transaction.Value().lsn);
                 offset += static_cast<std::size_t>(total);
             }
-            if (valid && max_height < floor && max_lsn <= m_base.base_lsn) {
+            const bool outside_retention{!m_config.sync_wal || max_height < floor};
+            if (valid && outside_retention && max_lsn <= m_durable_lsn) {
                 std::error_code remove_error;
                 const uint64_t size{std::filesystem::file_size(path, remove_error)};
                 if (!remove_error && std::filesystem::remove(path, remove_error) && !remove_error) {
                     m_wal_bytes = size > m_wal_bytes ? 0 : m_wal_bytes - size;
+                    removed_any = true;
                 }
             }
         }
         if (iterator_error) return Result<void>::Err("prune WAL directory: " + iterator_error.message());
-        return SyncDirectory(m_directory);
+        return removed_any ? SyncDirectory(m_directory) : Result<void>::Ok();
     }
 
     std::filesystem::path m_directory;
@@ -2115,6 +3300,13 @@ private:
     ChainPoint m_point;
     std::vector<Hash256> m_chain_hashes;
     uint64_t m_current_lsn{0};
+    uint64_t m_durable_lsn{0};
+    uint64_t m_durable_live_nodes{0};
+    uint64_t m_delta_generation{0};
+    uint64_t m_delta_bytes{0};
+    uint64_t m_delta_runs{0};
+    uint64_t m_delta_records{0};
+    uint64_t m_delta_unique_records{0};
     uint64_t m_wal_bytes{0};
     uint64_t m_redo_wal_bytes{0};
     uint64_t m_wal_segment_directory_syncs{0};
@@ -2128,6 +3320,17 @@ private:
     uint64_t m_last_transaction_sync_us{0};
     uint64_t m_last_transaction_publish_us{0};
     uint64_t m_last_transaction_total_us{0};
+    uint64_t m_last_flush_dirty_nodes{0};
+    uint64_t m_last_flush_sort_us{0};
+    uint64_t m_last_flush_cleanup_us{0};
+    uint64_t m_last_flush_total_us{0};
+    uint64_t m_last_flush_delta_bytes{0};
+    uint64_t m_last_flush_chain_bytes{0};
+    uint64_t m_last_flush_write_us{0};
+    uint64_t m_last_flush_sync_us{0};
+    uint64_t m_last_flush_compaction_input_records{0};
+    uint64_t m_last_flush_compaction_output_records{0};
+    bool m_last_flush_compacted{false};
     OnlineStateLock m_lock;
     std::optional<std::filesystem::path> m_publish_target;
 };
@@ -2413,9 +3616,10 @@ Result<void> PackedForest::ModifyBlock(std::span<const Hash256> additions,
     }
     constexpr uint64_t MAX_REDO_WAL_BYTES{1024ULL * 1024 * 1024};
     if (m_impl->arena.DirtyBytes() >= m_impl->online->Config().max_dirty_bytes ||
-        m_impl->online->RedoWalBytes() >= MAX_REDO_WAL_BYTES) {
+        (m_impl->online->WalEnabled() &&
+         m_impl->online->RedoWalBytes() >= MAX_REDO_WAL_BYTES)) {
         auto flushed{FlushOnline()};
-        if (!flushed) return Result<void>::Err("online base flush required before block: " + flushed.Error());
+        if (!flushed) return Result<void>::Err("online delta seal required before block: " + flushed.Error());
     }
 
     WalTransaction transaction{
@@ -2450,8 +3654,11 @@ Result<void> PackedForest::ModifyBlock(std::span<const Hash256> additions,
         transaction.after_num_leaves = m_impl->num_leaves;
         transaction.after_next = static_cast<NodeId>(m_impl->arena.Next());
         transaction.after_roots = m_impl->roots;
-        transaction.changes = m_impl->arena.TransactionChanges();
-        appended = m_impl->online->Append(transaction);
+        const uint64_t changed_nodes{m_impl->arena.TransactionNodeCount()};
+        if (m_impl->online->WalEnabled()) {
+            transaction.changes = m_impl->arena.TransactionChanges();
+        }
+        appended = m_impl->online->Append(transaction, changed_nodes);
     } catch (...) {
         m_impl->arena.RollbackTransaction();
         m_impl->roots = transaction.before_roots;
@@ -2607,7 +3814,11 @@ Result<void> PackedForest::EnableOnline(const std::filesystem::path& directory,
 {
     if (IsOnline()) return Result<void>::Err("forest is already using online storage");
     if (config.max_dirty_bytes == 0 || config.wal_segment_bytes < 1024 * 1024 ||
-        config.undo_depth == 0) {
+        config.undo_depth == 0 || config.delta_compaction_min_runs < 2 ||
+        config.max_delta_runs < config.delta_compaction_min_runs ||
+        config.max_delta_runs > 1024 ||
+        config.delta_compaction_garbage_percent == 0 ||
+        config.delta_compaction_garbage_percent > 100) {
         return Result<void>::Err("invalid online forest configuration");
     }
     if (chain_hashes.size() != static_cast<std::size_t>(point.height) + 1 ||
@@ -2678,7 +3889,11 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
                                               OnlineForestConfig config)
 {
     if (config.max_dirty_bytes == 0 || config.wal_segment_bytes < 1024 * 1024 ||
-        config.undo_depth == 0) {
+        config.undo_depth == 0 || config.delta_compaction_min_runs < 2 ||
+        config.max_delta_runs < config.delta_compaction_min_runs ||
+        config.max_delta_runs > 1024 ||
+        config.delta_compaction_garbage_percent == 0 ||
+        config.delta_compaction_garbage_percent > 100) {
         return Result<PackedForest>::Err("invalid online forest configuration");
     }
     auto directory_lock{OnlineStateLock::Acquire(directory, true)};
@@ -2694,6 +3909,34 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
     }
     auto state{ReadBestSuperblock(directory)};
     if (!state) return Result<PackedForest>::Err(state.Error());
+    auto pending_flush{ReadFlushUndo(directory)};
+    if (!pending_flush) return Result<PackedForest>::Err(pending_flush.Error());
+    bool restore_base{false};
+    if (pending_flush.Value()) {
+        const auto& journal{*pending_flush.Value()};
+        if (state.Value().generation == journal.target_generation) {
+            if (state.Value().base_lsn != journal.target_base_lsn ||
+                state.Value().point != journal.target_point) {
+                return Result<PackedForest>::Err(
+                    "published superblock does not match the pending flush undo journal");
+            }
+            auto removed{RemoveFlushUndo(directory, journal)};
+            if (!removed) return Result<PackedForest>::Err(removed.Error());
+            pending_flush.Value().reset();
+        } else if (state.Value().generation == journal.base_generation) {
+            restore_base = true;
+            for (const auto& [id, record] : journal.records) {
+                static_cast<void>(record);
+                if (id >= state.Value().next) {
+                    return Result<PackedForest>::Err(
+                        "flush undo journal contains a node outside its base generation");
+                }
+            }
+        } else {
+            return Result<PackedForest>::Err(
+                "flush undo journal does not match either durable superblock generation");
+        }
+    }
     const auto chain_path{state.Value().format_version >= ONLINE_FORMAT_VERSION ?
         ChainHashesPath(directory, state.Value().generation) :
         directory / "chain.hashes"};
@@ -2723,20 +3966,40 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
     auto mapped{forest.m_impl->arena.OpenMapped(directory / "forest.hashes",
                                                 directory / "forest.meta",
                                                 state.Value().capacity_slots,
-                                                state.Value().next)};
+                                                state.Value().next,
+                                                !restore_base, restore_base)};
     if (!mapped) return Result<PackedForest>::Err(mapped.Error());
+    if (restore_base) {
+        auto restored{forest.m_impl->arena.RestoreBase(
+            pending_flush.Value()->records)};
+        if (!restored) return Result<PackedForest>::Err(restored.Error());
+        auto removed{RemoveFlushUndo(directory, *pending_flush.Value())};
+        if (!removed) return Result<PackedForest>::Err(removed.Error());
+        pending_flush.Value().reset();
+        auto read_only{forest.m_impl->arena.ReopenBaseReadOnly(
+            directory / "forest.hashes", directory / "forest.meta")};
+        if (!read_only) return Result<PackedForest>::Err(read_only.Error());
+        auto bookkeeping{forest.m_impl->arena.RebuildBookkeeping()};
+        if (!bookkeeping) return Result<PackedForest>::Err(bookkeeping.Error());
+    }
     auto online{std::make_unique<OnlineStore>(directory, config, state.Value(),
                                                std::move(recovered_chain),
                                                directory_lock.Take())};
+    auto deltas_recovered{online->RecoverDeltas(forest.m_impl->arena,
+                                                forest.m_impl->roots,
+                                                forest.m_impl->num_leaves)};
+    if (!deltas_recovered) {
+        return Result<PackedForest>::Err(deltas_recovered.Error());
+    }
     auto recovered{online->Recover(forest.m_impl->arena, forest.m_impl->roots,
                                    forest.m_impl->num_leaves)};
     if (!recovered) return Result<PackedForest>::Err(recovered.Error());
     auto bookkeeping{forest.m_impl->arena.RebuildBookkeeping()};
     if (!bookkeeping) return Result<PackedForest>::Err(bookkeeping.Error());
-    if (online->CurrentLsn() == state.Value().base_lsn &&
-        forest.m_impl->arena.LiveCount() != state.Value().live_nodes) {
+    if (online->CurrentLsn() == online->BaseLsn() &&
+        forest.m_impl->arena.LiveCount() != online->DurableLiveNodes()) {
         return Result<PackedForest>::Err(
-            "online arena live-node count does not match its superblock");
+            "online arena live-node count does not match its durable state");
     }
     auto rebuilt{forest.m_impl->RebuildIndexAndValidate()};
     if (!rebuilt) return Result<PackedForest>::Err(rebuilt.Error());
@@ -2766,7 +4029,8 @@ Result<void> PackedForest::FlushOnline()
         m_impl->online->BaseLsn() == m_impl->online->CurrentLsn()) {
         return Result<void>::Ok();
     }
-    return m_impl->online->FlushBase(m_impl->arena, m_impl->roots, m_impl->num_leaves);
+    return m_impl->online->SealDelta(m_impl->arena, m_impl->roots,
+                                     m_impl->num_leaves);
 }
 
 Result<ChainPoint> PackedForest::RollbackOnlineBlock()
@@ -2775,6 +4039,10 @@ Result<ChainPoint> PackedForest::RollbackOnlineBlock()
     if (m_impl->online->IsPendingPublication()) {
         return Result<ChainPoint>::Err(
             "publish the validated online generation before rolling it back");
+    }
+    if (!m_impl->online->WalEnabled()) {
+        return Result<ChainPoint>::Err(
+            "online forest WAL is disabled; restart from the last base and replay Bitcoin Core");
     }
     const ChainPoint current{m_impl->online->Point()};
     if (current.height == 0) return Result<ChainPoint>::Err("cannot roll back the genesis point");
@@ -2810,7 +4078,7 @@ Result<ChainPoint> PackedForest::RollbackOnlineBlock()
     if (applied) {
         m_impl->roots = rollback.after_roots;
         m_impl->num_leaves = rollback.after_num_leaves;
-        applied = m_impl->online->Append(rollback);
+        applied = m_impl->online->Append(rollback, rollback.changes.size());
     }
     if (!applied) {
         m_impl->arena.RollbackTransaction();
@@ -2839,11 +4107,19 @@ OnlineForestUsage PackedForest::OnlineUsage() const
     if (!m_impl->online) return {};
     return OnlineForestUsage{
         .base_bytes = m_impl->arena.BaseBytes(),
+        .delta_bytes = m_impl->online->DeltaBytes(),
+        .delta_filter_bytes = m_impl->arena.DeltaFilterBytes(),
+        .delta_index_bytes = m_impl->arena.DeltaIndexBytes(),
+        .delta_runs = m_impl->online->DeltaRuns(),
+        .delta_records = m_impl->online->DeltaRecords(),
+        .delta_unique_records = m_impl->online->DeltaUniqueRecords(),
+        .delta_obsolete_records = m_impl->online->DeltaObsoleteRecords(),
         .dirty_nodes = m_impl->arena.DirtyNodes(),
         .dirty_bytes = m_impl->arena.DirtyBytes(),
         .wal_bytes = m_impl->online->WalBytes(),
         .redo_wal_bytes = m_impl->online->RedoWalBytes(),
         .base_lsn = m_impl->online->BaseLsn(),
+        .physical_base_lsn = m_impl->online->PhysicalBaseLsn(),
         .current_lsn = m_impl->online->CurrentLsn(),
         .wal_segment_directory_syncs = m_impl->online->WalSegmentDirectorySyncs(),
         .last_transaction_nodes = m_impl->online->LastTransactionNodes(),
@@ -2854,6 +4130,19 @@ OnlineForestUsage PackedForest::OnlineUsage() const
         .last_transaction_sync_us = m_impl->online->LastTransactionSyncUs(),
         .last_transaction_publish_us = m_impl->online->LastTransactionPublishUs(),
         .last_transaction_total_us = m_impl->online->LastTransactionTotalUs(),
+        .last_flush_dirty_nodes = m_impl->online->LastFlushDirtyNodes(),
+        .last_flush_sort_us = m_impl->online->LastFlushSortUs(),
+        .last_flush_cleanup_us = m_impl->online->LastFlushCleanupUs(),
+        .last_flush_total_us = m_impl->online->LastFlushTotalUs(),
+        .last_flush_delta_bytes = m_impl->online->LastFlushDeltaBytes(),
+        .last_flush_chain_bytes = m_impl->online->LastFlushChainBytes(),
+        .last_flush_write_us = m_impl->online->LastFlushWriteUs(),
+        .last_flush_sync_us = m_impl->online->LastFlushSyncUs(),
+        .last_flush_compaction_input_records =
+            m_impl->online->LastFlushCompactionInputRecords(),
+        .last_flush_compaction_output_records =
+            m_impl->online->LastFlushCompactionOutputRecords(),
+        .last_flush_compacted = m_impl->online->LastFlushCompacted(),
     };
 }
 
@@ -3001,7 +4290,11 @@ Result<PackedForest> ReadForestOnline(std::istream& input,
                                       OnlineForestConfig config)
 {
     if (config.max_dirty_bytes == 0 || config.wal_segment_bytes < 1024 * 1024 ||
-        config.undo_depth == 0) {
+        config.undo_depth == 0 || config.delta_compaction_min_runs < 2 ||
+        config.max_delta_runs < config.delta_compaction_min_runs ||
+        config.max_delta_runs > 1024 ||
+        config.delta_compaction_garbage_percent == 0 ||
+        config.delta_compaction_garbage_percent > 100) {
         return Result<PackedForest>::Err("invalid online forest configuration");
     }
     if (chain_hashes.size() != static_cast<std::size_t>(point.height) + 1 ||

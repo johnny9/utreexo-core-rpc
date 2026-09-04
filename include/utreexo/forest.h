@@ -45,25 +45,41 @@ struct ForestUsage {
 };
 
 struct OnlineForestConfig {
-    /** Maximum coalesced node-delta memory before a base flush is required. */
+    /** Maximum coalesced node-delta memory before an immutable run is sealed. */
     uint64_t max_dirty_bytes{512ULL * 1024 * 1024};
     /** Rotate the append-only WAL after this many bytes. */
     uint64_t wal_segment_bytes{256ULL * 1024 * 1024};
     /** Retain before-images for at least this many connected blocks. */
     uint32_t undo_depth{1'008};
-    /** Synchronize every WAL transaction before publishing it. */
-    bool sync_wal{true};
+    /** Write and synchronize a per-block recovery/undo WAL. Disabled by default. */
+    bool sync_wal{false};
     /** Keep a newly imported generation private until PublishOnline succeeds. */
     bool defer_publish{false};
+    /** Start measuring obsolete delta records once this many runs exist. */
+    uint32_t delta_compaction_min_runs{4};
+    /** Compact regardless of overlap when lookup depth reaches this many runs. */
+    uint32_t max_delta_runs{128};
+    /** Compact when at least this percentage of delta records are obsolete. */
+    uint32_t delta_compaction_garbage_percent{50};
 };
 
 struct OnlineForestUsage {
     uint64_t base_bytes{0};
+    uint64_t delta_bytes{0};
+    uint64_t delta_filter_bytes{0};
+    uint64_t delta_index_bytes{0};
+    uint64_t delta_runs{0};
+    uint64_t delta_records{0};
+    uint64_t delta_unique_records{0};
+    uint64_t delta_obsolete_records{0};
     uint64_t dirty_nodes{0};
     uint64_t dirty_bytes{0};
     uint64_t wal_bytes{0};
     uint64_t redo_wal_bytes{0};
+    /** Last durable forest LSN (base plus committed delta runs). */
     uint64_t base_lsn{0};
+    /** LSN physically materialized in forest.hashes/forest.meta. */
+    uint64_t physical_base_lsn{0};
     uint64_t current_lsn{0};
     uint64_t wal_segment_directory_syncs{0};
     uint64_t last_transaction_nodes{0};
@@ -74,6 +90,17 @@ struct OnlineForestUsage {
     uint64_t last_transaction_sync_us{0};
     uint64_t last_transaction_publish_us{0};
     uint64_t last_transaction_total_us{0};
+    uint64_t last_flush_dirty_nodes{0};
+    uint64_t last_flush_sort_us{0};
+    uint64_t last_flush_cleanup_us{0};
+    uint64_t last_flush_total_us{0};
+    uint64_t last_flush_delta_bytes{0};
+    uint64_t last_flush_chain_bytes{0};
+    uint64_t last_flush_write_us{0};
+    uint64_t last_flush_sync_us{0};
+    uint64_t last_flush_compaction_input_records{0};
+    uint64_t last_flush_compaction_output_records{0};
+    bool last_flush_compacted{false};
 };
 
 class PackedForest
@@ -90,7 +117,7 @@ public:
 
     Result<void> Modify(std::span<const Hash256> additions,
                         std::span<const Hash256> deletions);
-    /** Apply and durably publish one block when online storage is enabled. */
+    /** Apply one block to online state; per-block crash durability is optional. */
     Result<void> ModifyBlock(std::span<const Hash256> additions,
                              std::span<const Hash256> deletions,
                              const ChainPoint& point);
@@ -105,7 +132,7 @@ public:
 
     /**
      * Atomically create a native mmap generation and switch this forest from
-     * bootstrap RAM storage to WAL-backed online storage.
+     * bootstrap RAM storage to a coalesced in-memory overlay.
      */
     Result<void> EnableOnline(const std::filesystem::path& directory,
                               const ChainPoint& point,
@@ -118,9 +145,9 @@ public:
                                            OnlineForestConfig config = {});
     /** Atomically publish a directly imported generation after external validation. */
     Result<void> PublishOnline();
-    /** Flush coalesced records into the mmap base and advance its superblock. */
+    /** Crash-safely seal coalesced records into an immutable sorted delta run. */
     Result<void> FlushOnline();
-    /** Durably disconnect the current online tip using its retained WAL before-images. */
+    /** With the optional WAL enabled, durably disconnect its current tip. */
     Result<ChainPoint> RollbackOnlineBlock();
     bool IsOnline() const;
     std::optional<ChainPoint> OnlinePoint() const;
@@ -143,7 +170,7 @@ private:
 Result<void> WriteForest(std::ostream& output, const PackedForest& forest);
 Result<PackedForest> ReadForest(std::istream& input);
 /**
- * Stream the stable forest serialization directly into a native mmap/WAL
+ * Stream the stable forest serialization directly into a native mmap
  * generation. This avoids materializing the checkpoint arena in RAM.
  */
 Result<PackedForest> ReadForestOnline(std::istream& input,

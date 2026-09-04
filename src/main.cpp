@@ -92,6 +92,7 @@ struct Options {
     uint64_t online_cache_mib{0};
     uint64_t online_wal_segment_mib{256};
     uint32_t online_undo_depth{1'008};
+    uint32_t online_flush_interval_hours{0};
     uint32_t proof_store_threads{2};
     uint32_t proof_store_group_blocks{32};
     uint32_t proof_store_group_delay_ms{0};
@@ -117,6 +118,7 @@ struct Options {
     uint64_t p2p_proof_cache_mib{256};
     utreexo::LogLevel log_level{utreexo::LogLevel::INFO};
     bool allow_untrusted_checkpoint{false};
+    bool online_wal{false};
     bool proof_store_scrub{false};
     bool fast_sync{false};
     bool follow{false};
@@ -299,10 +301,14 @@ void Usage()
         << "                              WARNING: requires at least 32 GiB system RAM\n"
         << "  --checkpoint-interval=N     Full checkpoint every N blocks (default 0: final only)\n"
         << "                              RAM guard saves at safe completed sync boundaries\n"
-        << "  --online-state=DIR          Native mmap/WAL state (default for checkpoint catch-up)\n"
+        << "  --online-state=DIR          Native mmap state (default for checkpoint catch-up)\n"
         << "  --online-cache-mib=N        Dirty-node cache (default: 128 on <=20GiB, else 512)\n"
-        << "  --online-wal-segment-mib=N  WAL segment size (default 256)\n"
-        << "  --online-undo-depth=N       Retained WAL before-image window (default 1008)\n"
+        << "  --online-flush-interval-hours=N\n"
+        << "                              Timed delta seal (default 0: cache limit/shutdown only)\n"
+        << "  --online-wal                Enable per-block forest recovery/undo WAL\n"
+        << "                              (default off; crash replay starts at the last durable delta)\n"
+        << "  --online-wal-segment-mib=N  Optional WAL segment size (default 256)\n"
+        << "  --online-undo-depth=N       Optional WAL before-image window (default 1008)\n"
         << "  --proof-store=DIR           Durable checkpoint-to-tip AssumeUtreexo proofs\n"
         << "  --proof-store-scrub         Verify every durable proof/state record before serving\n"
         << "  --proof-store-threads=N     Parallel proof serializers (default 2)\n"
@@ -390,6 +396,12 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
                 options.online_wal_segment_mib > std::numeric_limits<uint64_t>::max() /
                                                          (1024ULL * 1024)) {
                 return utreexo::Result<Options>::Err("invalid --online-wal-segment-mib");
+            }
+        } else if (auto flush_interval{value("--online-flush-interval-hours")}) {
+            if (!ParseInteger(*flush_interval, options.online_flush_interval_hours) ||
+                options.online_flush_interval_hours > 24U * 365U) {
+                return utreexo::Result<Options>::Err(
+                    "invalid --online-flush-interval-hours");
             }
         } else if (auto depth{value("--online-undo-depth")}) {
             if (!ParseInteger(*depth, options.online_undo_depth) || options.online_undo_depth == 0) {
@@ -529,6 +541,8 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
             }
         } else if (argument == "--allow-untrusted-checkpoint") {
             options.allow_untrusted_checkpoint = true;
+        } else if (argument == "--online-wal") {
+            options.online_wal = true;
         } else if (argument == "--proof-store-scrub") {
             options.proof_store_scrub = true;
         } else if (argument == "--fast-sync") {
@@ -774,7 +788,7 @@ utreexo::OnlineForestConfig OnlineConfig(const Options& options)
         .max_dirty_bytes = (options.online_cache_mib == 0 ? automatic_mib : options.online_cache_mib) * MIB,
         .wal_segment_bytes = options.online_wal_segment_mib * MIB,
         .undo_depth = options.online_undo_depth,
-        .sync_wal = true,
+        .sync_wal = options.online_wal,
     };
 }
 
@@ -946,11 +960,19 @@ void LogOnlineBreakdown(std::string_view phase, uint32_t height,
         "phase=" + std::string{phase} +
         " height=" + std::to_string(height) +
         " base_bytes=" + std::to_string(usage.base_bytes) +
+        " delta_bytes=" + std::to_string(usage.delta_bytes) +
+        " delta_filter_bytes=" + std::to_string(usage.delta_filter_bytes) +
+        " delta_index_bytes=" + std::to_string(usage.delta_index_bytes) +
+        " delta_runs=" + std::to_string(usage.delta_runs) +
+        " delta_records=" + std::to_string(usage.delta_records) +
+        " delta_unique_records=" + std::to_string(usage.delta_unique_records) +
+        " delta_obsolete_records=" + std::to_string(usage.delta_obsolete_records) +
         " dirty_nodes=" + std::to_string(usage.dirty_nodes) +
         " dirty_bytes=" + std::to_string(usage.dirty_bytes) +
         " wal_bytes=" + std::to_string(usage.wal_bytes) +
         " redo_wal_bytes=" + std::to_string(usage.redo_wal_bytes) +
         " base_lsn=" + std::to_string(usage.base_lsn) +
+        " physical_base_lsn=" + std::to_string(usage.physical_base_lsn) +
         " current_lsn=" + std::to_string(usage.current_lsn) +
         " wal_segment_directory_syncs=" +
             std::to_string(usage.wal_segment_directory_syncs) +
@@ -964,7 +986,41 @@ void LogOnlineBreakdown(std::string_view phase, uint32_t height,
         " last_transaction_sync_us=" + std::to_string(usage.last_transaction_sync_us) +
         " last_transaction_publish_us=" +
             std::to_string(usage.last_transaction_publish_us) +
-        " last_transaction_total_us=" + std::to_string(usage.last_transaction_total_us));
+        " last_transaction_total_us=" + std::to_string(usage.last_transaction_total_us) +
+        " last_flush_dirty_nodes=" + std::to_string(usage.last_flush_dirty_nodes) +
+        " last_flush_sort_us=" + std::to_string(usage.last_flush_sort_us) +
+        " last_flush_cleanup_us=" + std::to_string(usage.last_flush_cleanup_us) +
+        " last_flush_total_us=" + std::to_string(usage.last_flush_total_us) +
+        " last_flush_delta_bytes=" + std::to_string(usage.last_flush_delta_bytes) +
+        " last_flush_chain_bytes=" + std::to_string(usage.last_flush_chain_bytes) +
+        " last_flush_write_us=" + std::to_string(usage.last_flush_write_us) +
+        " last_flush_sync_us=" + std::to_string(usage.last_flush_sync_us) +
+        " last_flush_compacted=" +
+            std::string{usage.last_flush_compacted ? "true" : "false"} +
+        " last_flush_compaction_input_records=" +
+            std::to_string(usage.last_flush_compaction_input_records) +
+        " last_flush_compaction_output_records=" +
+            std::to_string(usage.last_flush_compaction_output_records));
+}
+
+std::string OnlineFlushFields(const utreexo::OnlineForestUsage& usage)
+{
+    return " flush_dirty_nodes=" + std::to_string(usage.last_flush_dirty_nodes) +
+        " delta_bytes_written=" + std::to_string(usage.last_flush_delta_bytes) +
+        " chain_bytes_written=" + std::to_string(usage.last_flush_chain_bytes) +
+        " delta_write_us=" + std::to_string(usage.last_flush_write_us) +
+        " delta_sync_us=" + std::to_string(usage.last_flush_sync_us) +
+        " delta_runs=" + std::to_string(usage.delta_runs) +
+        " delta_records=" + std::to_string(usage.delta_records) +
+        " delta_obsolete_records=" + std::to_string(usage.delta_obsolete_records) +
+        " compacted=" + std::string{usage.last_flush_compacted ? "true" : "false"} +
+        " compaction_input_records=" +
+            std::to_string(usage.last_flush_compaction_input_records) +
+        " compaction_output_records=" +
+            std::to_string(usage.last_flush_compaction_output_records) +
+        " sort_us=" + std::to_string(usage.last_flush_sort_us) +
+        " cleanup_us=" + std::to_string(usage.last_flush_cleanup_us) +
+        " total_us=" + std::to_string(usage.last_flush_total_us);
 }
 
 void LogProofStoreBreakdown(std::string_view phase, const utreexo::ProofStore& store)
@@ -1136,7 +1192,7 @@ int BridgeMain(int argc, char** argv)
                                    std::filesystem::exists(*options.online_state)};
         if (existing_online) {
             utreexo::Log(utreexo::LogLevel::INFO, "fast_sync_not_used",
-                "reason=online_state_already_exists storage_mode=mmap_wal");
+                "reason=online_state_already_exists storage_mode=mmap_overlay");
         } else {
             utreexo::Log(utreexo::LogLevel::WARN, "fast_sync_memory_warning",
                 "message=fast_sync_requires_at_least_32_GiB_of_system_RAM"
@@ -1192,6 +1248,36 @@ int BridgeMain(int argc, char** argv)
     }
 
     const auto online_config{OnlineConfig(options)};
+    const char* const online_checkpoint_status{online_config.sync_wal ?
+        "online_wal_and_delta_durable" : "online_delta_durable_overlay_volatile"};
+    const char* const online_recovery_action{online_config.sync_wal ?
+        "reopen_mmap_deltas_and_replay_wal" :
+        "reopen_mmap_deltas_and_replay_bitcoin_core"};
+    const char* const online_reorg_recovery_action{online_config.sync_wal ?
+        "restore_validated_checkpoint" :
+        "restart_from_last_delta_if_active_else_rebuild_from_checkpoint"};
+    const auto online_durable_lsn = [wal_enabled = online_config.sync_wal](
+        const utreexo::OnlineForestUsage& usage) {
+        return wal_enabled ? usage.current_lsn : usage.base_lsn;
+    };
+    if (options.online_state) {
+        utreexo::Log(utreexo::LogLevel::INFO, "online_storage_configured",
+            "dirty_cache_bytes=" + std::to_string(online_config.max_dirty_bytes) +
+            " forest_wal=" + std::string{online_config.sync_wal ? "enabled" : "disabled"} +
+            " delta_seal_interval_hours=" +
+                std::to_string(options.online_flush_interval_hours) +
+            " delta_seal_trigger=" + std::string{options.online_flush_interval_hours == 0 ?
+                "cache_limit_or_clean_shutdown" :
+                "cache_limit_interval_or_clean_shutdown"} +
+            " delta_compaction_min_runs=" +
+                std::to_string(online_config.delta_compaction_min_runs) +
+            " max_delta_runs=" + std::to_string(online_config.max_delta_runs) +
+            " delta_compaction_garbage_percent=" +
+                std::to_string(online_config.delta_compaction_garbage_percent) +
+            " mmap_base_rewrite=disabled" +
+            " crash_recovery=" + std::string{online_config.sync_wal ?
+                "replay_wal" : "replay_bitcoin_core_from_last_delta"});
+    }
     std::optional<std::filesystem::path> checkpoint_load_path;
     bool loading_recovery_checkpoint{false};
     if (recovery_checkpoint && std::filesystem::exists(*recovery_checkpoint)) {
@@ -1259,7 +1345,7 @@ int BridgeMain(int argc, char** argv)
     } else if (checkpoint_load_path) {
         if (!options.fast_sync && !options.online_state) {
             utreexo::Log(utreexo::LogLevel::ERROR, "checkpoint_load_failed",
-                "reason=mmap_wal_is_default_for_checkpoint_catchup"
+                "reason=mmap_overlay_is_default_for_checkpoint_catchup"
                 " action=provide_online_state_or_use_fast_sync");
             return 1;
         }
@@ -1338,7 +1424,7 @@ int BridgeMain(int argc, char** argv)
             "path=" + PathField(*checkpoint_load_path) +
             " role=" + std::string{loading_recovery_checkpoint ? "local_recovery" :
                                                                "bootstrap"} +
-            " storage_mode=" + std::string{options.fast_sync ? "ram_bootstrap" : "mmap_wal"} +
+            " storage_mode=" + std::string{options.fast_sync ? "ram_bootstrap" : "mmap_overlay"} +
             " import_mode=" + std::string{options.fast_sync ? "deserialize_ram" : "stream_to_native"});
         utreexo::CheckpointMetrics checkpoint_metrics;
         auto checkpoint_online_config{online_config};
@@ -1436,7 +1522,7 @@ int BridgeMain(int argc, char** argv)
                                                                "bootstrap"} +
             " bytes=" + std::to_string(checkpoint_metrics.final_bytes) +
             " total_us=" + std::to_string(checkpoint_metrics.total_us) +
-            " storage_mode=" + std::string{loaded_online ? "mmap_wal" : "ram_bootstrap"});
+            " storage_mode=" + std::string{loaded_online ? "mmap_overlay" : "ram_bootstrap"});
         if (utreexo::LogEnabled(utreexo::LogLevel::DEBUG)) {
             utreexo::Log(utreexo::LogLevel::DEBUG, "checkpoint_load_metrics",
                 "height=" + std::to_string(loaded_height) +
@@ -1470,7 +1556,7 @@ int BridgeMain(int argc, char** argv)
             utreexo::Log(utreexo::LogLevel::ERROR, "online_reconcile_failed",
                 "height=" + std::to_string(sync.CurrentPoint() ? sync.CurrentPoint()->height : 0) +
                 " error=" + StringField(reconciled.Error()) +
-                " action=fail_closed_restore_validated_checkpoint");
+                " action=" + std::string{online_reorg_recovery_action});
             return 1;
         }
         if (reconciled.Value() != 0) {
@@ -1853,8 +1939,8 @@ int BridgeMain(int argc, char** argv)
         "start_height=" + std::to_string(sync.ChainHashes().empty() ? 0 : sync.ChainHashes().size() - 1) +
         " target_height=" + std::to_string(target) +
         " core_tip_height=" + std::to_string(tip.Value()) +
-        " storage_mode=" + std::string{loaded_online ? "mmap_wal" :
-            (fresh_genesis_online ? "mmap_wal_after_genesis" : "ram_bootstrap")} +
+        " storage_mode=" + std::string{loaded_online ? "mmap_overlay" :
+            (fresh_genesis_online ? "mmap_overlay_after_genesis" : "ram_bootstrap")} +
         " prefetch_blocks=2 rpc_transport=persistent json_parser=streaming_projection" +
         std::string{proof_store ? " proof_pipeline=ordered_parallel proof_wal=group_commit" :
                                   " proof_pipeline=disabled"});
@@ -1946,6 +2032,84 @@ int BridgeMain(int argc, char** argv)
                 std::to_string(sync.CurrentPoint() ? sync.CurrentPoint()->height : 0) +
             " action=stop_at_block_boundary_and_persist");
     };
+    const auto seal_online_delta = [&](std::string_view reason, bool force)
+        -> utreexo::Result<bool> {
+        if (!forest.IsOnline() || !sync.CurrentPoint()) {
+            return utreexo::Result<bool>::Ok(false);
+        }
+        constexpr uint64_t MAX_REDO_WAL_BYTES{1024ULL * 1024 * 1024};
+        const auto before{forest.OnlineUsage()};
+        const bool has_unpublished_state{
+            before.dirty_nodes != 0 || before.base_lsn != before.current_lsn};
+        const bool limit_reached{
+            before.dirty_bytes >= online_config.max_dirty_bytes ||
+            (online_config.sync_wal &&
+             before.redo_wal_bytes >= MAX_REDO_WAL_BYTES)};
+        if (!has_unpublished_state || (!force && !limit_reached)) {
+            return utreexo::Result<bool>::Ok(false);
+        }
+
+        const auto flush_start{Clock::now()};
+        utreexo::Log(utreexo::LogLevel::INFO, "online_delta_seal_started",
+            "height=" + std::to_string(sync.CurrentPoint()->height) +
+            " reason=" + std::string{reason} +
+            " dirty_nodes=" + std::to_string(before.dirty_nodes) +
+            " dirty_bytes=" + std::to_string(before.dirty_bytes) +
+            " redo_wal_bytes=" + std::to_string(before.redo_wal_bytes) +
+            " base_lsn=" + std::to_string(before.base_lsn) +
+            " current_lsn=" + std::to_string(before.current_lsn) +
+            " forest_wal=" + std::string{online_config.sync_wal ? "enabled" : "disabled"} +
+            " proof_drain_required=" + std::string{proof_store ? "true" : "false"});
+        uint64_t proof_drain_us{0};
+        if (proof_store) {
+            const auto drain_start{Clock::now()};
+            auto durable{proof_store->WaitDurable(sync.CurrentPoint()->height)};
+            proof_drain_us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    Clock::now() - drain_start).count());
+            if (!durable) {
+                return utreexo::Result<bool>::Err(
+                    "proof archive could not reach the forest delta boundary: " +
+                    durable.Error());
+            }
+        }
+        const auto process_before{ReadProcessResources()};
+        LogProcessResources("online_delta_seal_start", sync.CurrentPoint()->height);
+        auto flushed{forest.FlushOnline()};
+        const auto after{forest.OnlineUsage()};
+        const auto process_after{ReadProcessResources()};
+        const bool io_available{process_before.proc_io_available &&
+                                process_after.proc_io_available};
+        const uint64_t io_write_delta{!io_available ||
+            process_after.io_write_bytes < process_before.io_write_bytes ? 0 :
+            process_after.io_write_bytes - process_before.io_write_bytes};
+        if (!flushed) {
+            return utreexo::Result<bool>::Err(
+                flushed.Error() +
+                " io_accounting_available=" +
+                    std::string{io_available ? "true" : "false"} +
+                " io_write_bytes_delta=" + std::to_string(io_write_delta) +
+                OnlineFlushFields(after));
+        }
+        utreexo::Log(utreexo::LogLevel::INFO, "online_delta_sealed",
+            "height=" + std::to_string(sync.CurrentPoint()->height) +
+            " reason=" + std::string{reason} +
+            " dirty_nodes=" + std::to_string(before.dirty_nodes) +
+            " dirty_bytes=" + std::to_string(before.dirty_bytes) +
+            " redo_wal_bytes=" + std::to_string(before.redo_wal_bytes) +
+            " proof_drain_us=" + std::to_string(proof_drain_us) +
+            " io_accounting_available=" +
+                std::string{io_available ? "true" : "false"} +
+            " io_write_bytes_delta=" + std::to_string(io_write_delta) +
+            " base_lsn_before=" + std::to_string(before.base_lsn) +
+            " base_lsn_after=" + std::to_string(after.base_lsn) +
+            " elapsed_us=" + std::to_string(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    Clock::now() - flush_start).count())) +
+            OnlineFlushFields(after));
+        LogProcessResources("online_delta_seal_complete", sync.CurrentPoint()->height);
+        return utreexo::Result<bool>::Ok(true);
+    };
 
     if (shutdown_signal_number == 0) {
         const auto prefetch_started{start_prefetch(target)};
@@ -1970,7 +2134,7 @@ int BridgeMain(int argc, char** argv)
                     " checkpoint_status=" + std::string{checkpoint_saved ?
                         "saved" : "previous_only"} +
                     " action=stop exit_code=2 recovery=" + std::string{forest.IsOnline() ?
-                        "reopen_mmap_and_replay_wal" :
+                        online_recovery_action :
                         "restart_from_previous_checkpoint_or_genesis"});
                 return 2;
             }
@@ -2039,6 +2203,15 @@ int BridgeMain(int argc, char** argv)
                 return 2;
             }
         }
+        auto delta_sealed{seal_online_delta("cache_or_wal_limit", false)};
+        if (!delta_sealed) {
+            sync.StopPrefetch();
+            utreexo::Log(utreexo::LogLevel::ERROR, "online_delta_seal_failed",
+                "height=" + std::to_string(sync.CurrentPoint() ?
+                    sync.CurrentPoint()->height : 0) +
+                " error=" + StringField(delta_sealed.Error()) + " action=stop");
+            return 1;
+        }
         const auto block_iteration_start{Clock::now()};
         utreexo::Result<utreexo::ProcessedBlock> block{utreexo::Result<utreexo::ProcessedBlock>::Err("uninitialized")};
         try {
@@ -2051,8 +2224,10 @@ int BridgeMain(int argc, char** argv)
                 const auto usage{forest.OnlineUsage()};
                 utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
                     "phase=online_block_transition safe_height=" + std::to_string(safe_height) +
-                    " durable_lsn=" + std::to_string(usage.current_lsn) +
-                    " action=stop_without_full_checkpoint recovery=reopen_mmap_and_replay_wal");
+                    " durable_lsn=" + std::to_string(online_durable_lsn(usage)) +
+                    " checkpoint_status=" + online_checkpoint_status +
+                    " action=stop_without_full_checkpoint recovery=" +
+                        online_recovery_action);
                 return 2;
             }
             utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
@@ -2088,9 +2263,10 @@ int BridgeMain(int argc, char** argv)
                     const auto usage{forest.OnlineUsage()};
                     utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
                         "phase=block_result safe_height=" + std::to_string(safe_height) +
-                        " durable_lsn=" + std::to_string(usage.current_lsn) +
-                        " checkpoint_status=online_wal_durable action=stop exit_code=2"
-                        " recovery=reopen_mmap_and_replay_wal error=" +
+                        " durable_lsn=" + std::to_string(online_durable_lsn(usage)) +
+                        " checkpoint_status=" + online_checkpoint_status +
+                        " action=stop exit_code=2 recovery=" + online_recovery_action +
+                        " error=" +
                             StringField(block.Error()));
                     return 2;
                 }
@@ -2128,7 +2304,7 @@ int BridgeMain(int argc, char** argv)
                             std::to_string(proof_store->DurablePoint().height) +
                         " checkpoint_status=previous_only action=stop_without_new_checkpoint"
                         " exit_code=2 recovery=" + std::string{forest.IsOnline() ?
-                            "rollback_forest_wal_to_proof_tip" :
+                            online_recovery_action :
                             "restart_from_previous_checkpoint_or_genesis"});
                     return 2;
                 }
@@ -2170,7 +2346,7 @@ int BridgeMain(int argc, char** argv)
                             " checkpoint_status=previous_only"
                             " action=stop_without_new_checkpoint exit_code=2 recovery=" +
                                 std::string{forest.IsOnline() ?
-                                    "rollback_forest_wal_to_proof_tip" :
+                                    online_recovery_action :
                                     "restart_from_previous_checkpoint_or_genesis"} +
                             " error=" + StringField(queued.Error()));
                         return 2;
@@ -2196,9 +2372,9 @@ int BridgeMain(int argc, char** argv)
                                     std::to_string(block.Value().delta.point.height) +
                                 " durable_proof_height=" +
                                     std::to_string(proof_store->DurablePoint().height) +
-                                " checkpoint_status=online_wal_durable"
-                                " action=stop exit_code=2"
-                                " recovery=rollback_forest_wal_to_proof_tip error=" +
+                                " checkpoint_status=" + online_checkpoint_status +
+                                " action=stop exit_code=2 recovery=" +
+                                    online_recovery_action + " error=" +
                                     StringField(bounded.Error()));
                             return 2;
                         }
@@ -2228,7 +2404,7 @@ int BridgeMain(int argc, char** argv)
                                 std::to_string(block.Value().delta.point.height) +
                             " checkpoint_status=previous_only action=stop"
                             " exit_code=2 recovery=" + std::string{forest.IsOnline() ?
-                                "rollback_forest_wal_to_proof_tip" :
+                                online_recovery_action :
                                 "restart_from_previous_checkpoint_or_genesis"} +
                             " error=" + StringField(archived_state.Error()));
                         return 2;
@@ -2294,7 +2470,7 @@ int BridgeMain(int argc, char** argv)
             }
             utreexo::Log(utreexo::LogLevel::INFO, "online_switch_complete",
                 "height=0 path=" + PathField(*options.online_state) +
-                " reason=default_genesis_mmap storage_mode=mmap_wal");
+                " reason=default_genesis_mmap storage_mode=mmap_overlay");
             LogMemoryBreakdown("online_switch_complete", height, forest);
             LogOnlineBreakdown("online_switch_complete", height, forest);
             LogProcessResources("online_switch_complete", height);
@@ -2404,7 +2580,7 @@ int BridgeMain(int argc, char** argv)
                         std::to_string(proof_store->DurablePoint().height) +
                     " checkpoint_status=previous_only action=stop exit_code=2 recovery=" +
                         std::string{forest.IsOnline() ?
-                            "rollback_forest_wal_to_proof_tip" :
+                            online_recovery_action :
                             "restart_from_previous_checkpoint_or_genesis"} +
                     " error=" + StringField(drained.Error()));
                 return 2;
@@ -2541,7 +2717,7 @@ int BridgeMain(int argc, char** argv)
             utreexo::Log(utreexo::LogLevel::INFO, "online_switch_complete",
                 "height=" + std::to_string(sync.CurrentPoint()->height) +
                 " path=" + PathField(*options.online_state) +
-                " storage_mode=mmap_wal");
+                " storage_mode=mmap_overlay");
             LogMemoryBreakdown("online_switch_complete", sync.CurrentPoint()->height, forest);
             LogOnlineBreakdown("online_switch_complete", sync.CurrentPoint()->height, forest);
             LogProcessResources("online_switch_complete", sync.CurrentPoint()->height);
@@ -2637,18 +2813,24 @@ int BridgeMain(int argc, char** argv)
         utreexo::Log(utreexo::LogLevel::INFO, "online_follow_started",
             "height=" + std::to_string(sync.CurrentPoint()->height) +
             " poll_interval_ms=" + std::to_string(options.poll_interval_ms) +
-            " forest_wal_sync=per_block" +
+            " forest_wal=" + std::string{online_config.sync_wal ? "enabled" : "disabled"} +
+            " delta_seal_interval_hours=" +
+                std::to_string(options.online_flush_interval_hours) +
+            " volatile_recovery=" + std::string{online_config.sync_wal ?
+                "wal_replay" : "bitcoin_core_replay_from_last_delta"} +
             std::string{proof_store ? " proof_wal_sync=before_tip_publication" :
                                       " proof_wal_sync=disabled"});
-        auto last_base_flush{Clock::now()};
+        auto last_delta_seal{Clock::now()};
         while (RequestedShutdownSignal() == 0) {
             const auto reconciled{sync.ReconcileCurrentPoint()};
             if (!reconciled) {
                 utreexo::Log(utreexo::LogLevel::ERROR, "online_reconcile_failed",
                     "height=" + std::to_string(sync.CurrentPoint()->height) +
                     " error=" + StringField(reconciled.Error()) +
-                    " action=fail_closed_restore_validated_checkpoint retained_undo_depth=" +
-                    std::to_string(online_config.undo_depth));
+                    " action=" + std::string{online_reorg_recovery_action} +
+                    " retained_undo_depth=" +
+                        std::to_string(online_config.sync_wal ?
+                            online_config.undo_depth : 0));
                 return 1;
             }
             if (reconciled.Value() != 0) {
@@ -2675,9 +2857,9 @@ int BridgeMain(int argc, char** argv)
                 utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
                     "phase=online_tip_poll safe_height=" +
                         std::to_string(sync.CurrentPoint()->height) +
-                    " durable_lsn=" + std::to_string(storage.current_lsn) +
-                    " checkpoint_status=online_wal_durable action=stop exit_code=2"
-                    " recovery=reopen_mmap_and_replay_wal");
+                    " durable_lsn=" + std::to_string(online_durable_lsn(storage)) +
+                    " checkpoint_status=" + online_checkpoint_status +
+                    " action=stop exit_code=2 recovery=" + online_recovery_action);
                 return 2;
             }
             if (!current_tip) {
@@ -2695,9 +2877,9 @@ int BridgeMain(int argc, char** argv)
                             "memory_allocation_failed",
                             "phase=online_prefetch_start safe_height=" +
                                 std::to_string(sync.CurrentPoint()->height) +
-                            " durable_lsn=" + std::to_string(storage.current_lsn) +
-                            " checkpoint_status=online_wal_durable action=stop exit_code=2"
-                            " recovery=reopen_mmap_and_replay_wal");
+                            " durable_lsn=" + std::to_string(online_durable_lsn(storage)) +
+                            " checkpoint_status=" + online_checkpoint_status +
+                            " action=stop exit_code=2 recovery=" + online_recovery_action);
                         return 2;
                     }
                     utreexo::Log(utreexo::LogLevel::ERROR, "online_prefetch_failed",
@@ -2706,6 +2888,17 @@ int BridgeMain(int argc, char** argv)
                 }
                 while (sync.ChainHashes().size() <= current_tip.Value() &&
                        RequestedShutdownSignal() == 0) {
+                    auto delta_sealed{seal_online_delta("cache_or_wal_limit", false)};
+                    if (!delta_sealed) {
+                        sync.StopPrefetch();
+                        utreexo::Log(utreexo::LogLevel::ERROR,
+                            "online_delta_seal_failed",
+                            "height=" + std::to_string(sync.CurrentPoint()->height) +
+                            " error=" + StringField(delta_sealed.Error()) +
+                            " action=stop");
+                        return 1;
+                    }
+                    if (delta_sealed.Value()) last_delta_seal = Clock::now();
                     const auto block_iteration_start{Clock::now()};
                     utreexo::Result<utreexo::ProcessedBlock> block{
                         utreexo::Result<utreexo::ProcessedBlock>::Err("uninitialized online block")};
@@ -2717,11 +2910,12 @@ int BridgeMain(int argc, char** argv)
                         utreexo::Log(utreexo::LogLevel::ERROR, "memory_allocation_failed",
                             "phase=online_follow_block safe_height=" +
                             std::to_string(sync.CurrentPoint()->height) +
-                            " durable_lsn=" + std::to_string(storage.current_lsn) +
+                            " durable_lsn=" + std::to_string(online_durable_lsn(storage)) +
                             " dirty_bytes=" + std::to_string(storage.dirty_bytes) +
                             " redo_wal_bytes=" + std::to_string(storage.redo_wal_bytes) +
-                            " action=stop_without_full_checkpoint"
-                            " recovery=reopen_mmap_and_replay_wal");
+                            " checkpoint_status=" + online_checkpoint_status +
+                            " action=stop_without_full_checkpoint recovery=" +
+                                online_recovery_action);
                         return 2;
                     }
                     if (!block) {
@@ -2732,9 +2926,10 @@ int BridgeMain(int argc, char** argv)
                                 "memory_allocation_failed",
                                 "phase=online_block_result safe_height=" +
                                     std::to_string(sync.CurrentPoint()->height) +
-                                " durable_lsn=" + std::to_string(storage.current_lsn) +
-                                " checkpoint_status=online_wal_durable action=stop exit_code=2"
-                                " recovery=reopen_mmap_and_replay_wal error=" +
+                                " durable_lsn=" + std::to_string(online_durable_lsn(storage)) +
+                                " checkpoint_status=" + online_checkpoint_status +
+                                " action=stop exit_code=2 recovery=" +
+                                    online_recovery_action + " error=" +
                                     StringField(block.Error()));
                             return 2;
                         }
@@ -2764,8 +2959,9 @@ int BridgeMain(int argc, char** argv)
                                         std::to_string(block.Value().delta.point.height) +
                                     " durable_proof_height=" +
                                         std::to_string(proof_store->DurablePoint().height) +
-                                    " checkpoint_status=online_wal_durable action=stop"
-                                    " exit_code=2 recovery=rollback_forest_wal_to_proof_tip");
+                                    " checkpoint_status=" + online_checkpoint_status +
+                                    " action=stop exit_code=2 recovery=" +
+                                        online_recovery_action);
                                 return 2;
                             }
                             utreexo::Log(utreexo::LogLevel::ERROR,
@@ -2790,7 +2986,7 @@ int BridgeMain(int argc, char** argv)
                                 std::to_string(block.Value().delta.point.height) +
                                 " durable_proof_height=" +
                                 std::to_string(proof_store->DurablePoint().height) +
-                                " action=stop recovery=rollback_forest_wal_to_proof_tip");
+                                " action=stop recovery=" + online_recovery_action);
                             return 2;
                         }
                         block.Value().metrics.proof_enqueue_us = static_cast<uint64_t>(
@@ -2805,9 +3001,10 @@ int BridgeMain(int argc, char** argv)
                                         std::to_string(block.Value().delta.point.height) +
                                     " durable_proof_height=" +
                                         std::to_string(proof_store->DurablePoint().height) +
-                                    " checkpoint_status=online_wal_durable action=stop"
-                                    " exit_code=2 recovery=rollback_forest_wal_to_proof_tip"
-                                    " error=" + StringField(queued.Error()));
+                                    " checkpoint_status=" + online_checkpoint_status +
+                                    " action=stop exit_code=2 recovery=" +
+                                        online_recovery_action + " error=" +
+                                        StringField(queued.Error()));
                                 return 2;
                             }
                             utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_enqueue_failed",
@@ -2830,9 +3027,10 @@ int BridgeMain(int argc, char** argv)
                                         std::to_string(block.Value().delta.point.height) +
                                     " durable_proof_height=" +
                                         std::to_string(proof_store->DurablePoint().height) +
-                                    " checkpoint_status=online_wal_durable action=stop"
-                                    " exit_code=2 recovery=rollback_forest_wal_to_proof_tip"
-                                    " error=" + StringField(durable.Error()));
+                                    " checkpoint_status=" + online_checkpoint_status +
+                                    " action=stop exit_code=2 recovery=" +
+                                        online_recovery_action + " error=" +
+                                        StringField(durable.Error()));
                                 return 2;
                             }
                             utreexo::Log(utreexo::LogLevel::ERROR, "proof_store_commit_failed",
@@ -2922,6 +3120,7 @@ int BridgeMain(int argc, char** argv)
                             std::to_string(storage.last_transaction_publish_us) +
                         " forest_wal_total_us=" +
                             std::to_string(storage.last_transaction_total_us) +
+                        " base_lsn=" + std::to_string(storage.base_lsn) +
                         " lsn=" + std::to_string(storage.current_lsn) +
                         (proof_store ? " proof_durable_height=" +
                                            std::to_string(proof_stats.durable_height) +
@@ -2948,21 +3147,16 @@ int BridgeMain(int argc, char** argv)
                     continue;
                 }
             }
-            if (Clock::now() - last_base_flush >= std::chrono::hours(24)) {
-                const auto before{forest.OnlineUsage()};
-                auto flushed{forest.FlushOnline()};
+            if (options.online_flush_interval_hours != 0 &&
+                Clock::now() - last_delta_seal >=
+                    std::chrono::hours(options.online_flush_interval_hours)) {
+                auto flushed{seal_online_delta("interval", true)};
                 if (!flushed) {
-                    utreexo::Log(utreexo::LogLevel::ERROR, "online_base_flush_failed",
+                    utreexo::Log(utreexo::LogLevel::ERROR, "online_delta_seal_failed",
                                  "error=" + StringField(flushed.Error()) + " action=stop");
                     return 1;
                 }
-                const auto after{forest.OnlineUsage()};
-                utreexo::Log(utreexo::LogLevel::INFO, "online_base_flushed",
-                    "height=" + std::to_string(sync.CurrentPoint()->height) +
-                    " dirty_nodes=" + std::to_string(before.dirty_nodes) +
-                    " base_lsn_before=" + std::to_string(before.base_lsn) +
-                    " base_lsn_after=" + std::to_string(after.base_lsn));
-                last_base_flush = Clock::now();
+                last_delta_seal = Clock::now();
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(options.poll_interval_ms));
         }
@@ -2983,9 +3177,9 @@ int BridgeMain(int argc, char** argv)
                     " durable_proof_height=" +
                         std::to_string(proof_store->DurablePoint().height) +
                     " checkpoint_status=" + std::string{forest.IsOnline() ?
-                        "online_wal_durable" : "previous_only"} +
+                        online_checkpoint_status : "previous_only"} +
                     " action=stop exit_code=2 recovery=" + std::string{forest.IsOnline() ?
-                        "rollback_forest_wal_to_proof_tip" :
+                        online_recovery_action :
                         "restart_from_previous_checkpoint_or_genesis"} +
                     " error=" + StringField(drained.Error()));
                 return 2;
@@ -3014,19 +3208,16 @@ int BridgeMain(int argc, char** argv)
         std::to_string(source.LargestBlockResponseElapsedUs()));
 
     if (forest.IsOnline()) {
-        const auto before{forest.OnlineUsage()};
-        const auto flushed{forest.FlushOnline()};
+        const auto flushed{seal_online_delta("clean_shutdown", true)};
         if (!flushed) {
-            utreexo::Log(utreexo::LogLevel::ERROR, "online_base_flush_failed",
+            utreexo::Log(utreexo::LogLevel::ERROR, "online_delta_seal_failed",
                          "reason=clean_shutdown error=" + StringField(flushed.Error()));
             return 1;
         }
-        const auto after{forest.OnlineUsage()};
-        utreexo::Log(utreexo::LogLevel::INFO, "online_base_flushed",
-            "height=" + std::to_string(sync.CurrentPoint() ? sync.CurrentPoint()->height : 0) +
-            " reason=clean_shutdown dirty_nodes=" + std::to_string(before.dirty_nodes) +
-            " base_lsn_before=" + std::to_string(before.base_lsn) +
-            " base_lsn_after=" + std::to_string(after.base_lsn));
+        if (!flushed.Value()) {
+            utreexo::Log(utreexo::LogLevel::DEBUG, "online_delta_seal_skipped",
+                "reason=clean_shutdown base_already_current=true");
+        }
     }
     bool final_checkpoint_saved{false};
     if (checkpoint_output_path && sync.CurrentPoint() && !forest.IsOnline()) {
@@ -3092,8 +3283,14 @@ int BridgeMain(int argc, char** argv)
             " roots=" + RootsField(forest) +
             " checkpoint_bytes=" + std::to_string(checkpoint_bytes) +
             " checkpoint_role=" + std::string{reported_checkpoint_role} +
-            " storage_mode=" + std::string{forest.IsOnline() ? "mmap_wal" : "ram_checkpoint"} +
+            " storage_mode=" + std::string{forest.IsOnline() ? "mmap_overlay" : "ram_checkpoint"} +
             " online_base_bytes=" + std::to_string(forest.OnlineUsage().base_bytes) +
+            " online_delta_bytes=" + std::to_string(forest.OnlineUsage().delta_bytes) +
+            " online_delta_filter_bytes=" +
+                std::to_string(forest.OnlineUsage().delta_filter_bytes) +
+            " online_delta_index_bytes=" +
+                std::to_string(forest.OnlineUsage().delta_index_bytes) +
+            " online_delta_runs=" + std::to_string(forest.OnlineUsage().delta_runs) +
             " online_wal_bytes=" + std::to_string(forest.OnlineUsage().wal_bytes) +
             " online_base_lsn=" + std::to_string(forest.OnlineUsage().base_lsn) +
             (proof_store ? " proof_base_height=" +
@@ -3115,7 +3312,7 @@ int BridgeMain(int argc, char** argv)
             " proof_store_durable_height=" +
                 std::to_string(proof_store ? proof_store->DurablePoint().height : 0) +
             " forest_persistence=" + std::string{forest.IsOnline() ?
-                "mmap_wal_flushed" : (final_checkpoint_saved ? "checkpoint_saved" : "none")});
+                "delta_sealed" : (final_checkpoint_saved ? "checkpoint_saved" : "none")});
     } else {
         utreexo::Log(utreexo::LogLevel::INFO, "sync_complete",
                      "height=" +

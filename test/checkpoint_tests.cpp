@@ -216,6 +216,7 @@ TEST(checkpoint_streams_directly_to_online_state)
         .max_dirty_bytes = 1024 * 1024,
         .wal_segment_bytes = 1024 * 1024,
         .undo_depth = 16,
+        .sync_wal = true,
     };
     const ChainPoint next_point{2, Hash256::FromHex(
         "020102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f").Value()};

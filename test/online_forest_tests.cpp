@@ -6,9 +6,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -52,6 +54,49 @@ std::filesystem::path WalPath(const std::filesystem::path& directory)
         if (name.starts_with("wal-") && name.ends_with(".log")) return entry.path();
     }
     return {};
+}
+
+std::filesystem::path DeltaPathForTest(const std::filesystem::path& directory,
+                                       uint64_t generation,
+                                       bool temporary = false)
+{
+    std::ostringstream name;
+    name << "delta-" << std::setw(20) << std::setfill('0') << generation
+         << ".run";
+    if (temporary) name << ".tmp";
+    return directory / name.str();
+}
+
+std::vector<std::filesystem::path> DeltaPaths(
+    const std::filesystem::path& directory)
+{
+    std::vector<std::filesystem::path> paths;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        const auto name{entry.path().filename().string()};
+        if (name.starts_with("delta-") && name.ends_with(".run")) {
+            paths.push_back(entry.path());
+        }
+    }
+    std::ranges::sort(paths);
+    return paths;
+}
+
+uint64_t FileChecksum(const std::filesystem::path& path)
+{
+    std::ifstream input{path, std::ios::binary};
+    CHECK(input.good());
+    uint64_t checksum{14695981039346656037ULL};
+    std::array<char, 64 * 1024> buffer{};
+    while (input) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count{input.gcount()};
+        for (std::streamsize i{0}; i < count; ++i) {
+            checksum ^= static_cast<unsigned char>(buffer[static_cast<std::size_t>(i)]);
+            checksum *= 1099511628211ULL;
+        }
+    }
+    CHECK(input.eof());
+    return checksum;
 }
 
 void FlipByte(const std::filesystem::path& path, std::streamoff offset)
@@ -134,7 +179,12 @@ struct TestDelta {
 
 } // namespace
 
-TEST(online_forest_switch_wal_recovery_and_flush)
+TEST(online_forest_defaults_to_wal_free_overlay)
+{
+    CHECK(!OnlineForestConfig{}.sync_wal);
+}
+
+TEST(online_forest_switch_wal_recovery_and_delta_seal)
 {
     const auto path{OnlinePath("recovery")};
     Cleanup(path);
@@ -174,9 +224,9 @@ TEST(online_forest_switch_wal_recovery_and_flush)
         CHECK(forest.OnlineUsage().wal_bytes > 0U);
     }
 
-    // Model a crash after a capacity-growing base flush resized the arena files
-    // but before its new superblock was published. The old superblock must map
-    // only its declared prefix and replay the already durable WAL.
+    // Preserve recovery compatibility with a legacy crash after a base resize
+    // but before its new superblock was published. The old superblock maps only
+    // its declared prefix and replays the already durable WAL.
     const auto hashes_path{path / "forest.hashes"};
     const auto metadata_path{path / "forest.meta"};
     std::filesystem::resize_file(
@@ -218,6 +268,271 @@ TEST(online_forest_switch_wal_recovery_and_flush)
         CHECK_EQ(flushed.Value().OnlineUsage().current_lsn, 1U);
     }
 
+    Cleanup(path);
+}
+
+TEST(online_forest_without_wal_replays_from_last_base_after_restart)
+{
+    const auto path{OnlinePath("no-wal-replay")};
+    Cleanup(path);
+    const Hash256 genesis{OnlineHash64(900'000)};
+    const ChainPoint next_point{1, OnlineHash64(900'001)};
+    const std::array<Hash256, 1> chain{genesis};
+    const std::array<Hash256, 4> initial{
+        OnlineHash64(901), OnlineHash64(902), OnlineHash64(903), OnlineHash64(904)};
+    const std::array<Hash256, 1> deletion{initial[1]};
+    const std::array<Hash256, 1> addition{OnlineHash64(905)};
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = false,
+    };
+
+    PackedForest base;
+    CHECK(base.Modify(initial, {}));
+    const auto base_roots{base.Roots()};
+    {
+        PackedForest online;
+        CHECK(online.Modify(initial, {}));
+        CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+        CHECK(online.ModifyBlock(addition, deletion, next_point));
+        CHECK_EQ(online.OnlinePoint(), std::optional<ChainPoint>{next_point});
+        CHECK(online.OnlineUsage().dirty_nodes > 0U);
+        CHECK_EQ(online.OnlineUsage().wal_bytes, 0U);
+        CHECK(WalPath(path).empty());
+    }
+
+    auto recovered{ReopenOnline(path, chain, ChainPoint{0, genesis}, config)};
+    CHECK_EQ(recovered.Roots(), base_roots);
+    CHECK(recovered.Contains(deletion[0]));
+    CHECK(!recovered.Contains(addition[0]));
+    CHECK_EQ(recovered.OnlineUsage().base_lsn, 0U);
+    CHECK_EQ(recovered.OnlineUsage().current_lsn, 0U);
+    Cleanup(path);
+}
+
+TEST(online_forest_without_wal_publishes_delta_atomically_and_keeps_base_immutable)
+{
+    const auto path{OnlinePath("no-wal-flush-recovery")};
+    Cleanup(path);
+    const Hash256 genesis{OnlineHash64(910'000)};
+    const ChainPoint next_point{1, OnlineHash64(910'001)};
+    std::vector<Hash256> chain{genesis};
+    const std::array<Hash256, 4> initial{
+        OnlineHash64(911), OnlineHash64(912), OnlineHash64(913), OnlineHash64(914)};
+    const std::array<Hash256, 1> deletion{initial[2]};
+    const std::array<Hash256, 2> additions{OnlineHash64(915), OnlineHash64(916)};
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = false,
+    };
+
+    PackedForest base;
+    CHECK(base.Modify(initial, {}));
+    const auto base_roots{base.Roots()};
+    PackedForest expected;
+    CHECK(expected.Modify(initial, {}));
+    CHECK(expected.Modify(additions, deletion));
+    uint64_t base_hashes_checksum{0};
+    uint64_t base_meta_checksum{0};
+
+    {
+        PackedForest online;
+        CHECK(online.Modify(initial, {}));
+        CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+        base_hashes_checksum = FileChecksum(path / "forest.hashes");
+        base_meta_checksum = FileChecksum(path / "forest.meta");
+        CHECK(online.ModifyBlock(additions, deletion, next_point));
+
+        // A failed temporary-file publication must leave both the immutable
+        // mmap base and the previous durable point untouched.
+        std::filesystem::create_directory(DeltaPathForTest(path, 1, true));
+        const auto flushed{online.FlushOnline()};
+        CHECK(!flushed);
+        CHECK(DeltaPaths(path).empty());
+        CHECK_EQ(FileChecksum(path / "forest.hashes"), base_hashes_checksum);
+        CHECK_EQ(FileChecksum(path / "forest.meta"), base_meta_checksum);
+    }
+
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(DeltaPathForTest(path, 1, true), cleanup_error);
+    CHECK(!cleanup_error);
+    {
+        auto recovered{ReopenOnline(path, chain, ChainPoint{0, genesis}, config)};
+        CHECK_EQ(recovered.Roots(), base_roots);
+        CHECK(recovered.Contains(deletion[0]));
+        CHECK(!recovered.Contains(additions[0]));
+
+        CHECK(recovered.ModifyBlock(additions, deletion, next_point));
+        CHECK(recovered.FlushOnline());
+        CHECK_EQ(recovered.Roots(), expected.Roots());
+        const auto usage{recovered.OnlineUsage()};
+        CHECK_EQ(usage.wal_bytes, 0U);
+        CHECK(usage.last_flush_dirty_nodes > 0U);
+        CHECK_EQ(usage.delta_runs, 1U);
+        CHECK(usage.delta_records > 0U);
+        CHECK(usage.delta_bytes > 0U);
+        CHECK(usage.delta_filter_bytes > 0U);
+        CHECK(usage.delta_filter_bytes < usage.delta_bytes);
+        CHECK(usage.delta_index_bytes > 0U);
+        CHECK(usage.delta_index_bytes < usage.delta_filter_bytes);
+        CHECK_EQ(usage.last_flush_delta_bytes, usage.delta_bytes);
+        CHECK(usage.last_flush_total_us >= usage.last_flush_sort_us);
+        CHECK(usage.last_flush_total_us >= usage.last_flush_write_us);
+        CHECK(usage.last_flush_total_us >= usage.last_flush_sync_us);
+        CHECK_EQ(FileChecksum(path / "forest.hashes"), base_hashes_checksum);
+        CHECK_EQ(FileChecksum(path / "forest.meta"), base_meta_checksum);
+    }
+
+    chain.push_back(next_point.block_hash);
+    auto durable{ReopenOnline(path, chain, next_point, config)};
+    CHECK_EQ(durable.Roots(), expected.Roots());
+    CHECK(!durable.Contains(deletion[0]));
+    CHECK(durable.Contains(additions[0]));
+    CHECK(WalPath(path).empty());
+    CHECK_EQ(durable.OnlineUsage().physical_base_lsn, 0U);
+    CHECK_EQ(durable.OnlineUsage().base_lsn, 1U);
+    CHECK(durable.OnlineUsage().delta_filter_bytes > 0U);
+    CHECK(durable.OnlineUsage().delta_index_bytes > 0U);
+    CHECK_EQ(FileChecksum(path / "forest.hashes"), base_hashes_checksum);
+    CHECK_EQ(FileChecksum(path / "forest.meta"), base_meta_checksum);
+    Cleanup(path);
+}
+
+TEST(online_forest_rejects_corrupt_committed_delta_before_recovery)
+{
+    const auto path{OnlinePath("corrupt-flush-undo")};
+    Cleanup(path);
+    const Hash256 genesis{OnlineHash64(920'000)};
+    const ChainPoint next_point{1, OnlineHash64(920'001)};
+    const std::array<Hash256, 1> chain{genesis};
+    const std::array<Hash256, 4> initial{
+        OnlineHash64(921), OnlineHash64(922), OnlineHash64(923), OnlineHash64(924)};
+    const std::array<Hash256, 1> deletion{initial[0]};
+    const std::array<Hash256, 1> addition{OnlineHash64(925)};
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = false,
+    };
+
+    {
+        PackedForest online;
+        CHECK(online.Modify(initial, {}));
+        CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+        CHECK(online.ModifyBlock(addition, deletion, next_point));
+        CHECK(online.FlushOnline());
+        CHECK(std::filesystem::exists(DeltaPathForTest(path, 1)));
+    }
+    FlipByte(DeltaPathForTest(path, 1), 80);
+    std::vector<Hash256> recovered_chain;
+    ChainPoint recovered_point;
+    const auto recovered{
+        PackedForest::OpenOnline(path, recovered_chain, recovered_point, config)};
+    CHECK(!recovered);
+    CHECK(recovered.Error().find("forest delta checksum mismatch") !=
+          std::string::npos);
+    CHECK(std::filesystem::exists(DeltaPathForTest(path, 1)));
+    Cleanup(path);
+}
+
+TEST(online_forest_rejects_valid_delta_from_a_different_base)
+{
+    const auto source_path{OnlinePath("delta-source-base")};
+    const auto target_path{OnlinePath("delta-target-base")};
+    Cleanup(source_path);
+    Cleanup(target_path);
+    const Hash256 genesis{OnlineHash64(925'000)};
+    const std::array<Hash256, 1> chain{genesis};
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = false,
+    };
+    {
+        PackedForest source;
+        const std::array<Hash256, 4> leaves{
+            OnlineHash64(1), OnlineHash64(2), OnlineHash64(3), OnlineHash64(4)};
+        const std::array<Hash256, 1> addition{OnlineHash64(5)};
+        CHECK(source.Modify(leaves, {}));
+        CHECK(source.EnableOnline(source_path, ChainPoint{0, genesis}, chain,
+                                  config));
+        CHECK(source.ModifyBlock(addition, {},
+                                 ChainPoint{1, OnlineHash64(925'001)}));
+        CHECK(source.FlushOnline());
+    }
+    {
+        PackedForest target;
+        const std::array<Hash256, 4> leaves{
+            OnlineHash64(11), OnlineHash64(12), OnlineHash64(13), OnlineHash64(14)};
+        CHECK(target.Modify(leaves, {}));
+        CHECK(target.EnableOnline(target_path, ChainPoint{0, genesis}, chain,
+                                  config));
+    }
+    std::error_code copy_error;
+    CHECK(std::filesystem::copy_file(DeltaPathForTest(source_path, 1),
+                                     DeltaPathForTest(target_path, 1),
+                                     copy_error));
+    CHECK(!copy_error);
+    std::vector<Hash256> recovered_chain;
+    ChainPoint recovered_point;
+    const auto recovered{PackedForest::OpenOnline(
+        target_path, recovered_chain, recovered_point, config)};
+    CHECK(!recovered);
+    CHECK(recovered.Error().find("anchored to a different mmap base") !=
+          std::string::npos);
+    Cleanup(source_path);
+    Cleanup(target_path);
+}
+
+TEST(online_forest_wal_free_mode_commits_and_prunes_recovered_wal)
+{
+    const auto path{OnlinePath("disable-existing-wal")};
+    Cleanup(path);
+    const Hash256 genesis{OnlineHash64(930'000)};
+    const ChainPoint next_point{1, OnlineHash64(930'001)};
+    const std::array<Hash256, 1> base_chain{genesis};
+    const std::array<Hash256, 4> initial{
+        OnlineHash64(931), OnlineHash64(932), OnlineHash64(933), OnlineHash64(934)};
+    const std::array<Hash256, 1> deletion{initial[3]};
+    const std::array<Hash256, 1> addition{OnlineHash64(935)};
+    const OnlineForestConfig wal_config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = true,
+    };
+    auto no_wal_config{wal_config};
+    no_wal_config.sync_wal = false;
+
+    PackedForest expected;
+    CHECK(expected.Modify(initial, {}));
+    CHECK(expected.Modify(addition, deletion));
+    {
+        PackedForest online;
+        CHECK(online.Modify(initial, {}));
+        CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, base_chain,
+                                  wal_config));
+        CHECK(online.ModifyBlock(addition, deletion, next_point));
+    }
+    CHECK(!WalPath(path).empty());
+
+    const std::array<Hash256, 2> next_chain{genesis, next_point.block_hash};
+    {
+        auto migrated{ReopenOnline(path, next_chain, next_point, no_wal_config)};
+        CHECK_EQ(migrated.Roots(), expected.Roots());
+        CHECK(migrated.OnlineUsage().wal_bytes > 0U);
+        CHECK(migrated.FlushOnline());
+        CHECK(WalPath(path).empty());
+    }
+    auto durable{ReopenOnline(path, next_chain, next_point, no_wal_config)};
+    CHECK_EQ(durable.Roots(), expected.Roots());
+    CHECK_EQ(durable.OnlineUsage().wal_bytes, 0U);
     Cleanup(path);
 }
 
@@ -373,13 +688,13 @@ TEST(online_forest_rejects_hard_linked_owned_files_on_recovery)
         const std::array<Hash256, 2> leaves{OnlineHash(16), OnlineHash(17)};
         CHECK(forest.Modify(leaves, {}));
         CHECK(forest.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+        CHECK(forest.ModifyBlock({}, {}, ChainPoint{1, OnlineHash(115)}));
+        CHECK(forest.FlushOnline());
     }
-    for (const std::string_view name : {std::string_view{"LOCK"},
-                                       std::string_view{"FORMAT"},
-                                       std::string_view{"state.0"},
-                                       std::string_view{"chain.0.hashes"},
-                                       std::string_view{"forest.hashes"},
-                                       std::string_view{"forest.meta"}}) {
+    const std::vector<std::string> owned_names{
+        "LOCK", "FORMAT", "state.0", "chain.0.hashes", "forest.hashes",
+        "forest.meta", DeltaPathForTest(path, 1).filename().string()};
+    for (const std::string& name : owned_names) {
         std::filesystem::create_hard_link(path / name, external);
         const auto size{std::filesystem::file_size(external)};
         std::vector<Hash256> recovered_chain;
@@ -405,7 +720,7 @@ TEST(online_forest_flush_rejects_hard_linked_temporary_files_without_clobbering)
     };
     const std::string sentinel_content{"external online-state sentinel\n"};
     for (const std::string_view temporary_name :
-         {std::string_view{"chain.1.hashes.tmp"}, std::string_view{"state.1.tmp"}}) {
+         {std::string_view{"delta-00000000000000000001.run.tmp"}}) {
         const auto path{OnlinePath(std::string{"flush-temp-"} +
                                    std::string{temporary_name})};
         const auto external{OnlinePath(std::string{"flush-temp-sentinel-"} +
@@ -439,7 +754,7 @@ TEST(online_forest_flush_rejects_hard_linked_temporary_files_without_clobbering)
     }
 }
 
-TEST(online_forest_disconnect_is_durable_after_base_flush)
+TEST(online_forest_disconnect_is_durable_after_delta_seal)
 {
     const auto path{OnlinePath("disconnect")};
     Cleanup(path);
@@ -553,6 +868,202 @@ TEST(online_forest_randomized_differential_reopen_flush_and_proofs)
     Cleanup(path);
 }
 
+TEST(online_forest_compacts_from_measured_obsolete_records_without_rewriting_base)
+{
+    const auto path{OnlinePath("delta-compaction")};
+    Cleanup(path);
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = false,
+        .delta_compaction_min_runs = 3,
+        .max_delta_runs = 16,
+        .delta_compaction_garbage_percent = 1,
+    };
+    const Hash256 genesis{OnlineHash64(1'500'000)};
+    std::vector<Hash256> chain{genesis};
+    std::vector<Hash256> live;
+    for (uint64_t value{1}; value <= 8; ++value) {
+        live.push_back(OnlineHash64(value));
+    }
+    PackedForest reference;
+    PackedForest online;
+    CHECK(reference.Modify(live, {}));
+    CHECK(online.Modify(live, {}));
+    CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+    const uint64_t hashes_checksum{FileChecksum(path / "forest.hashes")};
+    const uint64_t metadata_checksum{FileChecksum(path / "forest.meta")};
+
+    Hash256 rolling{live.front()};
+    uint64_t next_value{100'000};
+    for (uint32_t height{1}; height <= 3; ++height) {
+        const Hash256 replacement{OnlineHash64(next_value++)};
+        const std::array<Hash256, 1> deletions{rolling};
+        const std::array<Hash256, 1> additions{replacement};
+        const auto found{std::ranges::find(live, rolling)};
+        CHECK(found != live.end());
+        *found = replacement;
+        rolling = replacement;
+        const ChainPoint point{height, OnlineHash64(1'500'000 + height)};
+        chain.push_back(point.block_hash);
+        CHECK(reference.Modify(additions, deletions));
+        CHECK(online.ModifyBlock(additions, deletions, point));
+        CHECK(online.FlushOnline());
+        CheckEquivalent(reference, online, live);
+    }
+
+    const auto usage{online.OnlineUsage()};
+    CHECK(usage.last_flush_compacted);
+    CHECK_EQ(usage.delta_runs, 1U);
+    CHECK(usage.last_flush_compaction_input_records >
+          usage.last_flush_compaction_output_records);
+    CHECK_EQ(usage.delta_records, usage.delta_unique_records);
+    CHECK_EQ(DeltaPaths(path).size(), 1U);
+    CHECK_EQ(DeltaPaths(path).front().filename().string(),
+             DeltaPathForTest(path, 4).filename().string());
+    CHECK_EQ(FileChecksum(path / "forest.hashes"), hashes_checksum);
+    CHECK_EQ(FileChecksum(path / "forest.meta"), metadata_checksum);
+
+    // A normal successor run must link to and override a compacted snapshot.
+    // Keep it below min_runs so this checks the mixed snapshot/run recovery path.
+    const Hash256 replacement{OnlineHash64(next_value++)};
+    const std::array<Hash256, 1> deletions{rolling};
+    const std::array<Hash256, 1> additions{replacement};
+    const auto found{std::ranges::find(live, rolling)};
+    CHECK(found != live.end());
+    *found = replacement;
+    const ChainPoint point_four{4, OnlineHash64(1'500'004)};
+    chain.push_back(point_four.block_hash);
+    CHECK(reference.Modify(additions, deletions));
+    CHECK(online.ModifyBlock(additions, deletions, point_four));
+    CHECK(online.FlushOnline());
+    CHECK(!online.OnlineUsage().last_flush_compacted);
+    CHECK_EQ(online.OnlineUsage().delta_runs, 2U);
+    CheckEquivalent(reference, online, live);
+
+    online = PackedForest{};
+    online = ReopenOnline(path, chain, point_four, config);
+    CheckEquivalent(reference, online, live);
+    CHECK_EQ(online.OnlineUsage().physical_base_lsn, 0U);
+    CHECK_EQ(online.OnlineUsage().base_lsn, 4U);
+    CHECK_EQ(online.OnlineUsage().delta_runs, 2U);
+    Cleanup(path);
+}
+
+TEST(online_forest_compacts_at_run_count_safety_cap)
+{
+    const auto path{OnlinePath("delta-run-cap")};
+    Cleanup(path);
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = false,
+        .delta_compaction_min_runs = 2,
+        .max_delta_runs = 3,
+        .delta_compaction_garbage_percent = 100,
+    };
+    const Hash256 genesis{OnlineHash64(1'600'000)};
+    std::vector<Hash256> chain{genesis};
+    std::vector<Hash256> live;
+    for (uint64_t value{1}; value <= 16; ++value) {
+        live.push_back(OnlineHash64(1'610'000 + value));
+    }
+    PackedForest reference;
+    PackedForest online;
+    CHECK(reference.Modify(live, {}));
+    CHECK(online.Modify(live, {}));
+    CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+    const uint64_t hashes_checksum{FileChecksum(path / "forest.hashes")};
+    const uint64_t metadata_checksum{FileChecksum(path / "forest.meta")};
+
+    for (uint32_t height{1}; height <= 3; ++height) {
+        const std::array<Hash256, 1> addition{
+            OnlineHash64(1'620'000 + height)};
+        live.push_back(addition[0]);
+        const ChainPoint point{height, OnlineHash64(1'600'000 + height)};
+        chain.push_back(point.block_hash);
+        CHECK(reference.Modify(addition, {}));
+        CHECK(online.ModifyBlock(addition, {}, point));
+        CHECK(online.FlushOnline());
+        CheckEquivalent(reference, online, live);
+        if (height < 3) CHECK(!online.OnlineUsage().last_flush_compacted);
+    }
+
+    const auto usage{online.OnlineUsage()};
+    CHECK(usage.last_flush_compacted);
+    CHECK_EQ(usage.delta_runs, 1U);
+    CHECK_EQ(usage.delta_records, usage.delta_unique_records);
+    CHECK_EQ(usage.delta_obsolete_records, 0U);
+    CHECK_EQ(DeltaPaths(path).size(), 1U);
+    CHECK_EQ(DeltaPaths(path).front().filename().string(),
+             DeltaPathForTest(path, 4).filename().string());
+    CHECK_EQ(FileChecksum(path / "forest.hashes"), hashes_checksum);
+    CHECK_EQ(FileChecksum(path / "forest.meta"), metadata_checksum);
+
+    online = PackedForest{};
+    online = ReopenOnline(path, chain, ChainPoint{3, chain.back()}, config);
+    CheckEquivalent(reference, online, live);
+    Cleanup(path);
+}
+
+TEST(online_forest_delta_extends_node_ids_past_the_fixed_mmap_base)
+{
+    const auto path{OnlinePath("delta-growth")};
+    Cleanup(path);
+    constexpr uint64_t INITIAL_LEAVES{uint64_t{1} << 19};
+    std::vector<Hash256> initial;
+    initial.reserve(INITIAL_LEAVES);
+    for (uint64_t value{1}; value <= INITIAL_LEAVES; ++value) {
+        initial.push_back(OnlineHash64(20'000'000 + value));
+    }
+    PackedForest reference;
+    PackedForest online;
+    CHECK(reference.Modify(initial, {}));
+    CHECK(online.Modify(initial, {}));
+    const Hash256 genesis{OnlineHash64(21'000'000)};
+    std::vector<Hash256> chain{genesis};
+    const OnlineForestConfig config{
+        .max_dirty_bytes = 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024,
+        .undo_depth = 8,
+        .sync_wal = false,
+    };
+    CHECK(online.EnableOnline(path, ChainPoint{0, genesis}, chain, config));
+    const uint64_t physical_slots{
+        std::filesystem::file_size(path / "forest.hashes") / sizeof(Hash256)};
+    const uint64_t hashes_checksum{FileChecksum(path / "forest.hashes")};
+    const uint64_t metadata_checksum{FileChecksum(path / "forest.meta")};
+    const std::array<Hash256, 2> additions{
+        OnlineHash64(22'000'001), OnlineHash64(22'000'002)};
+    const ChainPoint point{1, OnlineHash64(21'000'001)};
+    chain.push_back(point.block_hash);
+    CHECK(reference.Modify(additions, {}));
+    CHECK(online.ModifyBlock(additions, {}, point));
+    CHECK(online.Usage().allocated_slots > physical_slots);
+    CHECK(online.FlushOnline());
+    CHECK_EQ(std::filesystem::file_size(path / "forest.hashes"),
+             physical_slots * sizeof(Hash256));
+    CHECK_EQ(FileChecksum(path / "forest.hashes"), hashes_checksum);
+    CHECK_EQ(FileChecksum(path / "forest.meta"), metadata_checksum);
+
+    online = PackedForest{};
+    online = ReopenOnline(path, chain, point, config);
+    CHECK_EQ(online.Roots(), reference.Roots());
+    CHECK(online.Contains(additions[0]));
+    CHECK(online.Contains(additions[1]));
+    const std::array<Hash256, 3> targets{
+        initial.front(), additions[0], additions[1]};
+    const auto reference_proof{reference.Prove(targets)};
+    const auto online_proof{online.Prove(targets)};
+    CHECK(reference_proof);
+    CHECK(online_proof);
+    CHECK_EQ(online_proof.Value().targets, reference_proof.Value().targets);
+    CHECK_EQ(online_proof.Value().hashes, reference_proof.Value().hashes);
+    Cleanup(path);
+}
+
 TEST(online_forest_multiblock_reorg_reopen_and_alternate_branch)
 {
     const auto path{OnlinePath("multireorg")};
@@ -636,7 +1147,7 @@ TEST(online_forest_multiblock_reorg_reopen_and_alternate_branch)
     Cleanup(path);
 }
 
-TEST(online_forest_recovers_reorg_when_base_flush_stops_before_superblock)
+TEST(online_forest_recovers_reorg_when_delta_publication_is_blocked)
 {
     const auto path{OnlinePath("reorg-flush-boundary")};
     Cleanup(path);
@@ -674,10 +1185,9 @@ TEST(online_forest_recovers_reorg_when_base_flush_stops_before_superblock)
         chain.pop_back();
         CHECK_EQ(online.Roots(), expected_roots);
 
-        // Generation 3 would publish state.1. Blocking its temporary file makes
-        // FlushBase stop after syncing the inactive chain snapshot and mmap base,
-        // exactly where a power loss previously made the old superblock unusable.
-        std::filesystem::create_directory(path / "state.1.tmp");
+        // The rollback WAL is already durable. Blocking delta generation 3
+        // must not alter either prior immutable run or the mmap base.
+        std::filesystem::create_directory(DeltaPathForTest(path, 3, true));
         const auto flushed{online.FlushOnline()};
         CHECK(!flushed);
     }
@@ -685,7 +1195,7 @@ TEST(online_forest_recovers_reorg_when_base_flush_stops_before_superblock)
     auto recovered{ReopenOnline(path, chain, point_one, config)};
     CHECK_EQ(recovered.Roots(), expected_roots);
     std::error_code cleanup_error;
-    std::filesystem::remove_all(path / "state.1.tmp", cleanup_error);
+    std::filesystem::remove_all(DeltaPathForTest(path, 3, true), cleanup_error);
     CHECK(!cleanup_error);
     CHECK(recovered.FlushOnline());
     recovered = PackedForest{};
@@ -694,19 +1204,18 @@ TEST(online_forest_recovers_reorg_when_base_flush_stops_before_superblock)
     Cleanup(path);
 }
 
-TEST(online_forest_recovers_from_corrupt_newest_superblock)
+TEST(online_forest_ignores_incomplete_delta_temporary_file)
 {
-    const auto path{OnlinePath("superblock")};
+    const auto path{OnlinePath("incomplete-delta")};
     Cleanup(path);
     const OnlineForestConfig config{
         .max_dirty_bytes = 1024 * 1024,
         .wal_segment_bytes = 1024 * 1024,
         .undo_depth = 8,
-        .sync_wal = true,
+        .sync_wal = false,
     };
     const Hash256 genesis{OnlineHash64(4'000'000)};
     const ChainPoint point_one{1, OnlineHash64(4'000'001)};
-    const ChainPoint point_two{2, OnlineHash64(4'000'002)};
     std::vector<Hash256> chain{genesis};
     std::vector<Hash256> initial;
     for (uint64_t value{1}; value <= 8; ++value) initial.push_back(OnlineHash64(value));
@@ -716,7 +1225,6 @@ TEST(online_forest_recovers_from_corrupt_newest_superblock)
     PackedForest reference;
     CHECK(reference.Modify(initial, {}));
     CHECK(reference.Modify(addition_one, {}));
-    CHECK(reference.Modify(addition_two, {}));
     {
         PackedForest online;
         CHECK(online.Modify(initial, {}));
@@ -725,32 +1233,46 @@ TEST(online_forest_recovers_from_corrupt_newest_superblock)
         chain.push_back(point_one.block_hash);
         CHECK(online.FlushOnline());
         CHECK_EQ(online.OnlineUsage().base_lsn, 1U);
-        CHECK(online.ModifyBlock(addition_two, {}, point_two));
-        chain.push_back(point_two.block_hash);
-        CHECK(online.FlushOnline());
-        CHECK_EQ(online.OnlineUsage().base_lsn, 2U);
     }
 
-    // Generation 2 is state.0. Corrupt it so recovery must select generation
-    // 1 from state.1 and replay transaction 2 from the retained WAL.
-    FlipByte(path / "state.0", 24);
-    auto recovered{ReopenOnline(path, chain, point_two, config)};
-    CHECK_EQ(recovered.Roots(), reference.Roots());
-    CHECK_EQ(recovered.OnlineUsage().base_lsn, 1U);
-    CHECK_EQ(recovered.OnlineUsage().current_lsn, 2U);
-    CHECK(recovered.OnlineUsage().dirty_nodes > 0U);
+    // A crash can leave an arbitrary .tmp tail. Only fsync-and-renamed .run
+    // files are candidates for recovery.
+    {
+        std::ofstream output{DeltaPathForTest(path, 2, true), std::ios::binary};
+        output << "incomplete delta";
+        CHECK(output.good());
+    }
+    auto recovered{ReopenOnline(path, chain, point_one, config)};
+    std::vector<Hash256> live{initial.begin(), initial.end()};
+    live.push_back(addition_one[0]);
+    CheckEquivalent(reference, recovered, live);
+    CHECK(std::filesystem::exists(DeltaPathForTest(path, 2, true)));
+
+    // The next seal safely reclaims an unaliased regular temporary file, so a
+    // crash tail cannot permanently block publication of its generation.
+    const ChainPoint point_two{2, OnlineHash64(4'000'002)};
+    CHECK(reference.Modify(addition_two, {}));
+    live.push_back(addition_two[0]);
+    chain.push_back(point_two.block_hash);
+    CHECK(recovered.ModifyBlock(addition_two, {}, point_two));
+    CHECK(recovered.FlushOnline());
+    CHECK(!std::filesystem::exists(DeltaPathForTest(path, 2, true)));
+    CHECK(std::filesystem::exists(DeltaPathForTest(path, 2)));
+    recovered = PackedForest{};
+    recovered = ReopenOnline(path, chain, point_two, config);
+    CheckEquivalent(reference, recovered, live);
     Cleanup(path);
 }
 
-TEST(online_forest_falls_back_from_corrupt_newest_chain_snapshot)
+TEST(online_forest_rejects_missing_delta_predecessor)
 {
-    const auto path{OnlinePath("chain-superblock-pair")};
+    const auto path{OnlinePath("delta-gap")};
     Cleanup(path);
     const OnlineForestConfig config{
         .max_dirty_bytes = 1024 * 1024,
         .wal_segment_bytes = 1024 * 1024,
         .undo_depth = 8,
-        .sync_wal = true,
+        .sync_wal = false,
     };
     const Hash256 genesis{OnlineHash64(4'100'000)};
     const ChainPoint point_one{1, OnlineHash64(4'100'001)};
@@ -761,10 +1283,6 @@ TEST(online_forest_falls_back_from_corrupt_newest_chain_snapshot)
     const std::array<Hash256, 1> addition_one{OnlineHash64(85)};
     const std::array<Hash256, 1> addition_two{OnlineHash64(86)};
 
-    PackedForest reference;
-    CHECK(reference.Modify(initial, {}));
-    CHECK(reference.Modify(addition_one, {}));
-    CHECK(reference.Modify(addition_two, {}));
     {
         PackedForest online;
         CHECK(online.Modify(initial, {}));
@@ -777,13 +1295,16 @@ TEST(online_forest_falls_back_from_corrupt_newest_chain_snapshot)
         CHECK(online.FlushOnline());
     }
 
-    // Generation 2 uses state.0 + chain.0.hashes. Corrupting only its chain
-    // snapshot must select generation 1 and replay block 2 from retained WAL.
-    FlipByte(path / "chain.0.hashes", 2 * static_cast<std::streamoff>(Hash256::SIZE));
-    auto recovered{ReopenOnline(path, chain, point_two, config)};
-    CHECK_EQ(recovered.Roots(), reference.Roots());
-    CHECK_EQ(recovered.OnlineUsage().base_lsn, 1U);
-    CHECK_EQ(recovered.OnlineUsage().current_lsn, 2U);
+    CHECK_EQ(DeltaPaths(path).size(), 2U);
+    std::error_code remove_error;
+    CHECK(std::filesystem::remove(DeltaPathForTest(path, 1), remove_error));
+    CHECK(!remove_error);
+    std::vector<Hash256> recovered_chain;
+    ChainPoint recovered_point;
+    const auto recovered{
+        PackedForest::OpenOnline(path, recovered_chain, recovered_point, config)};
+    CHECK(!recovered);
+    CHECK(recovered.Error().find("not contiguous") != std::string::npos);
     Cleanup(path);
 }
 

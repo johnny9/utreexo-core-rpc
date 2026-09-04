@@ -452,8 +452,8 @@ def run(args: argparse.Namespace) -> int:
                 f"see {work / 'cpp-sidecar-reopen.log'}")
         if "event=online_state_loaded" not in reopen_result.stdout:
             raise AssertionError("C++ sidecar did not report online-state recovery")
-        if "event=online_base_flushed" not in reopen_result.stdout:
-            raise AssertionError("C++ sidecar did not report the post-switch base flush")
+        if "event=online_delta_sealed" not in reopen_result.stdout:
+            raise AssertionError("C++ sidecar did not report the post-switch delta seal")
         cpp_state = json.loads(reopen_state_path.read_text(encoding="utf-8"))
         cpp_roots = normalize_roots(cpp_state["roots"])
         reference_roots = normalize_roots(reference_state["roots"])

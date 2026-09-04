@@ -45,7 +45,7 @@ Result<void> SaveCheckpoint(const std::filesystem::path& path,
 Result<LoadedCheckpoint> LoadCheckpoint(const std::filesystem::path& path,
                                         CheckpointMetrics* metrics = nullptr);
 /**
- * Stream a checkpoint directly into a newly created native mmap/WAL state.
+ * Stream a checkpoint directly into a newly created native mmap state.
  * With config.defer_publish set, the generation remains private until the
  * caller validates the returned state and calls PackedForest::PublishOnline;
  * dropping it first removes the temporary generation.
