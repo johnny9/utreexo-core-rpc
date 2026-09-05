@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(utreexo_bridge VERSION 0.4.0 LANGUAGES CXX)
+project(utreexo_bridge VERSION 0.5.0 LANGUAGES CXX)
 
-set(UTREEXO_VERSION_SUFFIX "-beta.3")
+set(UTREEXO_VERSION_SUFFIX "-beta.1")
 if(NOT UTREEXO_VERSION_SUFFIX STREQUAL "" AND
    NOT UTREEXO_VERSION_SUFFIX MATCHES "^-(alpha|beta|rc)\\.[1-9][0-9]*$")
     message(FATAL_ERROR
@@ -81,6 +81,7 @@ utreexo_configure_target(utreexo_logging)
 
 add_library(utreexo_accumulator
     src/bridge_wire.cpp
+    src/transaction_wire.cpp
     src/hash.cpp
     src/leaf.cpp
     src/position.cpp
@@ -90,7 +91,7 @@ target_include_directories(utreexo_accumulator PUBLIC include)
 target_compile_features(utreexo_accumulator PUBLIC cxx_std_20)
 utreexo_configure_target(utreexo_accumulator)
 
-add_library(utreexo_p2p src/p2p.cpp src/proof_store.cpp)
+add_library(utreexo_p2p src/p2p.cpp src/proof_store.cpp src/transaction_cache.cpp)
 target_include_directories(utreexo_p2p PUBLIC include)
 target_compile_features(utreexo_p2p PUBLIC cxx_std_20)
 target_link_libraries(utreexo_p2p PUBLIC utreexo_accumulator utreexo_logging Threads::Threads)
@@ -138,10 +139,11 @@ if(UTREEXO_BUILD_RPC)
         src/core_rpc.cpp
         src/json_stream.cpp
         src/sync.cpp
+        src/transaction_relay.cpp
     )
     target_include_directories(utreexo_core_rpc PUBLIC include)
     target_compile_features(utreexo_core_rpc PUBLIC cxx_std_20)
-    target_link_libraries(utreexo_core_rpc PUBLIC utreexo_accumulator utreexo_univalue utreexo_logging Threads::Threads)
+    target_link_libraries(utreexo_core_rpc PUBLIC utreexo_accumulator utreexo_univalue utreexo_logging utreexo_p2p Threads::Threads)
     utreexo_configure_target(utreexo_core_rpc)
 
     add_executable(utreexo-bridge src/main.cpp)
@@ -168,7 +170,13 @@ if(UTREEXO_BUILD_FUZZERS)
     add_executable(utreexo_fuzz_p2p test/fuzz/p2p.cpp)
     target_link_libraries(utreexo_fuzz_p2p PRIVATE utreexo_p2p)
 
-    foreach(fuzz_target IN ITEMS utreexo_fuzz_forest utreexo_fuzz_rpc_json utreexo_fuzz_p2p)
+    # Compile the codec into this target so libFuzzer instruments its branches,
+    # not just the harness. Other executables use the ordinary library object.
+    add_executable(utreexo_fuzz_transaction_wire
+        test/fuzz/transaction_wire.cpp src/transaction_wire.cpp)
+    target_link_libraries(utreexo_fuzz_transaction_wire PRIVATE utreexo_accumulator)
+
+    foreach(fuzz_target IN ITEMS utreexo_fuzz_forest utreexo_fuzz_rpc_json utreexo_fuzz_p2p utreexo_fuzz_transaction_wire)
         target_compile_features(${fuzz_target} PRIVATE cxx_std_20)
         target_compile_options(${fuzz_target} PRIVATE
             -fno-omit-frame-pointer -fsanitize=fuzzer,address,undefined)
@@ -190,6 +198,7 @@ if(BUILD_TESTING)
         test/checkpoint_tests.cpp
         test/trusted_checkpoint_tests.cpp
         test/bridge_wire_tests.cpp
+        test/transaction_wire_tests.cpp
         test/p2p_tests.cpp
         test/proof_store_tests.cpp
         test/log_tests.cpp
@@ -276,6 +285,11 @@ install(FILES contrib/tor/torrc.example contrib/tor/bitcoin.conf.example
     DESTINATION ${CMAKE_INSTALL_DATADIR}/utreexo-bridge/tor)
 install(FILES doc/tor.md
     DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(FILES doc/transaction-proof-codec.md doc/core-backed-transaction-proof-relay-plan.md
+    doc/core-backed-transaction-proof-relay.md
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}/doc)
+install(FILES contrib/utreexod-v0.6.0-core-relay.patch
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}/contrib)
 
 set(CPACK_PACKAGE_NAME "utreexo-bridge")
 set(CPACK_PACKAGE_VERSION "${UTREEXO_FULL_VERSION}")

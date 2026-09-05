@@ -62,6 +62,8 @@ public:
     Result<uint32_t> RollbackTo(const ChainPoint& point);
     /** Generate and verify deletion proofs against each block's pre-mutation forest. */
     void SetProofGeneration(bool enabled) { m_generate_proofs = enabled; }
+    /** Invalidate readers of tip-specific data before any connect/disconnect. */
+    void SetBeforeMutation(std::function<void()> callback) { m_before_mutation = std::move(callback); }
     /** Decide proof capture after parsing a block but before mutating the forest. */
     void SetProofGenerationPolicy(std::function<Result<bool>(const BlockDelta&)> policy)
     {
@@ -81,6 +83,7 @@ private:
     std::unique_ptr<PrefetchState> m_prefetch;
     bool m_generate_proofs{false};
     std::function<Result<bool>(const BlockDelta&)> m_proof_policy;
+    std::function<void()> m_before_mutation;
 };
 
 } // namespace utreexo

@@ -151,6 +151,7 @@ Result<uint32_t> SequentialSync::ReconcileCurrentPoint()
             return Result<uint32_t>::Err(
                 "active-chain reorganization requires online WAL before-images or checkpoint restore");
         }
+        if (m_before_mutation) m_before_mutation();
         auto rolled_back{m_forest.RollbackOnlineBlock()};
         if (!rolled_back) return Result<uint32_t>::Err(rolled_back.Error());
         if (m_chain_hashes.size() < 2 ||
@@ -176,6 +177,7 @@ Result<uint32_t> SequentialSync::RollbackTo(const ChainPoint& target)
     uint32_t disconnected{0};
     while (m_chain_hashes.size() - 1 > target.height) {
         const auto previous{CurrentPoint()};
+        if (m_before_mutation) m_before_mutation();
         auto rolled_back{m_forest.RollbackOnlineBlock()};
         if (!rolled_back) return Result<uint32_t>::Err(rolled_back.Error());
         if (!previous || m_chain_hashes.size() < 2 ||
@@ -281,6 +283,7 @@ Result<ProcessedBlock> SequentialSync::ProcessNext()
     // Grow the external chain index before mutating the forest. A failed vector
     // allocation must never leave a RAM forest one block ahead of its checkpoint
     // point; pop_back is non-allocating if the forest transition is rejected.
+    if (m_before_mutation) m_before_mutation();
     m_chain_hashes.push_back(fetched.Value().hash);
     const auto modify_start{Clock::now()};
     try {

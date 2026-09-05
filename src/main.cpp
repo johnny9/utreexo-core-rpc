@@ -7,6 +7,8 @@
 #include <utreexo/p2p.h>
 #include <utreexo/proof_store.h>
 #include <utreexo/sync.h>
+#include <utreexo/core_transaction_peer.h>
+#include <utreexo/transaction_relay.h>
 #include <utreexo/trusted_checkpoint.h>
 
 #include <algorithm>
@@ -100,10 +102,14 @@ struct Options {
     uint64_t proof_store_queue_mib{256};
     uint64_t proof_store_max_record_mib{320};
     uint64_t memory_reserve_mib{2'048};
+    uint64_t tx_cache_mib{64};
     uint32_t poll_interval_ms{5'000};
+    uint32_t tx_cache_entries{10'000};
+    uint32_t tx_cache_seconds{60};
     std::string p2p_bind{"127.0.0.1"};
     std::optional<uint16_t> p2p_port;
     std::optional<utreexo::P2PIPv4Endpoint> p2p_advertise;
+    std::optional<utreexo::P2PIPv4Endpoint> core_tx_peer;
     std::vector<utreexo::P2PIPv4Endpoint> p2p_gossip_seeds;
     utreexo::BitcoinNetwork p2p_network{utreexo::BitcoinNetwork::MAINNET};
     uint32_t p2p_max_peers{16};
@@ -321,6 +327,10 @@ void Usage()
         << "                              (default 2048; 0 disables the proactive guard)\n"
         << "  --follow                    Poll Core and remain online after the initial sync\n"
         << "  --poll-interval-ms=N        Follow-mode Core tip poll interval (default 5000)\n"
+        << "  --core-tx-peer=IPv4:PORT    Enable Core-backed v0.6 transaction proof relay\n"
+        << "  --tx-cache-entries=N        Prepared transaction count ceiling (default 10000)\n"
+        << "  --tx-cache-mib=N            Prepared transaction byte ceiling (default 64)\n"
+        << "  --tx-cache-seconds=N        Preparation lifetime (default 60, maximum 86400)\n"
         << "  --p2p-port=N                Serve cached/archived getuproof over Bitcoin v1 P2P\n"
         << "  --p2p-bind=IP               P2P IPv4 bind address: 127.0.0.1 or 0.0.0.0\n"
         << "  --p2p-advertise=IPv4:PORT   Public address returned and announced to seeds\n"
@@ -452,6 +462,16 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
                 options.poll_interval_ms == 0 || options.poll_interval_ms > 60'000) {
                 return utreexo::Result<Options>::Err("invalid --poll-interval-ms");
             }
+        } else if (auto core_peer{value("--core-tx-peer")}) {
+            auto endpoint{utreexo::ParseP2PIPv4Endpoint(*core_peer)};
+            if (!endpoint) return utreexo::Result<Options>::Err(endpoint.Error());
+            options.core_tx_peer = endpoint.Take();
+        } else if (auto entries{value("--tx-cache-entries")}) {
+            if (!ParseInteger(*entries, options.tx_cache_entries) || options.tx_cache_entries == 0 || options.tx_cache_entries > 100'000) return utreexo::Result<Options>::Err("invalid --tx-cache-entries");
+        } else if (auto bytes{value("--tx-cache-mib")}) {
+            if (!ParseInteger(*bytes, options.tx_cache_mib) || options.tx_cache_mib == 0 || options.tx_cache_mib > 4096) return utreexo::Result<Options>::Err("invalid --tx-cache-mib");
+        } else if (auto lifetime{value("--tx-cache-seconds")}) {
+            if (!ParseInteger(*lifetime, options.tx_cache_seconds) || options.tx_cache_seconds == 0 || options.tx_cache_seconds > 86'400) return utreexo::Result<Options>::Err("invalid --tx-cache-seconds");
         } else if (auto bind{value("--p2p-bind")}) {
             options.p2p_bind = *bind;
         } else if (auto advertised{value("--p2p-advertise")}) {
@@ -593,6 +613,13 @@ utreexo::Result<Options> ParseOptions(int argc, char** argv)
     }
     if (options.p2p_port && !options.follow) {
         return utreexo::Result<Options>::Err("--p2p-port requires --follow");
+    }
+    if (options.core_tx_peer && (!options.follow || !options.p2p_port)) {
+        return utreexo::Result<Options>::Err("--core-tx-peer requires --follow and --p2p-port");
+    }
+    if (options.core_tx_peer && options.p2p_network != utreexo::BitcoinNetwork::MAINNET &&
+        options.p2p_network != utreexo::BitcoinNetwork::REGTEST) {
+        return utreexo::Result<Options>::Err("Core transaction relay supports mainnet checkpoint synchronization and regtest");
     }
     if ((options.p2p_advertise || !options.p2p_gossip_seeds.empty()) &&
         !options.p2p_port) {
@@ -1233,7 +1260,7 @@ int BridgeMain(int argc, char** argv)
         .authorization = options.authorization,
     };
     utreexo::CoreRpcBlockSource source{utreexo::CoreRpcClient{
-        std::make_unique<utreexo::HttpRpcTransport>(std::move(rpc_config))}};
+        std::make_unique<utreexo::HttpRpcTransport>(rpc_config)}};
     if (options.p2p_port) {
         auto core_genesis{source.BlockHash(0)};
         if (!core_genesis) {
@@ -1567,6 +1594,16 @@ int BridgeMain(int argc, char** argv)
     }
 
     utreexo::SequentialSync sync{source, forest, std::move(chain_hashes)};
+    if (options.core_tx_peer && options.p2p_network == utreexo::BitcoinNetwork::MAINNET) {
+        const auto* anchor{utreexo::FindTrustedCheckpoint("mainnet-943013")};
+        if (!anchor || options.allow_untrusted_checkpoint ||
+            sync.ChainHashes().size() <= anchor->point.height ||
+            sync.ChainHashes()[anchor->point.height] != anchor->point.block_hash) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "transaction_relay_checkpoint_required",
+                "reason=mainnet_requires_trusted_943013_checkpoint_or_its_online_resume");
+            return 1;
+        }
+    }
     if (forest.IsOnline()) {
         const auto reconciled{sync.ReconcileCurrentPoint()};
         if (!reconciled) {
@@ -2771,7 +2808,27 @@ int BridgeMain(int argc, char** argv)
     }
 
     std::shared_ptr<utreexo::RecentProofCache> proof_cache;
+    std::shared_ptr<utreexo::TransactionProofCache> transaction_cache;
+    std::unique_ptr<utreexo::CoreTransactionPeer> core_transaction_peer;
+    std::unique_ptr<utreexo::TransactionRelay> transaction_relay;
     std::unique_ptr<utreexo::P2PServer> p2p_server;
+    if (options.core_tx_peer && RequestedShutdownSignal() == 0) {
+        transaction_cache = std::make_shared<utreexo::TransactionProofCache>(utreexo::TransactionCacheConfig{
+            options.tx_cache_entries, options.tx_cache_mib * 1024ULL * 1024,
+            std::chrono::seconds(options.tx_cache_seconds)});
+        sync.SetBeforeMutation([transaction_cache] { transaction_cache->Invalidate(); });
+        auto started{utreexo::CoreTransactionPeer::Start(utreexo::CoreTransactionPeerConfig{
+            .network = options.p2p_network, .endpoint = *options.core_tx_peer})};
+        if (!started) {
+            utreexo::Log(utreexo::LogLevel::ERROR, "core_transaction_start_failed", "error=" + StringField(started.Error()));
+            return 1;
+        }
+        core_transaction_peer = started.Take();
+        rpc_config.max_response_bytes = 32ULL * 1024 * 1024;
+        rpc_config.timeout_seconds = 5;
+        transaction_relay = std::make_unique<utreexo::TransactionRelay>(utreexo::CoreRpcClient{
+            std::make_unique<utreexo::HttpRpcTransport>(rpc_config), 0}, forest, sync, transaction_cache);
+    }
     if (RequestedShutdownSignal() != 0) note_shutdown("before_p2p_start");
     if (options.p2p_port && shutdown_signal_number == 0) {
         constexpr uint64_t MIB{1024ULL * 1024};
@@ -2781,7 +2838,7 @@ int BridgeMain(int argc, char** argv)
         if (!proof_store) sync.SetProofGeneration(true);
         const bool advertise_archive{proof_store && proof_store->Coverage().full_history};
         auto started{utreexo::P2PServer::Start(
-            P2PConfig(options, advertise_archive), proof_cache, proof_store)};
+            P2PConfig(options, advertise_archive), proof_cache, proof_store, transaction_cache)};
         if (!started) {
             const bool allocation_failure{IsAllocationFailure(started.Error())};
             utreexo::Log(utreexo::LogLevel::ERROR, "p2p_listen_failed",
@@ -2880,12 +2937,14 @@ int BridgeMain(int argc, char** argv)
                 return 2;
             }
             if (!current_tip) {
+                if (transaction_cache) transaction_cache->Invalidate();
                 utreexo::Log(utreexo::LogLevel::WARN, "online_tip_poll_failed",
                              "error=" + StringField(current_tip.Error()) + " action=retry");
                 std::this_thread::sleep_for(std::chrono::milliseconds(options.poll_interval_ms));
                 continue;
             }
             if (sync.ChainHashes().size() <= current_tip.Value()) {
+                if (transaction_cache) transaction_cache->Invalidate();
                 auto started{start_prefetch(current_tip.Value())};
                 if (!started) {
                     if (IsAllocationFailure(started.Error())) {
@@ -3175,7 +3234,13 @@ int BridgeMain(int argc, char** argv)
                 }
                 last_delta_seal = Clock::now();
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(options.poll_interval_ms));
+            if (transaction_relay) {
+                auto relayed{transaction_relay->Poll(core_transaction_peer->Take(64))};
+                if (!relayed) utreexo::Log(utreexo::LogLevel::WARN, "transaction_relay_withdrawn", "error=" + StringField(relayed.Error()));
+                core_transaction_peer->Wait(std::chrono::milliseconds(std::min(options.poll_interval_ms, uint32_t{1000})));
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(options.poll_interval_ms));
+            }
         }
         sync.StopPrefetch();
         if (RequestedShutdownSignal() != 0) note_shutdown("online_follow");
@@ -3183,6 +3248,7 @@ int BridgeMain(int argc, char** argv)
 
     // Stop public readers before the final archive/forest persistence boundary.
     p2p_server.reset();
+    core_transaction_peer.reset();
     if (proof_store) {
         const auto drained{proof_store->Drain()};
         if (!drained) {

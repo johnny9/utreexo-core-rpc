@@ -1,6 +1,8 @@
 // Copyright (c) 2026 The Utreexo Bridge developers
 // Distributed under the MIT software license.
 #include <utreexo/p2p.h>
+#include <utreexo/core_transaction_peer.h>
+#include <utreexo/transaction_cache.h>
 
 #include <utreexo/hash.h>
 #include <utreexo/log.h>
@@ -21,11 +23,13 @@
 #include <fcntl.h>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <netinet/in.h>
 #include <new>
 #include <optional>
 #include <poll.h>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sys/socket.h>
@@ -133,7 +137,8 @@ std::array<std::byte, 4> NetworkMagic(BitcoinNetwork network)
 
 uint64_t AdvertisedServices(const P2PServerConfig& config)
 {
-    return NODE_UTREEXO | (config.advertise_archive ? NODE_UTREEXO_ARCHIVE : 0);
+    return NODE_UTREEXO | (config.advertise_archive ? NODE_UTREEXO_ARCHIVE : 0) |
+           (config.serve_transactions ? uint64_t{1} << 3 : 0);
 }
 
 std::string EndpointText(const P2PIPv4Endpoint& endpoint)
@@ -528,9 +533,11 @@ std::vector<std::byte> AdvertisedAddressPayload(const P2PServerConfig& config,
 }
 
 std::vector<std::byte> VersionPayload(const P2PServerConfig& config, uint32_t height,
-                                      uint16_t peer_port)
+                                      uint16_t peer_port,
+                                      std::optional<uint64_t> override_services = std::nullopt,
+                                      bool request_transactions = false)
 {
-    const uint64_t services{AdvertisedServices(config)};
+    const uint64_t services{override_services.value_or(AdvertisedServices(config))};
     std::vector<std::byte> output;
     output.reserve(128);
     AppendLE(output, PROTOCOL_VERSION);
@@ -557,7 +564,7 @@ std::vector<std::byte> VersionPayload(const P2PServerConfig& config, uint32_t he
         output.push_back(static_cast<std::byte>(static_cast<unsigned char>(character)));
     }
     AppendLE(output, height);
-    output.push_back(std::byte{0}); // No transaction relay.
+    output.push_back(request_transactions ? std::byte{1} : std::byte{0});
     return output;
 }
 
@@ -1196,9 +1203,10 @@ public:
     };
 
     Impl(P2PServerConfig server_config, std::shared_ptr<RecentProofCache> proof_cache,
-         std::shared_ptr<ProofStore> proof_store, int listener_socket, uint16_t actual_port)
+         std::shared_ptr<ProofStore> proof_store, std::shared_ptr<TransactionProofCache> tx_cache,
+         int listener_socket, uint16_t actual_port)
         : config{std::move(server_config)}, cache{std::move(proof_cache)},
-          store{std::move(proof_store)}, listener{listener_socket}, bound_port{actual_port},
+          store{std::move(proof_store)}, transactions{std::move(tx_cache)}, listener{listener_socket}, bound_port{actual_port},
           egress_tokens{static_cast<long double>(config.egress_burst_bytes)},
           egress_updated{std::chrono::steady_clock::now()}
     {
@@ -1687,11 +1695,75 @@ public:
         bool sent_version{false};
         bool received_verack{false};
         bool wants_addrv2{false};
+        bool wants_transactions{false};
+        uint64_t tx_cursor{0};
+        uint64_t tx_epoch{UINT64_MAX};
+        auto tx_repeat{std::chrono::steady_clock::now()};
+        std::map<Hash256, uint64_t> announced_transactions;
+        auto last_input{std::chrono::steady_clock::now()};
         uint64_t messages_in_window{0};
         uint64_t inbound_bytes_remaining{config.max_inbound_bytes_per_second};
         auto window_start{std::chrono::steady_clock::now()};
         std::string disconnect_reason{"shutdown"};
         while (!stopping.load()) {
+            if (received_verack && wants_transactions && transactions) {
+                const auto epoch{transactions->Stats().epoch};
+                if (epoch != tx_epoch) {
+                    // v0.6 getdata has no tip/announcement identifier. A new
+                    // connection is required before rebinding the same txid to
+                    // another anchor; an old request could otherwise match a
+                    // valid subset of a newly prepared proof by coincidence.
+                    if (!announced_transactions.empty()) {
+                        disconnect_reason = "transaction proof anchor changed";
+                        break;
+                    }
+                    tx_epoch = epoch;
+                }
+                auto next_cursor{tx_cursor};
+                auto entries{transactions->AnnouncementsAfter(next_cursor, 64, 2048, tx_epoch)};
+                // Inventory sent during the consumer's initial block download
+                // is ignored by v0.6. Repeat bounded passes so it can recover
+                // once current, without a sidecar mempool protocol.
+                if (entries.empty() && std::chrono::steady_clock::now() - tx_repeat >= std::chrono::seconds(5)) {
+                    tx_cursor = 0;
+                    tx_repeat = std::chrono::steady_clock::now();
+                }
+                if (!entries.empty()) {
+                    ProofWorkGuard work{*this};
+                    if (!work.Acquired()) { disconnect_reason = "transaction announcement server busy"; break; }
+                    std::vector<txwire::TransactionAnnouncement> announcements;
+                    announcements.reserve(entries.size());
+                    for (auto& entry : entries) announcements.push_back(std::move(entry.announcement));
+                    auto payload{txwire::SerializeTransactionAnnouncements(announcements, config.max_payload_bytes)};
+                    if (!payload) { disconnect_reason = payload.Error(); break; }
+                    EgressReservation egress{*this, MESSAGE_HEADER_SIZE + payload.Value().size()};
+                    if (!egress.Acquired()) { ++egress_limited; disconnect_reason = "transaction announcement egress limit"; break; }
+                    auto sent{SendMessageUntil(socket, config.network, "inv", payload.Value(),
+                        std::chrono::steady_clock::now() + std::chrono::seconds(config.idle_timeout_seconds))};
+                    if (!sent) { disconnect_reason = sent.Error(); break; }
+                    for (std::size_t i{0}; i < entries.size(); ++i) {
+                        // Drop records that no longer refer to a cached preparation.
+                        if (announced_transactions.size() >= transactions->MaxEntries()) {
+                            std::erase_if(announced_transactions, [&](const auto& item) { return !transactions->Find(item.first, item.second); });
+                        }
+                        if (announced_transactions.size() >= transactions->MaxEntries()) announced_transactions.erase(announced_transactions.begin());
+                        announced_transactions[announcements[i].txid] = entries[i].sequence;
+                    }
+                    tx_cursor = next_cursor;
+                }
+                // Poll only before a new frame, preserving one deadline for all
+                // bytes of a frame. Idle peers still receive new transactions.
+                pollfd descriptor{.fd = socket, .events = POLLIN, .revents = 0};
+                const int available{::poll(&descriptor, 1, 100)};
+                if (available < 0 && errno == EINTR) continue;
+                if (available < 0) { disconnect_reason = "transaction peer poll failed"; break; }
+                if (available == 0) {
+                    if (std::chrono::steady_clock::now() - last_input >= std::chrono::seconds(config.idle_timeout_seconds)) {
+                        disconnect_reason = "transaction peer idle timeout"; break;
+                    }
+                    continue;
+                }
+            }
             const auto read_started{std::chrono::steady_clock::now()};
             if (read_started - window_start >= std::chrono::seconds(1)) {
                 messages_in_window = 0;
@@ -1702,7 +1774,7 @@ public:
                 read_started + std::chrono::seconds(config.idle_timeout_seconds)};
             auto message{ReadMessageUntil(socket, config.network,
                                           std::min(config.max_payload_bytes,
-                                                   MAX_INBOUND_MESSAGE_BYTES),
+                                                   transactions ? txwire::MAX_INVENTORY_PAYLOAD : MAX_INBOUND_MESSAGE_BYTES),
                                           message_deadline, &inbound_bytes_remaining)};
             if (!message) {
                 disconnect_reason = message.Error();
@@ -1712,6 +1784,7 @@ public:
                 break;
             }
             const auto now{std::chrono::steady_clock::now()};
+            last_input = now;
             if (++messages_in_window > 256) {
                 disconnect_reason = "message rate limit exceeded";
                 break;
@@ -1723,6 +1796,13 @@ public:
                     break;
                 }
                 const auto version{VersionPayload(config, cache->Stats().tip_height, peer_port)};
+                const auto services{VersionServices(message.Value().payload).value_or(0)};
+                ByteReader version_reader{std::span<const std::byte>{message.Value().payload}.subspan(80)};
+                const auto agent_size{version_reader.ReadCompactSize()};
+                const auto agent_and_height{version_reader.ReadBytes(static_cast<std::size_t>(agent_size.Value()) + 4)};
+                static_cast<void>(agent_and_height);
+                const auto relay{version_reader.Remaining() == 0 ? Result<uint8_t>::Ok(1) : version_reader.ReadLE<uint8_t>()};
+                wants_transactions = relay && relay.Value() != 0 && (services & NODE_UTREEXO) != 0 && (services & (uint64_t{1} << 3)) != 0;
                 const auto response_deadline{
                     now + std::chrono::seconds(config.idle_timeout_seconds)};
                 auto sent{SendMessageUntil(socket, config.network, "version", version,
@@ -1786,6 +1866,9 @@ public:
                     disconnect_reason = "getaddr payload is not empty";
                     break;
                 }
+                // utreexod rejects an empty addrv2; no response is needed when
+                // the operator has not configured an address to advertise.
+                if (transactions && !config.advertised_endpoint) continue;
                 const auto addresses{AdvertisedAddressPayload(config, wants_addrv2)};
                 const auto response_deadline{
                     std::chrono::steady_clock::now() +
@@ -1974,6 +2057,45 @@ public:
                         " response_bytes=" + std::to_string(payload.Value().size()));
                 }
                 if (state_error) break;
+                continue;
+            }
+            if (command == "getdata" && transactions) {
+                auto requests{txwire::ParseTransactionProofRequests(message.Value().payload)};
+                if (!requests) { disconnect_reason = requests.Error(); break; }
+                ProofWorkGuard work{*this};
+                if (!work.Acquired()) { ++proof_busy; disconnect_reason = "transaction proof server busy"; break; }
+                bool failed{false};
+                for (const auto& request : requests.Value()) {
+                    const auto announced{announced_transactions.find(request.txid)};
+                    auto entry{announced == announced_transactions.end() ? nullptr : transactions->Find(request.txid, announced->second)};
+                    std::vector<std::byte> payload;
+                    std::string_view response{"utreexotx"};
+                    uint64_t bytes{37}; // One ordinary notfound inventory vector.
+                    if (entry) {
+                        auto measured{entry->proof.Measure(request, config.max_payload_bytes)};
+                        if (!measured) { disconnect_reason = measured.Error(); failed = true; break; }
+                        bytes = measured.Value();
+                    }
+                    EgressReservation egress{*this, MESSAGE_HEADER_SIZE + bytes};
+                    if (!egress.Acquired()) { ++egress_limited; disconnect_reason = "transaction proof egress limit"; failed = true; break; }
+                    if (entry && transactions->Find(request.txid, entry->sequence)) {
+                        auto encoded{entry->proof.Serialize(request, config.max_payload_bytes)};
+                        if (!encoded) { disconnect_reason = encoded.Error(); failed = true; break; }
+                        payload = encoded.Take();
+                    } else {
+                        response = "notfound";
+                        AppendCompactSize(payload, 1);
+                        AppendLE(payload, request.inventory_type);
+                        payload.insert(payload.end(), request.txid.Bytes().begin(), request.txid.Bytes().end());
+                    }
+                    auto sent{SendMessageUntil(socket, config.network, response, payload,
+                        std::chrono::steady_clock::now() + std::chrono::seconds(config.idle_timeout_seconds))};
+                    if (!sent) { disconnect_reason = sent.Error(); failed = true; break; }
+                    response_bytes.fetch_add(MESSAGE_HEADER_SIZE + payload.size());
+                    Log(LogLevel::DEBUG, "p2p_transaction_response", "txid=" + request.txid.ToBitcoinHex() +
+                        " response=" + std::string{response} + " hashes=" + std::to_string(request.proof_positions.size()));
+                }
+                if (failed) break;
                 continue;
             }
             if (command != "getuproof") continue;
@@ -2200,6 +2322,7 @@ public:
     P2PServerConfig config;
     std::shared_ptr<RecentProofCache> cache;
     std::shared_ptr<ProofStore> store;
+    std::shared_ptr<TransactionProofCache> transactions;
     int listener{-1};
     uint16_t bound_port{0};
     std::atomic<bool> stopping{false};
@@ -2334,8 +2457,9 @@ Result<void> ValidateP2PServerConfig(const P2PServerConfig& config)
 
 Result<std::unique_ptr<P2PServer>> P2PServer::Start(
     P2PServerConfig config, std::shared_ptr<RecentProofCache> cache,
-    std::shared_ptr<ProofStore> store)
+    std::shared_ptr<ProofStore> store, std::shared_ptr<TransactionProofCache> transactions)
 {
+    config.serve_transactions = static_cast<bool>(transactions);
     if (!cache) return Result<std::unique_ptr<P2PServer>>::Err("P2P proof cache is null");
     auto valid_config{ValidateP2PServerConfig(config)};
     if (!valid_config) {
@@ -2392,7 +2516,7 @@ Result<std::unique_ptr<P2PServer>> P2PServer::Start(
     config.port = bound_port;
     std::unique_ptr<Impl> impl;
     try {
-        impl = std::make_unique<Impl>(std::move(config), std::move(cache), std::move(store),
+        impl = std::make_unique<Impl>(std::move(config), std::move(cache), std::move(store), std::move(transactions),
                                       listener, bound_port);
     } catch (const std::bad_alloc&) {
         ::close(listener);
@@ -2416,5 +2540,265 @@ Result<std::unique_ptr<P2PServer>> P2PServer::Start(
 uint16_t P2PServer::BoundPort() const { return m_impl->bound_port; }
 
 P2PServerStats P2PServer::Stats() const { return m_impl->Stats(); }
+
+
+class CoreTransactionPeer::Impl
+{
+public:
+    explicit Impl(CoreTransactionPeerConfig settings) : config{std::move(settings)} {}
+    ~Impl()
+    {
+        stopping.store(true);
+        {
+            std::lock_guard lock{socket_mutex};
+            if (socket_fd >= 0) ::shutdown(socket_fd, SHUT_RDWR);
+        }
+        wakeup.notify_all();
+        if (worker.joinable()) worker.join();
+        CloseSocket();
+    }
+
+    void CloseSocket()
+    {
+        std::lock_guard lock{socket_mutex};
+        if (socket_fd >= 0) ::close(std::exchange(socket_fd, -1));
+    }
+
+    Result<int> Connect()
+    {
+        const int fd{::socket(AF_INET, SOCK_STREAM, 0)};
+        if (fd < 0) return Result<int>::Err("could not create Core transaction socket");
+        {
+            std::lock_guard lock{socket_mutex};
+            socket_fd = fd;
+        }
+        if (!ConfigureSocket(fd)) return Result<int>::Err("could not configure Core transaction socket");
+        const int flags{::fcntl(fd, F_GETFL, 0)};
+        if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            return Result<int>::Err("could not make Core transaction socket nonblocking");
+        }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(config.endpoint.port);
+        if (!ParseIPv4(config.endpoint.address, address.sin_addr)) return Result<int>::Err("invalid Core IPv4 address");
+        if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 && errno != EINPROGRESS) {
+            return Result<int>::Err("Core transaction connect failed: " + std::string{std::strerror(errno)});
+        }
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds(config.connect_timeout_seconds)};
+        while (!stopping.load() && std::chrono::steady_clock::now() < deadline) {
+            pollfd descriptor{.fd = fd, .events = POLLOUT, .revents = 0};
+            const int ready{::poll(&descriptor, 1, 100)};
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) return Result<int>::Err("Core connect poll failed");
+            if (ready == 0) continue;
+            int error{0};
+            socklen_t size{sizeof(error)};
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0 || error != 0) {
+                return Result<int>::Err("Core transaction connection refused or failed");
+            }
+            if (::fcntl(fd, F_SETFL, flags) != 0) return Result<int>::Err("could not restore Core socket mode");
+            return Result<int>::Ok(fd);
+        }
+        return Result<int>::Err("Core transaction connect timed out or stopped");
+    }
+
+    Result<void> Connection()
+    {
+        auto connected{Connect()};
+        if (!connected) return Result<void>::Err(connected.Error());
+        const int fd{connected.Value()};
+        P2PServerConfig version_config;
+        version_config.network = config.network;
+        version_config.user_agent = "/utreexo-bridge:core-tx/";
+        const auto handshake_deadline{std::chrono::steady_clock::now() + std::chrono::seconds(10)};
+        auto sent{SendMessageUntil(fd, config.network, "version",
+            VersionPayload(version_config, 0, config.endpoint.port, uint64_t{1} << 3, true), handshake_deadline)};
+        if (!sent) return sent;
+        bool version_received{false};
+        bool ready{false};
+        std::map<Hash256, std::chrono::steady_clock::time_point> pending;
+        while (!stopping.load()) {
+            const auto deadline{ready ? std::chrono::steady_clock::now() + std::chrono::seconds(180) : handshake_deadline};
+            auto message{ReadMessageUntil(fd, config.network, txwire::MAX_TX_PAYLOAD, deadline)};
+            if (!message) return Result<void>::Err(message.Error());
+            const auto now{std::chrono::steady_clock::now()};
+            const auto& command{message.Value().command};
+            const auto& payload{message.Value().payload};
+            if (command == "version") {
+                const auto services{VersionServices(payload)};
+                if (version_received || !services || (*services & (uint64_t{1} << 3)) == 0) {
+                    return Result<void>::Err("Core transaction peer must support witnesses");
+                }
+                version_received = true;
+                sent = SendMessageUntil(fd, config.network, "verack", {}, handshake_deadline);
+                if (!sent) return sent;
+                continue;
+            }
+            if (command == "verack") {
+                if (!version_received || ready || !payload.empty()) return Result<void>::Err("invalid Core verack");
+                ready = true;
+                {
+                    std::lock_guard lock{mutex};
+                    stats.connected = true;
+                    ++stats.connections;
+                    changed = true;
+                }
+                wakeup.notify_all();
+                Log(LogLevel::INFO, "core_tx_connected", "endpoint=" + EndpointText(config.endpoint));
+                continue;
+            }
+            if (!ready) {
+                if (command == "sendaddrv2" || command == "wtxidrelay") continue;
+                return Result<void>::Err("Core application message before handshake");
+            }
+            if (command == "ping") {
+                if (payload.size() != 8) return Result<void>::Err("invalid Core ping");
+                sent = SendMessageUntil(fd, config.network, "pong", payload, now + std::chrono::seconds(10));
+                if (!sent) return sent;
+            } else if (command == "inv") {
+                auto inventory{txwire::ParseTransactionAnnouncements(payload)};
+                if (!inventory) return Result<void>::Err(inventory.Error());
+                std::erase_if(pending, [now](const auto& item) { return now - item.second > std::chrono::seconds(30); });
+                std::vector<Hash256> wanted;
+                for (const auto& entry : inventory.Value()) {
+                    if (!entry.confirmed_targets.empty()) return Result<void>::Err("Core sent unexpected proof inventory");
+                    if (pending.size() >= config.max_inflight) break;
+                    std::lock_guard lock{mutex};
+                    if (queue.size() >= config.max_queued || stats.queue_bytes >= config.max_queue_bytes) {
+                        ++stats.dropped;
+                        continue;
+                    }
+                    if (pending.contains(entry.txid) || queued.contains(entry.txid)) continue;
+                    pending.emplace(entry.txid, now);
+                    wanted.push_back(entry.txid);
+                }
+                if (!wanted.empty()) {
+                    std::vector<std::byte> request;
+                    AppendCompactSize(request, wanted.size());
+                    for (const auto& txid : wanted) {
+                        AppendLE(request, uint32_t{1} | (uint32_t{1} << 30)); // MSG_WITNESS_TX
+                        request.insert(request.end(), txid.Bytes().begin(), txid.Bytes().end());
+                    }
+                    sent = SendMessageUntil(fd, config.network, "getdata", request, now + std::chrono::seconds(10));
+                    if (!sent) return sent;
+                }
+                // Block inventory also wakes the sync thread; no block request is sent here.
+                {
+                    std::lock_guard lock{mutex};
+                    changed = true;
+                }
+                wakeup.notify_all();
+            } else if (command == "tx") {
+                auto tx{txwire::Transaction::Parse(payload)};
+                if (!tx) return Result<void>::Err(tx.Error());
+                if (pending.erase(tx.Value().Txid()) == 0) continue;
+                Log(LogLevel::DEBUG, "core_tx_received", "txid=" + tx.Value().Txid().ToBitcoinHex());
+                std::lock_guard lock{mutex};
+                ++stats.received;
+                const auto bytes{tx.Value().MemoryUsage() + 128};
+                if (queue.size() >= config.max_queued || bytes > config.max_queue_bytes - stats.queue_bytes) {
+                    ++stats.dropped;
+                    continue;
+                }
+                if (queued.contains(tx.Value().Txid())) continue;
+                const auto inserted{queued.insert(tx.Value().Txid())};
+                try {
+                    queue.push_back(tx.Take());
+                } catch (...) {
+                    queued.erase(inserted.first);
+                    throw;
+                }
+                stats.queue_bytes += bytes;
+                changed = true;
+                wakeup.notify_all();
+            } else if (command == "notfound") {
+                // The bounded RPC inventory sweep repairs transactions missed in flight.
+                auto inventory{txwire::ParseTransactionAnnouncements(payload)};
+                if (!inventory) return Result<void>::Err(inventory.Error());
+                pending.clear();
+            }
+        }
+        return Result<void>::Ok();
+    }
+
+    void Run()
+    {
+        while (!stopping.load()) {
+            try {
+                auto result{Connection()};
+                if (!result && !stopping.load()) Log(LogLevel::WARN, "core_tx_disconnected", "error=" + Quoted(result.Error()));
+            } catch (const std::exception& error) {
+                try {
+                    if (!stopping.load()) Log(LogLevel::ERROR, "core_tx_failed", "error=" + Quoted(error.what()));
+                } catch (...) {
+                    EmergencyLog("Core transaction peer failed while reporting an error\n");
+                }
+            }
+            CloseSocket();
+            std::unique_lock lock{mutex};
+            stats.connected = false;
+            changed = true;
+            wakeup.notify_all();
+            wakeup.wait_for(lock, std::chrono::seconds(config.reconnect_seconds), [this] { return stopping.load(); });
+        }
+    }
+
+    CoreTransactionPeerConfig config;
+    std::atomic<bool> stopping{false};
+    std::mutex socket_mutex;
+    int socket_fd{-1};
+    std::thread worker;
+    std::mutex mutex;
+    std::condition_variable wakeup;
+    bool changed{false};
+    CoreTransactionPeerStats stats;
+    std::deque<txwire::Transaction> queue;
+    std::set<Hash256> queued;
+};
+
+CoreTransactionPeer::CoreTransactionPeer(std::unique_ptr<Impl> impl) : m_impl{std::move(impl)} {}
+CoreTransactionPeer::~CoreTransactionPeer() = default;
+
+Result<std::unique_ptr<CoreTransactionPeer>> CoreTransactionPeer::Start(CoreTransactionPeerConfig config)
+{
+    using R = Result<std::unique_ptr<CoreTransactionPeer>>;
+    auto endpoint{ParseP2PIPv4Endpoint(EndpointText(config.endpoint))};
+    if (!endpoint || config.max_queued == 0 || config.max_queue_bytes == 0 || config.max_inflight == 0 ||
+        config.max_inflight > 1024 || config.connect_timeout_seconds == 0 || config.connect_timeout_seconds > 60 ||
+        config.reconnect_seconds == 0 || config.reconnect_seconds > 60) return R::Err("invalid Core transaction peer settings");
+    auto impl{std::make_unique<Impl>(std::move(config))};
+    auto* const state{impl.get()};
+    impl->worker = std::thread{[state] { state->Run(); }};
+    return R::Ok(std::unique_ptr<CoreTransactionPeer>{new CoreTransactionPeer{std::move(impl)}});
+}
+
+std::vector<txwire::Transaction> CoreTransactionPeer::Take(uint32_t limit)
+{
+    std::lock_guard lock{m_impl->mutex};
+    std::vector<txwire::Transaction> output;
+    output.reserve(std::min<std::size_t>(limit, m_impl->queue.size()));
+    while (output.size() < limit && !m_impl->queue.empty()) {
+        m_impl->stats.queue_bytes -= m_impl->queue.front().MemoryUsage() + 128;
+        m_impl->queued.erase(m_impl->queue.front().Txid());
+        output.push_back(std::move(m_impl->queue.front()));
+        m_impl->queue.pop_front();
+    }
+    return output;
+}
+
+void CoreTransactionPeer::Wait(std::chrono::milliseconds timeout)
+{
+    std::unique_lock lock{m_impl->mutex};
+    m_impl->wakeup.wait_for(lock, timeout, [this] { return m_impl->changed || m_impl->stopping.load(); });
+    m_impl->changed = false;
+}
+
+CoreTransactionPeerStats CoreTransactionPeer::Stats()
+{
+    std::lock_guard lock{m_impl->mutex};
+    auto stats{m_impl->stats};
+    stats.queued = m_impl->queue.size();
+    return stats;
+}
 
 } // namespace utreexo

@@ -166,13 +166,80 @@ jobs:
       - name: Build fuzz targets
         run: >-
           cmake --build build --parallel 2 --target
-          utreexo_fuzz_forest utreexo_fuzz_rpc_json utreexo_fuzz_p2p
+          utreexo_fuzz_forest utreexo_fuzz_rpc_json utreexo_fuzz_p2p utreexo_fuzz_transaction_wire
       - name: Fuzz forest deserialization
         run: ./build/utreexo_fuzz_forest -runs=10000 -max_len=65536
       - name: Fuzz verbose RPC JSON parsing
         run: ./build/utreexo_fuzz_rpc_json -runs=10000 -max_len=65536
       - name: Fuzz P2P envelopes and getuproof requests
         run: ./build/utreexo_fuzz_p2p -runs=10000 -max_len=131072
+      - name: Seed transaction codec from pinned utreexod vectors
+        run: python3 test/integration/utreexod_tx_fuzz_seeds.py build/tx-corpus
+      - name: Fuzz transaction proof codec
+        run: ./build/utreexo_fuzz_transaction_wire build/tx-corpus -runs=10000 -max_len=131072
+
+  utreexod-transaction-wire:
+    name: Core 31.1 / compact utreexod v0.6 transaction relay
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      UTREEXOD_COMMIT: fe71f3d9282ef0812f7f6087f0c0df9ce0fda508
+      GOTOOLCHAIN: local
+      CORE_VERSION: "31.1"
+      CORE_ARCHIVE_SHA256: b80d9c3e04da78fb6f0569685673418cf686fadba9042d926d13fb87ff503f9e
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.25.13"
+          cache: false
+      - name: Clone pinned utreexod
+        working-directory: ${{ runner.temp }}
+        run: |
+          git clone --filter=blob:none https://github.com/utreexo/utreexod utreexod-tx
+          git -C utreexod-tx checkout --detach "${UTREEXOD_COMMIT}"
+          test "$(git -C utreexod-tx rev-parse HEAD)" = "${UTREEXOD_COMMIT}"
+      - name: Verify fixtures with the pinned Go encoder and decoder
+        working-directory: ${{ runner.temp }}/utreexod-tx
+        run: |
+          go test -mod=readonly ./wire ./chaincfg/chainhash
+          go run -mod=readonly "${GITHUB_WORKSPACE}/test/integration/utreexod_tx_vectors.go" \
+            -check "${GITHUB_WORKSPACE}/test/data/utreexod_tx_vectors.h"
+      - name: Build sidecar
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUTREEXO_WARNINGS_AS_ERRORS=ON
+          cmake --build build --parallel 2
+      - name: Apply and test the compact-node compatibility patch
+        working-directory: ${{ runner.temp }}/utreexod-tx
+        run: |
+          git apply --check --whitespace=error-all "${GITHUB_WORKSPACE}/contrib/utreexod-v0.6.0-core-relay.patch"
+          git apply "${GITHUB_WORKSPACE}/contrib/utreexod-v0.6.0-core-relay.patch"
+          go test -mod=readonly ./netsync ./mining ./mempool ./wire
+          go build -mod=readonly -o "${GITHUB_WORKSPACE}/build/utreexod-relay" .
+      - name: Install verified Bitcoin Core 31.1
+        working-directory: ${{ runner.temp }}
+        run: |
+          archive="bitcoin-${CORE_VERSION}-x86_64-linux-gnu.tar.gz"
+          curl --fail --silent --show-error --location --remote-name \
+            "https://bitcoincore.org/bin/bitcoin-core-${CORE_VERSION}/${archive}"
+          echo "${CORE_ARCHIVE_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xf "${archive}"
+      - name: Verify transaction relay, proof rejection, recovery, and mining
+        run: >-
+          python3 test/integration/core_utreexod_relay.py
+          --core="${RUNNER_TEMP}/bitcoin-${CORE_VERSION}/bin/bitcoind"
+          --sidecar="${GITHUB_WORKSPACE}/build/utreexo-bridge"
+          --utreexod="${GITHUB_WORKSPACE}/build/utreexod-relay"
+          --work-dir="${RUNNER_TEMP}/core-utreexod-relay"
+          --timeout=180
+      - name: Report integration evidence
+        if: always()
+        run: |
+          if test -f "${RUNNER_TEMP}/core-utreexod-relay/result.json"; then
+            cat "${RUNNER_TEMP}/core-utreexod-relay/result.json"
+          else
+            tail -n 100 "${RUNNER_TEMP}/core-utreexod-relay/"*.log || true
+          fi
 
   differential-regtest:
     name: Bitcoin Core / reference bridge / Floresta regtest

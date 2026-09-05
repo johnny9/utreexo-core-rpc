@@ -19,6 +19,7 @@
 #include <vector>
 
 namespace utreexo {
+class TransactionProofCache;
 
 class ProofStore;
 
@@ -129,6 +130,7 @@ struct P2PServerConfig {
     std::string user_agent{"/utreexo-bridge:unknown/"};
     /** Advertise historical proof/state service only after complete genesis coverage. */
     bool advertise_archive{false};
+    bool serve_transactions{false};
     /**
      * Explicit address placed in addr/addrv2 gossip. It is never inferred from the bind
      * address or a peer, and must be globally routable outside regtest.
@@ -174,7 +176,8 @@ class P2PServer
 public:
     static Result<std::unique_ptr<P2PServer>> Start(
         P2PServerConfig config, std::shared_ptr<RecentProofCache> cache,
-        std::shared_ptr<ProofStore> store = {});
+        std::shared_ptr<ProofStore> store = {},
+        std::shared_ptr<TransactionProofCache> transactions = {});
     ~P2PServer();
     P2PServer(const P2PServer&) = delete;
     P2PServer& operator=(const P2PServer&) = delete;

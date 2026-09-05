@@ -1,0 +1,3 @@
+# Unified patches preserve a context prefix before tabs and on blank lines.
+# Check the patched source with git apply --whitespace=error-all instead.
+contrib/*.patch whitespace=-blank-at-eol,-space-before-tab

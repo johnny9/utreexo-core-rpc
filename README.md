@@ -76,9 +76,9 @@ unit starts `/usr/local/bin/utreexo-bridge`. Verify the adjacent basename-only c
 then extract the single top-level archive directory into that prefix:
 
 ```sh
-sha256sum --check utreexo-bridge-0.4.0-Linux-x86_64.tar.gz.sha256
+sha256sum --check utreexo-bridge-0.5.0-beta.1-Linux-x86_64.tar.gz.sha256
 sudo tar --no-same-owner \
-  -xzf utreexo-bridge-0.4.0-Linux-x86_64.tar.gz \
+  -xzf utreexo-bridge-0.5.0-beta.1-Linux-x86_64.tar.gz \
   -C /usr/local --strip-components=1
 ```
 
@@ -532,9 +532,14 @@ After `getblockchaininfo` reports that Floresta is active, call `addnode` for th
 block peer and the sidecar proof peer, then remove the temporary reference peer. See
 `test/integration/floresta_regtest.py` for the current JSON-RPC sequence.
 
-The draft service bit used for Floresta interoperability also describes unconfirmed
-transaction-proof relay, which is not implemented here; this beta serves block proofs
-only. The type-1 `getcfilters` state exchange is a current-Floresta compatibility
+For compact utreexod v0.6, `--core-tx-peer=IPv4:PORT` enables
+[Core-backed transaction proof relay](doc/core-backed-transaction-proof-relay.md)
+with a bounded preparation cache and the exact
+[v0.6 transaction codec](doc/transaction-proof-codec.md). The supplied utreexod
+compatibility patch supports separate Core block/header and sidecar proof peers,
+proof-aware `getblocktemplate`, and standard `submitblock`. The
+[saved implementation plan](doc/core-backed-transaction-proof-relay-plan.md)
+records the scope and validation. The type-1 `getcfilters` state exchange is a current-Floresta compatibility
 protocol rather than BIP157 compact-filter service. Floresta v0.9.1's transport also
 rejects messages over 5,000,000 bytes. Ordinary mainnet proofs fit below that client
 limit, but a deliberately adversarial valid block could require a larger proof; the
@@ -548,7 +553,7 @@ The complete mainnet configuration, client example, and verification checklist a
 [`doc/tor.md`](doc/tor.md).
 
 Keep the listener on loopback while testing; binding `0.0.0.0` is an explicit operator
-choice. BIP 324 transport, transaction relay, standard block service, and proofs at or
+choice. BIP 324 transport, standard block service, and proofs at or
 before an AssumeUtreexo base remain out of scope.
 
 ## Offline arena compaction

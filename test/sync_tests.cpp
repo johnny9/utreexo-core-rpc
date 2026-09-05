@@ -1,6 +1,7 @@
 #include <test_framework.h>
 #include <utreexo/proof_store.h>
 #include <utreexo/sync.h>
+#include <utreexo/transaction_relay.h>
 
 #include <array>
 #include <atomic>
@@ -374,4 +375,124 @@ TEST(sequential_sync_reconciles_online_reorg_from_wal)
         CHECK(sync.ValidateCurrentPoint());
     }
     std::filesystem::remove_all(path, cleanup_error);
+}
+
+namespace {
+class TransactionMetadataTransport final : public RpcTransport
+{
+public:
+    TransactionMetadataTransport(Hash256 tip_hash, txwire::Transaction transaction, std::string encoded)
+        : tip{tip_hash}, tx{std::move(transaction)}, raw{std::move(encoded)} {}
+    Result<std::string> Post(const std::string& body) override
+    {
+        auto request{Json(body)};
+        const auto method{request["method"].get_str()};
+        const auto& params{request["params"]};
+        UniValue result;
+        UniValue error;
+        if (method == "getbestblockhash") {
+            ++tip_checks;
+            result = UniValue{mode == 4 && tip_checks > 1 ? std::string(64, '9') : tip.ToBitcoinHex()};
+        } else if (method == "getmempoolentry") {
+            if (params[0].get_str() != tx.Txid().ToBitcoinHex() && mode == 2) {
+                error = Json("{\"code\":-5,\"message\":\"Transaction not in mempool\"}");
+            } else {
+                result = UniValue{UniValue::VOBJ};
+                result.pushKV("wtxid", mode == 5 ? std::string(64, '8') : tx.Wtxid().ToBitcoinHex());
+            }
+        } else if (method == "gettxout") {
+            CHECK_EQ(params.size(), 3U);
+            CHECK(!params[2].get_bool());
+            ++confirmed_lookups;
+            if (mode == 3) return Result<std::string>::Err("simulated Core disconnect");
+            if (mode != 2) {
+                result = Json("{\"confirmations\":1,\"value\":50.0,\"coinbase\":true,\"scriptPubKey\":{\"hex\":\"51\"}}");
+                result.pushKV("bestblock", mode == 1 ? std::string(64, '9') : tip.ToBitcoinHex());
+            }
+        } else if (method == "getrawmempool") {
+            result = UniValue{UniValue::VARR};
+            if (present) result.push_back(tx.Txid().ToBitcoinHex());
+        } else if (method == "getrawtransaction") {
+            result = UniValue{raw};
+        } else {
+            throw std::runtime_error{"unexpected transaction RPC: " + method};
+        }
+        UniValue envelope{UniValue::VOBJ};
+        envelope.pushKV("result", result);
+        envelope.pushKV("error", error);
+        envelope.pushKV("id", 1);
+        return Result<std::string>::Ok(envelope.write());
+    }
+    Hash256 tip;
+    txwire::Transaction tx;
+    std::string raw;
+    int mode{0};
+    int tip_checks{0};
+    int confirmed_lookups{0};
+    bool present{true};
+};
+
+std::pair<txwire::Transaction, std::string> MetadataTransaction()
+{
+    const std::string hex{"0200000001" + std::string(64, '3') +
+        "0000000000ffffffff0100f2052a01000000015100000000"};
+    std::vector<std::byte> bytes;
+    for (std::size_t i{0}; i < hex.size(); i += 2) bytes.push_back(static_cast<std::byte>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+    return {txwire::Transaction::Parse(bytes).Take(), hex};
+}
+}
+
+TEST(transaction_relay_checks_core_membership_tip_and_confirmed_metadata)
+{
+    FakeBlockSource source;
+    PackedForest forest;
+    SequentialSync sync{source, forest};
+    CHECK(sync.ProcessNext());
+    CHECK(sync.ProcessNext());
+    const auto [tx, raw]{MetadataTransaction()};
+    for (int mode{0}; mode <= 5; ++mode) {
+        auto cache{std::make_shared<TransactionProofCache>(TransactionCacheConfig{})};
+        auto transport{std::make_unique<TransactionMetadataTransport>(source.hashes[1], tx, raw)};
+        auto* observed{transport.get()};
+        observed->mode = mode;
+        TransactionRelay relay{CoreRpcClient{std::move(transport), 0}, forest, sync, cache};
+        auto prepared{relay.Poll({tx})};
+        if (mode == 0) {
+            CHECK(prepared);
+            CHECK(cache->Find(tx.Txid()));
+            CHECK_EQ(observed->confirmed_lookups, 1);
+            CHECK(observed->tip_checks >= 3);
+            const auto entry{cache->Find(tx.Txid())};
+            CHECK_EQ(entry->proof.WireProof().targets, std::vector<uint64_t>{0});
+            CHECK(entry->proof.WireProof().hashes.empty());
+            CHECK(entry->proof.Serialize(entry->proof.FullRequest()));
+            // A fresh bounded Core inventory scan withdraws Core evictions.
+            observed->present = false;
+            TransactionRelay recovery{CoreRpcClient{std::make_unique<TransactionMetadataTransport>(*observed), 0}, forest, sync, cache};
+            CHECK(recovery.Poll());
+            CHECK(!cache->Find(tx.Txid()));
+        } else {
+            CHECK(!cache->Find(tx.Txid()));
+            CHECK_EQ(cache->Stats().bytes, 0U);
+            if (mode == 2) CHECK(prepared); // Missing parent is skipped, never flagged unconfirmed.
+            else { CHECK(!prepared); CHECK(!cache->Stats().ready); }
+        }
+    }
+}
+
+TEST(sync_invalidates_tip_readers_before_accumulator_mutation)
+{
+    FakeBlockSource source;
+    PackedForest forest;
+    SequentialSync sync{source, forest};
+    CHECK(sync.ProcessNext());
+    bool called{false};
+    sync.SetBeforeMutation([&] {
+        CHECK_EQ(forest.NumLeaves(), 0U);
+        CHECK_EQ(sync.CurrentPoint()->height, 0U);
+        called = true;
+    });
+    CHECK(sync.ProcessNext());
+    CHECK(called);
+    CHECK_EQ(forest.NumLeaves(), 1U);
 }

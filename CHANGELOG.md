@@ -4,6 +4,49 @@ All notable changes to the Utreexo bridge sidecar are documented here. The
 project follows Semantic Versioning while the command line, checkpoint, and
 proof-store formats remain explicitly versioned.
 
+## 0.5.0-beta.1 - 2026-09-05
+
+### Added
+
+- Core-backed transaction proof relay for compact utreexod, enabled with
+  `--core-tx-peer`. Bitcoin Core 31.1 supplies validated transaction announcements
+  and RPC metadata; the sidecar prepares and serves proofs from its accumulator.
+- The exact utreexod v0.6.0 transaction wire codec, including legacy and witness
+  transactions, confirmed-input target announcements, compact leaf data, and
+  full, partial, and zero-additional-hash requests.
+- A transaction proof cache bounded by retained bytes, entry count, and lifetime,
+  with Core inventory recovery after missed announcements or restarts.
+- A compatibility patch for utreexod v0.6.0 commit
+  `fe71f3d9282ef0812f7f6087f0c0df9ce0fda508`. It separates Core block/header peers
+  from the sidecar proof peer and supports compact `getblocktemplate` and ordinary
+  `submitblock` using verified mempool proofs. The patch and run guide are included
+  in the release package.
+- Pinned Go codec fixtures, malformed-input and resource-bound tests, transaction
+  codec fuzzing, and a Core/sidecar/compact-utreexod integration job in CI.
+
+### Changed
+
+- Transaction proofs are invalidated before accumulator mutations and withdrawn
+  when Core metadata cannot establish their anchor. Proof peers reconnect after
+  anchor changes to disambiguate v0.6 transaction announcements.
+- Transaction requests share the listener's existing admission, bandwidth, and
+  deadline limits. Raw transaction bytes and identities remain immutable.
+
+### Validation and beta scope
+
+- Regtest integration covers independent rejection of corrupt proofs, legacy and
+  witness transactions, mixed confirmed/unconfirmed inputs, reconnect and restart
+  recovery, mining templates, standard block submission, and matching final roots.
+  C++/Go suites, sanitizers, static analysis, and seeded fuzzing pass locally.
+- Mainnet synchronization requires the shared AssumeUtreexo checkpoint at height
+  943,013. Live mainnet checkpoint catch-up, sustained transaction load, and full
+  Core/sidecar/compact-utreexod reorganization recovery still need validation.
+- Wallets submit ordinary transactions to Core. The sidecar does not implement a
+  mempool, transaction policy, replacement logic, or mining RPCs. TTL proof serving,
+  production genesis synchronization, and compact-wallet proof acquisition are
+  outside this relay implementation.
+- Checkpoint, forest, and proof-store format versions are unchanged.
+
 ## 0.4.0-beta.3 - 2026-09-04
 
 ### Changed
