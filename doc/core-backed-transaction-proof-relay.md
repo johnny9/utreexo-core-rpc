@@ -81,7 +81,35 @@ upstream sync-manager double reply on rejected RPC blocks.
 
 The existing sidecar **block archive** uses native `TreeRows(num_leaves)` target
 positions. The explicit sidecar peer adapter translates those block targets into
-v0.6's fixed 63-row API space. Transaction inventory, requests, and responses use
+v0.6's fixed 63-row API space. `--utreexoproofpeer` is repeatable and marks only
+this encoding difference; it is not a proof-provider allowlist. Each marked
+numeric IPv4 endpoint must also appear in `--connect` or `--addpeer`.
+
+Standard v0.6 proof providers need only a normal peer connection. The patched
+consumer selects multiple providers by their advertised services:
+
+| Services | Proof availability |
+| --- | --- |
+| `NODE_UTREEXO` | New blocks |
+| `NODE_UTREEXO \| NODE_NETWORK` | All historical blocks |
+| `NODE_UTREEXO \| NODE_NETWORK_LIMITED` | Latest 288 blocks |
+| `NODE_UTREEXO_ARCHIVE` | All historical blocks, without requiring block service |
+
+Blocks and headers come from peers offering `NODE_NETWORK` or
+`NODE_NETWORK_LIMITED`. Proof-only peers need neither block-service bits nor
+`NODE_WITNESS`. Requests are balanced across eligible connected providers in a
+bounded window of 32 block/proof pairs. Disconnects, invalid proofs, and
+15-second proof timeouts retry another provider while retaining downloaded
+blocks. Historical catch-up waits for a provider covering the requested heights;
+`NODE_UTREEXO` alone does not promise historical proofs. The upstream committed-TTL
+synchronization path is unchanged.
+
+These consumer changes are newer than the patch shipped in v0.5.0-beta.1. Use
+the patch on master or the
+[patched utreexod branch](https://github.com/johnny9/utreexod/tree/core-sidecar-relay-v0.6.0).
+The existing beta.1 sidecar binary remains compatible.
+
+Transaction inventory, requests, and responses use
 the exact v0.6 format directly; see the [codec guide](transaction-proof-codec.md).
 TTL serving, production genesis synchronization, and compact-wallet
 `sendrawtransaction` proof acquisition remain outside this implementation.
@@ -106,3 +134,22 @@ incomplete submission, standard `submitblock`, and block relay in both direction
 Final accumulator roots and leaf counts must match. Logs, the template, and
 `result.json` remain in the test directory. CI runs the same pinned integration;
 live mainnet synchronization is not claimed by the regtest results.
+
+Run the multiple-provider integration with the same binaries and a fresh directory:
+
+```sh
+python3 test/integration/core_utreexod_proof_peers.py \
+  --core=/path/to/bitcoin-31.1/bin/bitcoind \
+  --sidecar=build/utreexo-bridge \
+  --utreexod=/path/to/utreexod-relay \
+  --work-dir=/path/to/fresh-proof-peer-test-directory --timeout=180
+```
+
+It runs the sidecar alongside a standard v0.6 utreexod proof generator. Loopback
+proxies advertise archive-only and `NODE_UTREEXO`-only services and inject a
+timeout, invalid proof, and disconnect. The test requires recovery through the
+other provider, no block requests to proof-only peers, transaction proof relay,
+standard pool submission, and matching accumulator roots. Only the separate
+proof generator enables a proof index; the consumer remains compact. CI runs
+both integrations. Full mainnet catch-up, sustained mainnet load, and a combined
+reorg integration remain unvalidated.

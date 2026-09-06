@@ -155,3 +155,34 @@ quota is small. LeakSanitizer runs outside the tracing sandbox. Validation is
 regtest-based; no live mainnet synchronization is claimed. TTL proof serving,
 production genesis synchronization, compact-wallet proof acquisition, sidecar
 mempool policy, and sidecar mining RPCs remain outside scope.
+
+## Capability-based proof peers — 2026-09-06
+
+The consumer patch now schedules proofs across connected peers advertising
+`NODE_UTREEXO` or `NODE_UTREEXO_ARCHIVE`, respecting the advertised historical
+range. Block/header sources are selected separately. A 32-pair work window
+survives proof-source disconnects, invalid proofs, and 15-second timeouts;
+authenticated block bytes remain available for retries. Block-source stall
+handling distinguishes missing proofs from missing blocks. The block-proof wire
+decoder rejects excessive counts before allocating.
+
+The repeatable `utreexoproofpeer` option marks only legacy native-position
+sidecars. Standard v0.6 peers require no special endpoint configuration. Witness
+transaction requests preserve the witness inventory bit.
+
+Validation:
+
+- `go test -race ./netsync ./mining ./mempool ./wire` and `go vet` for these
+  packages and the daemon pass.
+- Existing full relay/mining integration passes against the updated consumer:
+  `build/relay-integration/multiple-proof-final/result.json`.
+- New real Core/sidecar/standard-utreexod integration passes:
+  `build/relay-integration/proof-peers-v3/result.json`. It covers archive-only
+  service without witness or block bits, bare `NODE_UTREEXO` with transaction
+  relay, timeout/invalid-proof/disconnect failover, no block requests to proof-only
+  peers, standard `submitblock`, and matching roots.
+- The updated bundled patch applies cleanly to the pinned upstream commit with
+  `git apply --check --whitespace=error-all`. CI runs both integrations.
+
+The beta.1 tag is unchanged; the consumer update is on the fork branch and
+sidecar master. Mainnet catch-up and combined reorg integration remain unvalidated.

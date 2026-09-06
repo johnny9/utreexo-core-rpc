@@ -4,6 +4,18 @@ All notable changes to the Utreexo bridge sidecar are documented here. The
 project follows Semantic Versioning while the command line, checkpoint, and
 proof-store formats remain explicitly versioned.
 
+## Unreleased
+
+- The utreexod v0.6 compatibility patch selects multiple proof providers by
+  `NODE_UTREEXO` / `NODE_UTREEXO_ARCHIVE` services and historical availability,
+  independently of block peers. Timeouts, invalid proofs, and disconnects retry
+  another provider while retaining downloaded blocks.
+- `--utreexoproofpeer` is now a repeatable marker for the sidecar's native block
+  target encoding. Standard v0.6 proof peers need only a normal connection.
+- Bound block-proof decoder allocations, preserve witness transaction requests,
+  and add real Core/sidecar/standard-utreexod tests for proof-only providers and
+  failover. These consumer changes remain compatible with the beta.1 sidecar.
+
 ## 0.5.0-beta.1 - 2026-09-05
 
 ### Added
