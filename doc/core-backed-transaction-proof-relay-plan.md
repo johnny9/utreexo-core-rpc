@@ -186,3 +186,20 @@ Validation:
 
 The beta.1 tag is unchanged; the consumer update is on the fork branch and
 sidecar master. Mainnet catch-up and combined reorg integration remain unvalidated.
+
+## Provider-neutral consumer — 2026-09-06
+
+Remove the endpoint-specific flag, native-position adapter, and deployment-specific
+documentation from utreexod. Keep its capability-based peer scheduler and generic
+compact mining guide. The sidecar translates native block targets to fixed 63-row
+network positions using each proof's pre-block leaf count. Cache entries retain
+that count; archive reads recover it from authenticated previous-block state.
+Stored proof bytes and archive versions are unchanged. Both binaries must be
+updated together.
+
+Validation: all six CTest suites and the four Go race-tested packages pass.
+Regtest with Core 31.1, the updated sidecar, and the consumer without special
+flags passes at `build/relay-integration/generic-proof-regtest/result.json`,
+including Core block downloads, sidecar proof validation, transaction relay,
+standard submission, restart recovery, and matching roots. Additional tests
+exercise fixed-row internal targets from both RAM cache and the proof archive.

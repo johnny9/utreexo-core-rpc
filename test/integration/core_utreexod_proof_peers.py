@@ -2,7 +2,7 @@
 """Exercise independent proof providers with Core, a real sidecar, and utreexod.
 
 The consumer has no proof index. A second utreexod generates standard v0.6
-proofs, so only the actual sidecar needs the native-target compatibility option.
+proofs, and every provider uses the same wire format without endpoint-specific options.
 Loopback proxies inject transport faults and advertise proof-only services.
 """
 from __future__ import annotations
@@ -161,7 +161,7 @@ def run(args):
         processes.append(a)
         node = launch("consumer", common + [f"--datadir={work / 'consumer'}",
             f"--logdir={work / 'consumer-logs'}", f"--rpclisten=127.0.0.1:{ur}",
-            f"--connect=127.0.0.1:{ap}", f"--utreexoproofpeer=127.0.0.1:{ap}",
+            f"--connect=127.0.0.1:{ap}",
             f"--connect=127.0.0.1:{bp}"])
         wait("First provider has outstanding requests", lambda: a.snapshot()["requests"])
         first_hash = a.snapshot()["requests"][0]
@@ -206,8 +206,7 @@ def run(args):
         stop(a)
         stop(sidecar)
         stop(b)
-        # Now the only proof provider advertises NODE_UTREEXO alone. No explicit
-        # proof-peer option names it, and the real prover uses v0.6 positions.
+        # Now the only proof provider advertises NODE_UTREEXO alone. It uses the same v0.6 positions and normal peer configuration as the sidecar.
         b = ProofPeerProxy(bp, pp, services=(1 << 12) | 8)
         processes.append(b)
         def live_peer():

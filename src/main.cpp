@@ -3128,7 +3128,8 @@ int BridgeMain(int argc, char** argv)
                             return 1;
                         }
                         auto published{proof_cache->Publish(block.Value().delta,
-                                                           std::move(*block.Value().proof))};
+                                                           std::move(*block.Value().proof),
+                                                           forest.NumLeaves() - block.Value().delta.additions.size())};
                         if (!published) {
                             sync.StopPrefetch();
                             if (IsAllocationFailure(published.Error())) {

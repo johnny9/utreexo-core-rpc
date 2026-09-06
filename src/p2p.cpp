@@ -799,11 +799,13 @@ struct UtreexoProofLayout {
     bool all_hashes{false};
     bool targets_requested{false};
     bool all_leaves{false};
+    bool wire_format{false};
+    std::vector<uint64_t> wire_targets;
 };
 
 Result<UtreexoProofLayout> MeasureUtreexoProof(
     const CachedBlockProof& proof, const GetUtreexoProofRequest& request,
-    uint64_t max_payload_bytes)
+    uint64_t max_payload_bytes, std::optional<uint64_t> wire_num_leaves = std::nullopt)
 {
     if (proof.point.block_hash != request.block_hash) {
         return Result<UtreexoProofLayout>::Err(
@@ -816,6 +818,27 @@ Result<UtreexoProofLayout> MeasureUtreexoProof(
     }
 
     UtreexoProofLayout layout;
+    if (wire_num_leaves) {
+        if (*wire_num_leaves > (uint64_t{1} << 63)) {
+            return Result<UtreexoProofLayout>::Err("unsupported forest leaf count");
+        }
+        layout.wire_format = true;
+        const auto rows{*wire_num_leaves == 0 ? 0U :
+            static_cast<unsigned int>(std::bit_width(*wire_num_leaves - 1))};
+        const uint64_t mask{rows == 63 ? UINT64_MAX : (uint64_t{1} << (rows + 1)) - 1};
+        layout.wire_targets.reserve(proof.proof.targets.size());
+        for (const uint64_t target : proof.proof.targets) {
+            if (target >= mask) {
+                return Result<UtreexoProofLayout>::Err("block target outside forest position space");
+            }
+            const auto row{static_cast<unsigned int>(std::countl_one(target << (63 - rows)))};
+            const uint64_t offset{target - (mask ^ (mask >> row))};
+            if (offset >= (*wire_num_leaves >> row)) {
+                return Result<UtreexoProofLayout>::Err("block target outside populated forest");
+            }
+            layout.wire_targets.push_back((UINT64_MAX ^ (UINT64_MAX >> row)) + offset);
+        }
+    }
     layout.all_hashes = (request.request_bitmap & (1U << 1)) != 0;
     for (std::size_t i{0}; i < proof.proof.hashes.size(); ++i) {
         if (layout.all_hashes || BitmapBit(request.proof_indexes, i)) {
@@ -853,7 +876,7 @@ Result<UtreexoProofLayout> MeasureUtreexoProof(
         return fail_oversized();
     }
     if (layout.targets_requested) {
-        for (const uint64_t target : proof.proof.targets) {
+        for (const uint64_t target : layout.wire_format ? layout.wire_targets : proof.proof.targets) {
             if (!add_bytes(CompactSizeBytes(target))) return fail_oversized();
         }
     }
@@ -906,7 +929,9 @@ Result<std::vector<std::byte>> SerializeUtreexoProofWithLayout(
     }
     AppendCompactSize(output, layout.target_count);
     if (layout.targets_requested) {
-        for (const uint64_t target : proof.proof.targets) AppendCompactSize(output, target);
+        for (const uint64_t target : layout.wire_format ? layout.wire_targets : proof.proof.targets) {
+            AppendCompactSize(output, target);
+        }
     }
     AppendCompactSize(output, layout.leaf_count);
     for (std::size_t index{0}; index < proof.leaves.size(); ++index) {
@@ -928,6 +953,15 @@ Result<std::vector<std::byte>> SerializeUtreexoProofWithLayout(
 }
 
 } // namespace
+
+Result<std::vector<std::byte>> SerializeUtreexoProofWire(
+    const CachedBlockProof& proof, const GetUtreexoProofRequest& request,
+    uint64_t num_leaves_before, uint64_t max_payload_bytes)
+{
+    auto layout{MeasureUtreexoProof(proof, request, max_payload_bytes, num_leaves_before)};
+    if (!layout) return Result<std::vector<std::byte>>::Err(layout.Error());
+    return SerializeUtreexoProofWithLayout(proof, request, layout.Value());
+}
 
 Result<std::vector<std::byte>> SerializeUtreexoProof(
     const CachedBlockProof& proof, const GetUtreexoProofRequest& request,
@@ -1047,7 +1081,7 @@ RecentProofCache::RecentProofCache(uint32_t max_blocks, uint64_t max_bytes)
 
 RecentProofCache::~RecentProofCache() = default;
 
-Result<void> RecentProofCache::Publish(const BlockDelta& delta, Proof proof)
+Result<void> RecentProofCache::Publish(const BlockDelta& delta, Proof proof, uint64_t num_leaves_before)
 {
     try {
         if (proof.targets.size() != delta.deletions.size() ||
@@ -1071,6 +1105,7 @@ Result<void> RecentProofCache::Publish(const BlockDelta& delta, Proof proof)
             .point = delta.point,
             .proof = std::move(proof),
             .leaves = delta.proof_leaves,
+            .num_leaves_before = num_leaves_before,
         })};
         {
             std::lock_guard lock{m_impl->mutex};
@@ -2175,8 +2210,13 @@ public:
             }
             // Measure without allocating the response, then reserve its exact wire size.
             // The work guard remains held through serialization and the bounded write.
+            if (!proof->num_leaves_before && !proof->proof.targets.empty()) {
+                disconnect_reason = "pre-block accumulator state unavailable for proof encoding";
+                break;
+            }
             auto layout{MeasureUtreexoProof(*proof, request.Value(),
-                                            config.max_payload_bytes)};
+                                            config.max_payload_bytes,
+                                            proof->num_leaves_before.value_or(0))};
             if (!layout) {
                 disconnect_reason = layout.Error();
                 break;

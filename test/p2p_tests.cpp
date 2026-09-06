@@ -382,6 +382,35 @@ TEST(full_uproof_archive_roundtrip_is_strict)
     CHECK(!ParseFullUtreexoProof(proof.point.height, trailing));
 }
 
+TEST(uproof_network_targets_use_fixed_rows_without_mutating_archive)
+{
+    auto proof{ExampleProof()};
+    proof.proof.targets = {1, 8};
+    const auto request{EntireRequest(proof.point.block_hash)};
+    auto archive{SerializeUtreexoProof(proof, request)};
+    auto wire{SerializeUtreexoProofWire(proof, request, 8)};
+    CHECK(archive);
+    CHECK(wire);
+    auto parsed{ParseFullUtreexoProof(proof.point.height, wire.Value())};
+    CHECK(parsed);
+    CHECK_EQ(parsed.Value().proof.targets, (std::vector<uint64_t>{1, uint64_t{1} << 63}));
+    CHECK_EQ(parsed.Value().proof.hashes, proof.proof.hashes);
+    CHECK_EQ(proof.proof.targets, (std::vector<uint64_t>{1, 8}));
+    CHECK_EQ(SerializeUtreexoProof(proof, request).Value(), archive.Value());
+    CHECK(SerializeUtreexoProofWire(proof, request, 8, wire.Value().size()));
+    CHECK(!SerializeUtreexoProofWire(proof, request, 8, wire.Value().size() - 1));
+    proof.proof.targets = {1, 15};
+    CHECK(!SerializeUtreexoProofWire(proof, request, 8));
+    proof.proof.targets = {1, 6};
+    CHECK(!SerializeUtreexoProofWire(proof, request, 5));
+    proof.proof.targets = {1, (uint64_t{1} << 63) + 7};
+    wire = SerializeUtreexoProofWire(proof, request, uint64_t{1} << 63);
+    CHECK(wire);
+    CHECK_EQ(ParseFullUtreexoProof(proof.point.height, wire.Value()).Value().proof.targets,
+             proof.proof.targets);
+    CHECK(!SerializeUtreexoProofWire(proof, request, (uint64_t{1} << 63) + 1));
+}
+
 TEST(recent_proof_cache_bounds_memory_and_discards_reorgs)
 {
     RecentProofCache cache{2, 1024 * 1024};
@@ -392,7 +421,7 @@ TEST(recent_proof_cache_bounds_memory_and_discards_reorgs)
                          .additions = {},
                          .deletions = {Hash256{}, Hash256{}},
                          .proof_leaves = proof.leaves};
-        CHECK(cache.Publish(delta, proof.proof));
+        CHECK(cache.Publish(delta, proof.proof, 1024));
     }
     CHECK_EQ(cache.Stats().entries, 2U);
     CHECK(!cache.Find(ExampleProof(1, 1).point.block_hash));
@@ -417,7 +446,7 @@ TEST(recent_proof_cache_bounds_memory_and_discards_reorgs)
                                        std::chrono::seconds(1));
     }};
     while (!waiter_started.load()) std::this_thread::yield();
-    CHECK(waiting_cache.Publish(awaited_delta, awaited_proof.proof));
+    CHECK(waiting_cache.Publish(awaited_delta, awaited_proof.proof, 1024));
     waiter.join();
     CHECK(waited);
     CHECK_EQ(waited->point, awaited_proof.point);
@@ -432,7 +461,7 @@ TEST(recent_proof_cache_skips_one_oversized_proof_without_stopping)
                      .additions = {},
                      .deletions = {Hash256{}, Hash256{}},
                      .proof_leaves = proof.leaves};
-    CHECK(cache.Publish(delta, std::move(proof.proof)));
+    CHECK(cache.Publish(delta, std::move(proof.proof), 1024));
     const auto stats{cache.Stats()};
     CHECK_EQ(stats.entries, 0U);
     CHECK_EQ(stats.bytes, 0U);
@@ -445,6 +474,7 @@ TEST(p2p_server_handshakes_and_serves_floresta_proof_request)
 {
     auto cache{std::make_shared<RecentProofCache>(8, 1024 * 1024)};
     auto proof{ExampleProof()};
+    proof.proof.targets = {1, 1024};
     BlockDelta delta{.point = proof.point,
                      .previous_block_hash = {},
                      .additions = {},
@@ -522,10 +552,10 @@ TEST(p2p_server_handshakes_and_serves_floresta_proof_request)
     auto request{EncodeP2PMessage(BitcoinNetwork::REGTEST, "getuproof", request_payload)};
     CHECK(request);
     SendBytes(socket, request.Value(), 1);
-    CHECK(cache->Publish(delta, proof.proof));
+    CHECK(cache->Publish(delta, proof.proof, 1024));
     auto response{ReadWireMessage(socket, BitcoinNetwork::REGTEST)};
     CHECK_EQ(response.command, "uproof");
-    auto expected{SerializeUtreexoProof(proof, EntireRequest(proof.point.block_hash))};
+    auto expected{SerializeUtreexoProofWire(proof, EntireRequest(proof.point.block_hash), 1024)};
     CHECK(expected);
     CHECK_EQ(response.payload, expected.Value());
     CHECK_EQ(cache->Stats().hits, 1U);
@@ -814,6 +844,7 @@ TEST(p2p_server_serves_archived_proof_when_ram_cache_is_empty)
     std::error_code cleanup_error;
     std::filesystem::remove_all(path, cleanup_error);
     auto proof{ExampleProof(0x61, 42)};
+    proof.proof.targets = {1, 1024};
     const ChainPoint base{41, Hash256::FromHex(
         "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20").Value()};
     BlockDelta delta{
@@ -828,7 +859,7 @@ TEST(p2p_server_serves_archived_proof_when_ram_cache_is_empty)
         .create_base = base,
         .create_base_state = AccumulatorState{
             .point = base,
-            .num_leaves = 1,
+            .num_leaves = 1024,
             .roots = {RepeatedHash(0x51)},
         },
         .serializer_threads = 2,
@@ -895,7 +926,7 @@ TEST(p2p_server_serves_archived_proof_when_ram_cache_is_empty)
     SendBytes(socket, request.Value());
     auto response{ReadWireMessage(socket, BitcoinNetwork::REGTEST)};
     CHECK_EQ(response.command, "uproof");
-    auto expected{SerializeUtreexoProof(proof, EntireRequest(proof.point.block_hash))};
+    auto expected{SerializeUtreexoProofWire(proof, EntireRequest(proof.point.block_hash), 1024)};
     CHECK(expected);
     CHECK_EQ(response.payload, expected.Value());
     CHECK_EQ(store->Stats().hits, 1U);
@@ -1147,7 +1178,7 @@ TEST(p2p_server_waits_for_proof_without_holding_work_or_egress_admission)
         .deletions = {Hash256{}, Hash256{}},
         .proof_leaves = available_proof.leaves,
     };
-    CHECK(cache->Publish(available_delta, available_proof.proof));
+    CHECK(cache->Publish(available_delta, available_proof.proof, 1024));
     auto started{P2PServer::Start(P2PServerConfig{
         .network = BitcoinNetwork::REGTEST,
         .bind_address = "127.0.0.1",
@@ -1201,7 +1232,7 @@ TEST(p2p_server_waits_for_proof_without_holding_work_or_egress_admission)
         .deletions = {Hash256{}, Hash256{}},
         .proof_leaves = waiting_proof.leaves,
     };
-    CHECK(cache->Publish(waiting_delta, waiting_proof.proof));
+    CHECK(cache->Publish(waiting_delta, waiting_proof.proof, 1024));
     CHECK_EQ(ReadWireMessage(first, BitcoinNetwork::REGTEST).command, "uproof");
     CHECK(WaitUntil([&] { return server->Stats().active_proof_requests == 0; }));
     const auto stats{server->Stats()};
@@ -1229,7 +1260,7 @@ TEST(p2p_server_releases_proof_work_when_a_peer_dribbles_response_reads)
         .deletions = {Hash256{}, Hash256{}},
         .proof_leaves = proof.leaves,
     };
-    CHECK(cache->Publish(delta, proof.proof));
+    CHECK(cache->Publish(delta, proof.proof, 1024));
     auto started{P2PServer::Start(P2PServerConfig{
         .network = BitcoinNetwork::REGTEST,
         .bind_address = "127.0.0.1",
@@ -1343,7 +1374,7 @@ TEST(p2p_server_reserves_exact_proof_wire_bytes_before_allocation)
         .deletions = {Hash256{}, Hash256{}},
         .proof_leaves = proof.leaves,
     };
-    CHECK(cache->Publish(delta, proof.proof));
+    CHECK(cache->Publish(delta, proof.proof, 1024));
     auto expected{SerializeUtreexoProof(proof, EntireRequest(proof.point.block_hash))};
     CHECK(expected);
     CHECK(2 * (expected.Value().size() + 24) < 4'120U);
@@ -1399,7 +1430,7 @@ TEST(p2p_server_bounds_global_proof_egress_and_disconnects_misses)
         .deletions = {Hash256{}, Hash256{}},
         .proof_leaves = proof.leaves,
     };
-    CHECK(cache->Publish(delta, proof.proof));
+    CHECK(cache->Publish(delta, proof.proof, 1024));
     auto started{P2PServer::Start(P2PServerConfig{
         .network = BitcoinNetwork::REGTEST,
         .bind_address = "127.0.0.1",

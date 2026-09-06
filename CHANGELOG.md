@@ -10,11 +10,13 @@ proof-store formats remain explicitly versioned.
   `NODE_UTREEXO` / `NODE_UTREEXO_ARCHIVE` services and historical availability,
   independently of block peers. Timeouts, invalid proofs, and disconnects retry
   another provider while retaining downloaded blocks.
-- `--utreexoproofpeer` is now a repeatable marker for the sidecar's native block
-  target encoding. Standard v0.6 proof peers need only a normal connection.
+- Remove the provider-specific option and adapter from utreexod. The sidecar now
+  sends fixed 63-row block targets using pre-block state, preserving the native
+  proof archive format. Upgrade both binaries together; beta.1 sidecar binaries
+  still use the previous network target encoding.
 - Bound block-proof decoder allocations, preserve witness transaction requests,
   and add real Core/sidecar/standard-utreexod tests for proof-only providers and
-  failover. These consumer changes remain compatible with the beta.1 sidecar.
+  failover. Consumer documentation now describes generic proof peers.
 
 ## 0.5.0-beta.1 - 2026-09-05
 

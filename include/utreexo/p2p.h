@@ -54,6 +54,8 @@ struct CachedBlockProof {
     ChainPoint point;
     Proof proof;
     std::vector<CompactLeafData> leaves;
+    /** Native archive targets are translated using the pre-block forest size. */
+    std::optional<uint64_t> num_leaves_before{std::nullopt};
 };
 
 /** Encode/decode the checksummed Bitcoin v1 transport envelope. */
@@ -72,6 +74,10 @@ Result<std::vector<std::byte>> SerializeUtreexoProof(
 Result<std::vector<std::byte>> SerializeUtreexoProof(
     const CachedBlockProof& proof, const GetUtreexoProofRequest& request,
     uint64_t max_payload_bytes);
+/** Network encoding uses fixed 63-row positions; the archive remains native. */
+Result<std::vector<std::byte>> SerializeUtreexoProofWire(
+    const CachedBlockProof& proof, const GetUtreexoProofRequest& request,
+    uint64_t num_leaves_before, uint64_t max_payload_bytes = 32U * 1024U * 1024U);
 /** Decode the full (bitmap 0x07) uproof representation used by the proof archive. */
 Result<CachedBlockProof> ParseFullUtreexoProof(uint32_t height,
                                               std::span<const std::byte> payload);
@@ -94,7 +100,7 @@ public:
     RecentProofCache(const RecentProofCache&) = delete;
     RecentProofCache& operator=(const RecentProofCache&) = delete;
 
-    Result<void> Publish(const BlockDelta& delta, Proof proof);
+    Result<void> Publish(const BlockDelta& delta, Proof proof, uint64_t num_leaves_before);
     std::shared_ptr<const CachedBlockProof> Find(const Hash256& block_hash) const;
     std::shared_ptr<const CachedBlockProof> WaitFor(
         const Hash256& block_hash, std::chrono::milliseconds timeout,

@@ -270,7 +270,7 @@ def run(args: argparse.Namespace) -> None:
             f"--configfile={work / 'utreexod.conf'}",
             "--notls", "--nodnsseed", f"--rpcuser={auth[0]}", f"--rpcpass={auth[1]}",
             f"--rpclisten=127.0.0.1:{ur}", f"--connect=127.0.0.1:{cp}",
-            f"--connect=127.0.0.1:{pp}", f"--utreexoproofpeer=127.0.0.1:{pp}",
+            f"--connect=127.0.0.1:{pp}",
             "--debuglevel=debug"]
         validator = ManagedProcess("utreexod", utree_command, work)
         processes.append(validator)

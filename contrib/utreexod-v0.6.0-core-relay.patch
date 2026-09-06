@@ -1,64 +1,3 @@
-diff --git a/config.go b/config.go
-index 86f830a..1585b04 100644
---- a/config.go
-+++ b/config.go
-@@ -99,17 +99,18 @@ func minUint32(a, b uint32) uint32 {
- // See loadConfig for details on the configuration load process.
- type config struct {
- 	// General application behavior.
--	ShowVersion         bool   `short:"V" long:"version" description:"Display version information and exit"`
--	DataDir             string `short:"b" long:"datadir" description:"Directory to store data"`
--	LogDir              string `long:"logdir" description:"Directory to log output."`
--	ConfigFile          string `short:"C" long:"configfile" description:"Path to configuration file"`
--	DebugLevel          string `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
--	DbType              string `long:"dbtype" description:"Database backend to use for the Block Chain"`
--	SigCacheMaxSize     uint   `long:"sigcachemaxsize" description:"The maximum number of entries in the signature verification cache"`
--	UtxoCacheMaxSizeMiB uint   `long:"utxocachemaxsize" description:"The maximum size in MiB of the UTXO cache"`
--	NoUtreexo           bool   `long:"noutreexo" description:"Disable utreexo compact state during block validation"`
--	NoWinService        bool   `long:"nowinservice" description:"Do not start as a background service on Windows -- NOTE: This flag only works on the command line, not in the config file"`
--	Prune               uint64 `long:"prune" description:"Prune already validated blocks from the database. Must specify a target size in MiB (minimum value of 550, default of 550. Set to 0 to disable pruning.)"`
-+	ShowVersion         bool     `short:"V" long:"version" description:"Display version information and exit"`
-+	DataDir             string   `short:"b" long:"datadir" description:"Directory to store data"`
-+	LogDir              string   `long:"logdir" description:"Directory to log output."`
-+	ConfigFile          string   `short:"C" long:"configfile" description:"Path to configuration file"`
-+	DebugLevel          string   `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
-+	DbType              string   `long:"dbtype" description:"Database backend to use for the Block Chain"`
-+	SigCacheMaxSize     uint     `long:"sigcachemaxsize" description:"The maximum number of entries in the signature verification cache"`
-+	UtxoCacheMaxSizeMiB uint     `long:"utxocachemaxsize" description:"The maximum size in MiB of the UTXO cache"`
-+	UtreexoProofPeers   []string `long:"utreexoproofpeer" description:"Sidecar endpoint using native block-target positions (repeatable; also add with --connect or --addpeer). Proof providers are selected by advertised services."`
-+	NoUtreexo           bool     `long:"noutreexo" description:"Disable utreexo compact state during block validation"`
-+	NoWinService        bool     `long:"nowinservice" description:"Do not start as a background service on Windows -- NOTE: This flag only works on the command line, not in the config file"`
-+	Prune               uint64   `long:"prune" description:"Prune already validated blocks from the database. Must specify a target size in MiB (minimum value of 550, default of 550. Set to 0 to disable pruning.)"`
- 
- 	// Profiling options.
- 	Profile       string `long:"profile" description:"Enable HTTP profiling on given port -- NOTE port must be between 1024 and 65536"`
-@@ -1212,6 +1213,26 @@ func loadConfig() (*config, []string, error) {
- 		}
- 	}
- 
-+	for _, proofPeer := range cfg.UtreexoProofPeers {
-+		host, port, err := net.SplitHostPort(proofPeer)
-+		number, portErr := strconv.Atoi(port)
-+		if err != nil || net.ParseIP(host).To4() == nil || portErr != nil || number < 1 || number > 65535 {
-+			return nil, nil, fmt.Errorf("--utreexoproofpeer requires a numeric IPv4:port endpoint")
-+		}
-+		if cfg.NoUtreexo {
-+			return nil, nil, fmt.Errorf("--utreexoproofpeer requires compact validation without proof indexes")
-+		}
-+		connected := false
-+		for _, endpoint := range append(append([]string{}, cfg.ConnectPeers...), cfg.AddPeers...) {
-+			if endpoint == proofPeer {
-+				connected = true
-+			}
-+		}
-+		if !connected {
-+			return nil, nil, fmt.Errorf("also configure --utreexoproofpeer with --connect or --addpeer")
-+		}
-+	}
-+
- 	if cfg.WatchOnlyWallet && cfg.NoUtreexo {
- 		err := fmt.Errorf("%s: the --watchonlywallet requires the --noutreexo option off", funcName)
- 		fmt.Fprintln(os.Stderr, err)
 diff --git a/mining/mining.go b/mining/mining.go
 index 08241ad..861dd29 100644
 --- a/mining/mining.go
@@ -93,28 +32,8 @@ index 08241ad..861dd29 100644
  		if err != nil {
  			log.Warnf("Unable to fetch utxo view for tx %s: %v",
  				tx.Hash(), err)
-diff --git a/netsync/interface.go b/netsync/interface.go
-index b1fe59a..62cec07 100644
---- a/netsync/interface.go
-+++ b/netsync/interface.go
-@@ -29,10 +29,11 @@ type PeerNotifier interface {
- 
- // Config is a configuration struct used to initialize a new SyncManager.
- type Config struct {
--	PeerNotifier PeerNotifier
--	Chain        *blockchain.BlockChain
--	TxMemPool    *mempool.TxPool
--	ChainParams  *chaincfg.Params
-+	SidecarProofPeers []string
-+	PeerNotifier      PeerNotifier
-+	Chain             *blockchain.BlockChain
-+	TxMemPool         *mempool.TxPool
-+	ChainParams       *chaincfg.Params
- 
- 	DisableCheckpoints bool
- 	MaxPeers           int
 diff --git a/netsync/manager.go b/netsync/manager.go
-index ef49245..81132ab 100644
+index ef49245..048b193 100644
 --- a/netsync/manager.go
 +++ b/netsync/manager.go
 @@ -179,6 +179,9 @@ type peerSyncState struct {
@@ -127,37 +46,16 @@ index ef49245..81132ab 100644
  	requestedUtreexoTTLs      map[wire.MsgGetUtreexoTTLs]struct{}
  }
  
-@@ -207,16 +210,19 @@ func limitAdd(m map[chainhash.Hash]struct{}, hash chainhash.Hash, limit int) {
+@@ -207,6 +210,8 @@ func limitAdd(m map[chainhash.Hash]struct{}, hash chainhash.Hash, limit int) {
  // chain is in sync, the SyncManager handles incoming block and header
  // notifications and relays announcements of new blocks to peers.
  type SyncManager struct {
--	peerNotifier   PeerNotifier
--	started        int32
--	shutdown       int32
--	chain          *blockchain.BlockChain
--	txMemPool      *mempool.TxPool
--	chainParams    *chaincfg.Params
--	progressLogger *blockProgressLogger
--	msgChan        chan interface{}
--	wg             sync.WaitGroup
--	quit           chan struct{}
-+	sidecarProofPeers map[string]struct{}
-+	proofRequests     map[chainhash.Hash]*blockProofRequest
-+	proofSequence     uint64
-+	peerNotifier      PeerNotifier
-+	started           int32
-+	shutdown          int32
-+	chain             *blockchain.BlockChain
-+	txMemPool         *mempool.TxPool
-+	chainParams       *chaincfg.Params
-+	progressLogger    *blockProgressLogger
-+	msgChan           chan interface{}
-+	wg                sync.WaitGroup
-+	quit              chan struct{}
- 
- 	// These fields should only be accessed from the blockHandler thread
- 	rejectedTxns     map[chainhash.Hash]struct{}
-@@ -287,10 +293,7 @@ func (sm *SyncManager) startSync() {
++	proofRequests  map[chainhash.Hash]*blockProofRequest
++	proofSequence  uint64
+ 	peerNotifier   PeerNotifier
+ 	started        int32
+ 	shutdown       int32
+@@ -287,10 +292,7 @@ func (sm *SyncManager) startSync() {
  		return
  	}
  
@@ -169,7 +67,7 @@ index ef49245..81132ab 100644
  	best := sm.chain.BestSnapshot()
  	_, bestHeaderHeight := sm.chain.BestHeader()
  	var higherPeers, equalPeers, higherHeaderPeers []*peerpkg.Peer
-@@ -304,11 +307,6 @@ func (sm *SyncManager) startSync() {
+@@ -304,11 +306,6 @@ func (sm *SyncManager) startSync() {
  			continue
  		}
  
@@ -181,7 +79,7 @@ index ef49245..81132ab 100644
  		// Figure out what the peer is based on the best block.
  		switch {
  		// Remove sync candidate peers that are no longer candidates due
-@@ -424,9 +422,11 @@ func (sm *SyncManager) startSync() {
+@@ -424,9 +421,11 @@ func (sm *SyncManager) startSync() {
  // isSyncCandidate returns whether or not the peer is a candidate to consider
  // syncing from.
  func (sm *SyncManager) isSyncCandidate(peer *peerpkg.Peer) bool {
@@ -196,7 +94,7 @@ index ef49245..81132ab 100644
  	if sm.chainParams == &chaincfg.RegressionNetParams {
  		// The peer is not a candidate if it's not coming from localhost
  		// or the hostname can't be determined for some reason.
-@@ -457,14 +457,6 @@ func (sm *SyncManager) isSyncCandidate(peer *peerpkg.Peer) bool {
+@@ -457,14 +456,6 @@ func (sm *SyncManager) isSyncCandidate(peer *peerpkg.Peer) bool {
  		return false
  	}
  
@@ -211,7 +109,7 @@ index ef49245..81132ab 100644
  	var (
  		nodeServices = peer.Services()
  		fullNode     = nodeServices.HasFlag(wire.SFNodeNetwork)
-@@ -516,6 +508,7 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
+@@ -516,6 +507,7 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
  	isSyncCandidate := sm.isSyncCandidate(peer)
  	sm.peerStates[peer] = &peerSyncState{
  		syncCandidate:             isSyncCandidate,
@@ -219,7 +117,7 @@ index ef49245..81132ab 100644
  		requestedTxns:             make(map[chainhash.Hash]struct{}),
  		requestedBlocks:           make(map[chainhash.Hash]struct{}),
  		requestedUtreexoSummaries: make(map[chainhash.Hash]struct{}),
-@@ -523,6 +516,10 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
+@@ -523,6 +515,10 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
  		requestedUtreexoTTLs:      make(map[wire.MsgGetUtreexoTTLs]struct{}),
  	}
  
@@ -230,7 +128,7 @@ index ef49245..81132ab 100644
  	// Start syncing by choosing the best candidate if needed.
  	if isSyncCandidate && sm.syncPeer == nil {
  		sm.startSync()
-@@ -553,6 +550,11 @@ func (sm *SyncManager) handleStallSample() {
+@@ -553,6 +549,11 @@ func (sm *SyncManager) handleStallSample() {
  	if !exists {
  		return
  	}
@@ -242,7 +140,7 @@ index ef49245..81132ab 100644
  
  	sm.clearRequestedState(state)
  
-@@ -599,6 +601,10 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
+@@ -599,6 +600,10 @@ func (sm *SyncManager) handleDonePeerMsg(peer *peerpkg.Peer) {
  	log.Infof("Lost peer %s", peer)
  
  	sm.clearRequestedState(state)
@@ -253,7 +151,7 @@ index ef49245..81132ab 100644
  
  	if peer == sm.syncPeer {
  		// Update the sync peer. The server has already disconnected the
-@@ -617,8 +623,8 @@ func (sm *SyncManager) clearRequestedState(state *peerSyncState) {
+@@ -617,8 +622,8 @@ func (sm *SyncManager) clearRequestedState(state *peerSyncState) {
  		delete(sm.requestedTxns, txHash)
  	}
  
@@ -264,7 +162,7 @@ index ef49245..81132ab 100644
  		// Remove requested blocks from the global map so that they will
  		// be fetched from elsewhere next time we get an inv.
  		// TODO: we could possibly here check which peers have these
-@@ -777,25 +783,19 @@ func (sm *SyncManager) checkHeadersList(block *btcutil.Block) (
+@@ -777,25 +782,19 @@ func (sm *SyncManager) checkHeadersList(block *btcutil.Block) (
  // handleBlockMsg handles block messages from all peers.
  func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
  	peer := bmsg.peer
@@ -299,7 +197,7 @@ index ef49245..81132ab 100644
  		}
  	}
  
-@@ -809,6 +809,23 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
+@@ -809,6 +808,23 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
  		}
  
  		// We need the utreexo proof to be able to verify the block.
@@ -323,7 +221,7 @@ index ef49245..81132ab 100644
  		utreexoProofMsg, found := sm.queuedUtreexoProofs[*bmsg.block.Hash()]
  		if !found {
  			log.Warnf("got block %v but don't have the associated "+
-@@ -817,17 +834,30 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
+@@ -817,17 +833,26 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
  			return
  		}
  
@@ -339,13 +237,9 @@ index ef49245..81132ab 100644
  			},
 -			LeafDatas: utreexoProofMsg.proof.LeafDatas,
 +			LeafDatas: append([]wire.LeafData(nil), utreexoProofMsg.proof.LeafDatas...),
- 		}
-+		var proofErr error
-+		if _, native := sm.sidecarProofPeers[utreexoProofMsg.peer.Addr()]; native {
-+			proofErr = translateSidecarTargets(udata.AccProof.Targets,
-+				sm.chain.GetUtreexoView().NumLeaves())
 +		}
-+		if proofErr == nil && sm.independentProofs() {
++		var proofErr error
++		if sm.independentProofs() {
 +			proofErr = sm.verifyBlockProof(bmsg.block, &udata)
 +		}
 +		if proofErr != nil {
@@ -353,14 +247,14 @@ index ef49245..81132ab 100644
 +			sm.failProofPeer(utreexoProofMsg.peer, proofErr.Error())
 +			sm.scheduleProofs(time.Now())
 +			return
-+		}
+ 		}
 +		delete(sm.queuedUtreexoProofs, *blockHash)
 +		delete(sm.queuedBlocks, *blockHash)
 +		delete(sm.proofRequests, *blockHash)
  
  		bmsg.block.SetUtreexoData(&udata)
  	}
-@@ -838,10 +868,11 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
+@@ -838,10 +863,11 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
  	// Remove block from request maps. Either chain will know about it and
  	// so we shouldn't have any more instances of trying to fetch it, or we
  	// will fail the insert and thus we'll retry next time we get an inv.
@@ -376,7 +270,7 @@ index ef49245..81132ab 100644
  		delete(sm.requestedBlocks, *blockHash)
  	}
  
-@@ -1069,6 +1100,11 @@ func (sm *SyncManager) fetchHeaderBlocks(peer *peerpkg.Peer) {
+@@ -1069,6 +1095,11 @@ func (sm *SyncManager) fetchHeaderBlocks(peer *peerpkg.Peer) {
  		return
  	}
  
@@ -388,7 +282,7 @@ index ef49245..81132ab 100644
  	_, bestHeaderHeight := sm.chain.BestHeader()
  
  	// Start fetching from the fork point between the best chain and
-@@ -1199,6 +1235,9 @@ func (sm *SyncManager) fetchHeaderBlocks(peer *peerpkg.Peer) {
+@@ -1199,6 +1230,9 @@ func (sm *SyncManager) fetchHeaderBlocks(peer *peerpkg.Peer) {
  // requested when performing a headers-first sync.
  func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
  	peer := hmsg.peer
@@ -398,7 +292,7 @@ index ef49245..81132ab 100644
  	_, exists := sm.peerStates[peer]
  	if !exists {
  		log.Warnf("Received headers message from unknown peer %s", peer)
-@@ -1300,6 +1339,19 @@ func (sm *SyncManager) handleUtreexoProofMsg(hmsg *utreexoProofMsg) {
+@@ -1300,6 +1334,19 @@ func (sm *SyncManager) handleUtreexoProofMsg(hmsg *utreexoProofMsg) {
  	}
  
  	blockHash := hmsg.proof.BlockHash
@@ -418,7 +312,7 @@ index ef49245..81132ab 100644
  	if _, exists = state.requestedUtreexoProofs[blockHash]; !exists {
  		log.Warnf("Got unrequested utreexo proof %v from %s -- "+
  			"disconnecting", blockHash, peer.Addr())
-@@ -1307,7 +1359,11 @@ func (sm *SyncManager) handleUtreexoProofMsg(hmsg *utreexoProofMsg) {
+@@ -1307,7 +1354,11 @@ func (sm *SyncManager) handleUtreexoProofMsg(hmsg *utreexoProofMsg) {
  		return
  	}
  
@@ -430,7 +324,7 @@ index ef49245..81132ab 100644
  
  	bmsg, haveBlock := sm.queuedBlocks[blockHash]
  	if haveBlock {
-@@ -1532,12 +1588,6 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1532,12 +1583,6 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  		return
  	}
  
@@ -443,7 +337,7 @@ index ef49245..81132ab 100644
  	// Ignore invs when we're in headers build mode.
  	if sm.headersBuildMode {
  		return
-@@ -1563,6 +1613,9 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1563,6 +1608,9 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  	// we already have and request more blocks to prevent them.
  	for i := 0; i < len(invVects); i++ {
  		iv := invVects[i]
@@ -453,7 +347,7 @@ index ef49245..81132ab 100644
  
  		// Ignore unsupported inventory types.
  		switch iv.Type {
-@@ -1701,6 +1754,22 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1701,6 +1749,22 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  		case wire.InvTypeWitnessBlock:
  			fallthrough
  		case wire.InvTypeBlock:
@@ -476,7 +370,7 @@ index ef49245..81132ab 100644
  			// Request the block if there is not already a pending
  			// request.
  			if _, exists := sm.requestedBlocks[iv.Hash]; !exists {
-@@ -1782,8 +1851,11 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1782,8 +1846,11 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  						iv.Type = wire.InvTypeWitnessTx
  					}
  
@@ -489,7 +383,7 @@ index ef49245..81132ab 100644
  					gdmsg.AddInvVect(iv)
  					numRequested++
  
-@@ -1807,6 +1879,9 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1807,6 +1874,9 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  		}
  	}
  	state.requestQueue = requestQueue
@@ -499,7 +393,7 @@ index ef49245..81132ab 100644
  	if len(gdmsg.InvList) > 0 {
  		peer.QueueMessage(gdmsg, nil)
  	}
-@@ -1821,6 +1896,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1821,6 +1891,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  func (sm *SyncManager) blockHandler() {
  	stallTicker := time.NewTicker(stallSampleInterval)
  	defer stallTicker.Stop()
@@ -508,23 +402,23 @@ index ef49245..81132ab 100644
  
  out:
  	for {
-@@ -1844,6 +1921,7 @@ out:
+@@ -1844,6 +1916,7 @@ out:
  
  			case *blockMsg:
  				sm.handleBlockMsg(msg)
-+				sm.drainSidecarBlocks()
++				sm.drainProofBlocks()
  				msg.reply <- struct{}{}
  
  			case *invMsg:
-@@ -1854,6 +1932,7 @@ out:
+@@ -1854,6 +1927,7 @@ out:
  
  			case *utreexoProofMsg:
  				sm.handleUtreexoProofMsg(msg)
-+				sm.drainSidecarBlocks()
++				sm.drainProofBlocks()
  
  			case *utreexoTTLsMsg:
  				sm.handleUtreexoTTLsMsg(msg)
-@@ -1872,6 +1951,12 @@ out:
+@@ -1872,6 +1946,12 @@ out:
  				msg.reply <- peerID
  
  			case processBlockMsg:
@@ -537,7 +431,7 @@ index ef49245..81132ab 100644
  				_, isOrphan, err := sm.chain.ProcessBlock(
  					msg.block, msg.flags)
  				if err != nil {
-@@ -1879,6 +1964,7 @@ out:
+@@ -1879,6 +1959,7 @@ out:
  						isOrphan: false,
  						err:      err,
  					}
@@ -545,14 +439,14 @@ index ef49245..81132ab 100644
  				}
  
  				msg.reply <- processBlockResponse{
-@@ -1898,6 +1984,15 @@ out:
+@@ -1898,6 +1979,15 @@ out:
  					"handler: %T", msg)
  			}
  
 +		case now := <-proofTicker.C:
 +			if sm.independentProofs() {
 +				sm.scheduleProofs(now)
-+				sm.drainSidecarBlocks()
++				sm.drainProofBlocks()
 +				if sm.syncPeer != nil && !sm.headersBuildMode {
 +					sm.fetchHeaderBlocks(nil)
 +				}
@@ -561,32 +455,105 @@ index ef49245..81132ab 100644
  		case <-stallTicker.C:
  			sm.handleStallSample()
  
-@@ -2191,6 +2286,8 @@ func (sm *SyncManager) Pause() chan<- struct{} {
+@@ -2191,6 +2281,7 @@ func (sm *SyncManager) Pause() chan<- struct{} {
  // block, tx, and inv updates.
  func New(config *Config) (*SyncManager, error) {
  	sm := SyncManager{
-+		sidecarProofPeers:   make(map[string]struct{}),
 +		proofRequests:       make(map[chainhash.Hash]*blockProofRequest),
  		peerNotifier:        config.PeerNotifier,
  		chain:               config.Chain,
  		txMemPool:           config.TxMemPool,
-@@ -2208,6 +2305,10 @@ func New(config *Config) (*SyncManager, error) {
- 		feeEstimator:        config.FeeEstimator,
- 	}
- 
-+	for _, address := range config.SidecarProofPeers {
-+		sm.sidecarProofPeers[address] = struct{}{}
-+	}
+diff --git a/netsync/mempoolproof.go b/netsync/mempoolproof.go
+new file mode 100644
+index 0000000..ac48225
+--- /dev/null
++++ b/netsync/mempoolproof.go
+@@ -0,0 +1,79 @@
++// Copyright (c) 2026 The Utreexo developers
++// Use of this source code is governed by an ISC license.
++package netsync
 +
- 	if sm.chain.IsUtreexoViewActive() {
- 		if len(sm.chainParams.TTL.Stump) > 0 {
- 			// Initialize the committed ttl state.
++import (
++	"fmt"
++	"github.com/utreexo/utreexod/blockchain"
++	"github.com/utreexo/utreexod/btcutil"
++	"github.com/utreexo/utreexod/wire"
++)
++
++// Standard submitblock obtains proofs already verified and remembered by the
++// compact mempool. Missing data fails closed; it never asks Core to validate.
++func (sm *SyncManager) attachMempoolProof(block *btcutil.Block) error {
++	if len(block.MsgBlock().Transactions) == 0 {
++		return fmt.Errorf("submitblock has no coinbase")
++	}
++	best := sm.chain.BestSnapshot()
++	if block.MsgBlock().Header.PrevBlock != best.Hash {
++		return fmt.Errorf("submitblock proof requires the current tip")
++	}
++	block.SetHeight(best.Height + 1)
++	_, _, skip, _ := blockchain.DedupeBlock(block)
++	var leaves []wire.LeafData
++	var inputIndex uint32
++	for txIndex, tx := range block.Transactions() {
++		if txIndex == 0 {
++			inputIndex += uint32(len(tx.MsgTx().TxIn))
++			continue
++		}
++		txLeaves, err := sm.txMemPool.FetchLeafDatas(tx.Hash())
++		if err != nil {
++			return fmt.Errorf("submitblock proof unavailable for %s: %w", tx.Hash(), err)
++		}
++		if len(txLeaves) != len(tx.MsgTx().TxIn) {
++			return fmt.Errorf("submitblock leaf/input count mismatch")
++		}
++		for i := range tx.MsgTx().TxIn {
++			if len(skip) > 0 && skip[0] == inputIndex {
++				skip = skip[1:]
++			} else {
++				if txLeaves[i].IsUnconfirmed() {
++					return fmt.Errorf("submitblock missing unconfirmed parent")
++				}
++				leaves = append(leaves, txLeaves[i])
++			}
++			inputIndex++
++		}
++	}
++	proof, err := sm.chain.GenerateUData(leaves)
++	if err != nil {
++		return err
++	}
++	block.SetUtreexoData(proof)
++	return nil
++}
++
++// Blocks and proofs arrive independently; drain ready pairs in chain order.
++// Do not enqueue onto our own channel while handling a message.
++func (sm *SyncManager) drainProofBlocks() {
++	if !sm.independentProofs() {
++		return
++	}
++	for {
++		best := sm.chain.BestSnapshot()
++		hash, err := sm.chain.HeaderHashByHeight(best.Height + 1)
++		if err != nil {
++			return
++		}
++		block := sm.queuedBlocks[*hash]
++		if block == nil || sm.queuedUtreexoProofs[*hash] == nil {
++			return
++		}
++		sm.handleBlockMsg(block)
++		if sm.chain.BestSnapshot().Hash == best.Hash {
++			return
++		}
++	}
++}
 diff --git a/netsync/proofpeers.go b/netsync/proofpeers.go
 new file mode 100644
-index 0000000..f18f102
+index 0000000..121dab0
 --- /dev/null
 +++ b/netsync/proofpeers.go
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,278 @@
 +// Copyright (c) 2026 The Utreexo developers
 +// Use of this source code is governed by an ISC license.
 +
@@ -597,7 +564,6 @@ index 0000000..f18f102
 +	"sort"
 +	"time"
 +
-+	"github.com/utreexo/utreexo"
 +	"github.com/utreexo/utreexod/blockchain"
 +	"github.com/utreexo/utreexod/btcutil"
 +	"github.com/utreexo/utreexod/chaincfg/chainhash"
@@ -866,30 +832,12 @@ index 0000000..f18f102
 +	}
 +	return nil
 +}
-+
-+// translateSidecarTargets adapts only explicitly configured native-position
-+// endpoints. Standard v0.6 proof providers already use fixed 63-row positions.
-+func translateSidecarTargets(targets []uint64, leaves uint64) error {
-+	rows := utreexo.TreeRows(leaves)
-+	mask := (uint64(1) << (rows + 1)) - 1
-+	for i, target := range targets {
-+		if target >= mask {
-+			return fmt.Errorf("sidecar target outside accumulator forest")
-+		}
-+		row := utreexo.DetectRow(target, rows)
-+		if row > 0 && row <= rows {
-+			start := (^uint64(0) << (rows + 1 - row)) & mask
-+			targets[i] = target - start + (^uint64(0) << (64 - row))
-+		}
-+	}
-+	return nil
-+}
 diff --git a/netsync/proofpeers_test.go b/netsync/proofpeers_test.go
 new file mode 100644
-index 0000000..93751c8
+index 0000000..3e68c07
 --- /dev/null
 +++ b/netsync/proofpeers_test.go
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,191 @@
 +// Copyright (c) 2026 The Utreexo developers
 +// Use of this source code is governed by an ISC license.
 +
@@ -1072,14 +1020,6 @@ index 0000000..93751c8
 +	require.False(t, sm.waitingOnlyForProofs(), "proofs no longer block validation")
 +}
 +
-+func TestSidecarTargetConversion(t *testing.T) {
-+	targets := []uint64{0, 8, 12}
-+	require.NoError(t, translateSidecarTargets(targets, 8))
-+	require.Equal(t, []uint64{0, 1 << 63, 3 << 62}, targets)
-+	require.Error(t, translateSidecarTargets([]uint64{15}, 8))
-+	require.NoError(t, translateSidecarTargets(nil, 0))
-+}
-+
 +func TestBlockCommitmentsBeforeProofAttribution(t *testing.T) {
 +	params := chaincfg.RegressionNetParams
 +	block := generateTestBlocks(t, &params, 1)[0]
@@ -1089,93 +1029,8 @@ index 0000000..93751c8
 +	require.Error(t, verifyBlockCommitments(btcutil.NewBlock(&changed), false))
 +	require.Error(t, verifyBlockCommitments(btcutil.NewBlock(&wire.MsgBlock{}), false))
 +}
-diff --git a/netsync/sidecar.go b/netsync/sidecar.go
-new file mode 100644
-index 0000000..d004dc7
---- /dev/null
-+++ b/netsync/sidecar.go
-@@ -0,0 +1,79 @@
-+// Copyright (c) 2026 The Utreexo developers
-+// Use of this source code is governed by an ISC license.
-+package netsync
-+
-+import (
-+	"fmt"
-+	"github.com/utreexo/utreexod/blockchain"
-+	"github.com/utreexo/utreexod/btcutil"
-+	"github.com/utreexo/utreexod/wire"
-+)
-+
-+// Standard submitblock obtains proofs already verified and remembered by the
-+// compact mempool. Missing data fails closed; it never asks Core to validate.
-+func (sm *SyncManager) attachMempoolProof(block *btcutil.Block) error {
-+	if len(block.MsgBlock().Transactions) == 0 {
-+		return fmt.Errorf("submitblock has no coinbase")
-+	}
-+	best := sm.chain.BestSnapshot()
-+	if block.MsgBlock().Header.PrevBlock != best.Hash {
-+		return fmt.Errorf("submitblock proof requires the current tip")
-+	}
-+	block.SetHeight(best.Height + 1)
-+	_, _, skip, _ := blockchain.DedupeBlock(block)
-+	var leaves []wire.LeafData
-+	var inputIndex uint32
-+	for txIndex, tx := range block.Transactions() {
-+		if txIndex == 0 {
-+			inputIndex += uint32(len(tx.MsgTx().TxIn))
-+			continue
-+		}
-+		txLeaves, err := sm.txMemPool.FetchLeafDatas(tx.Hash())
-+		if err != nil {
-+			return fmt.Errorf("submitblock proof unavailable for %s: %w", tx.Hash(), err)
-+		}
-+		if len(txLeaves) != len(tx.MsgTx().TxIn) {
-+			return fmt.Errorf("submitblock leaf/input count mismatch")
-+		}
-+		for i := range tx.MsgTx().TxIn {
-+			if len(skip) > 0 && skip[0] == inputIndex {
-+				skip = skip[1:]
-+			} else {
-+				if txLeaves[i].IsUnconfirmed() {
-+					return fmt.Errorf("submitblock missing unconfirmed parent")
-+				}
-+				leaves = append(leaves, txLeaves[i])
-+			}
-+			inputIndex++
-+		}
-+	}
-+	proof, err := sm.chain.GenerateUData(leaves)
-+	if err != nil {
-+		return err
-+	}
-+	block.SetUtreexoData(proof)
-+	return nil
-+}
-+
-+// Blocks and proofs arrive independently; drain ready pairs in chain order.
-+// Do not enqueue onto our own channel while handling a message.
-+func (sm *SyncManager) drainSidecarBlocks() {
-+	if !sm.independentProofs() {
-+		return
-+	}
-+	for {
-+		best := sm.chain.BestSnapshot()
-+		hash, err := sm.chain.HeaderHashByHeight(best.Height + 1)
-+		if err != nil {
-+			return
-+		}
-+		block := sm.queuedBlocks[*hash]
-+		if block == nil || sm.queuedUtreexoProofs[*hash] == nil {
-+			return
-+		}
-+		sm.handleBlockMsg(block)
-+		if sm.chain.BestSnapshot().Hash == best.Hash {
-+			return
-+		}
-+	}
-+}
 diff --git a/server.go b/server.go
-index 6db58e3..7ca106b 100644
+index 6db58e3..6de3ba0 100644
 --- a/server.go
 +++ b/server.go
 @@ -22,6 +22,7 @@ import (
@@ -1251,14 +1106,6 @@ index 6db58e3..7ca106b 100644
  		}
  		// Add peers discovered through DNS to the address manager.
  		connmgr.SeedFromDNS(activeNetParams.Params, requiredServices,
-@@ -3632,6 +3618,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
- 	s.txMemPool = mempool.New(&txC)
- 
- 	s.syncManager, err = netsync.New(&netsync.Config{
-+		SidecarProofPeers:  cfg.UtreexoProofPeers,
- 		PeerNotifier:       &s,
- 		Chain:              s.chain,
- 		TxMemPool:          s.txMemPool,
 diff --git a/wire/msgutreexoproof.go b/wire/msgutreexoproof.go
 index 4f37283..6d1e61f 100644
 --- a/wire/msgutreexoproof.go

@@ -1166,6 +1166,17 @@ public:
             auto parsed{ParseDataRecord(height, block_hash, expected_previous,
                                         EntryDigest(entry), bytes)};
             if (!parsed) return Result<std::shared_ptr<const CachedBlockProof>>::Err(parsed.Error());
+            if (!parsed.Value().proof.proof.targets.empty()) {
+                auto before{StateAt(height - 1)};
+                if (!before) return Result<std::shared_ptr<const CachedBlockProof>>::Err(before.Error());
+                if (before.Value()) {
+                    if (before.Value()->point.block_hash != expected_previous) {
+                        return Result<std::shared_ptr<const CachedBlockProof>>::Err(
+                            "pre-block accumulator state changed while reading proof");
+                    }
+                    parsed.Value().proof.num_leaves_before = before.Value()->num_leaves;
+                }
+            }
             std::shared_ptr<const CachedBlockProof> result{
                 std::make_shared<CachedBlockProof>(std::move(parsed.Value().proof))};
             return Result<std::shared_ptr<const CachedBlockProof>>::Ok(std::move(result));

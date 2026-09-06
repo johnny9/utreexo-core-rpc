@@ -67,8 +67,7 @@ Connect that compact node to Core and the sidecar:
 
 ```sh
 ./utreexod-relay \
-  --connect=127.0.0.1:8333 --connect=127.0.0.1:8338 \
-  --utreexoproofpeer=127.0.0.1:8338
+  --connect=127.0.0.1:8333 --connect=127.0.0.1:8338
 ```
 
 Configure utreexod's usual local RPC authentication for the pool. Keep compact
@@ -79,11 +78,12 @@ and submission proofs from verified mempool leaves. A submitted block whose
 needed transactions/proofs are unavailable fails closed. It also fixes the
 upstream sync-manager double reply on rejected RPC blocks.
 
-The existing sidecar **block archive** uses native `TreeRows(num_leaves)` target
-positions. The explicit sidecar peer adapter translates those block targets into
-v0.6's fixed 63-row API space. `--utreexoproofpeer` is repeatable and marks only
-this encoding difference; it is not a proof-provider allowlist. Each marked
-numeric IPv4 endpoint must also appear in `--connect` or `--addpeer`.
+The sidecar keeps native `TreeRows(num_leaves)` targets in its **block archive**
+and converts them to fixed 63-row positions when sending network proofs. Cached
+proofs retain their pre-block leaf count; archive reads use the authenticated
+previous block's accumulator state. Conversion preserves target order and never
+changes archived or cached targets. No provider-specific flag or adapter is
+needed in utreexod.
 
 Standard v0.6 proof providers need only a normal peer connection. The patched
 consumer selects multiple providers by their advertised services:
@@ -107,7 +107,10 @@ synchronization path is unchanged.
 These consumer changes are newer than the patch shipped in v0.5.0-beta.1. Use
 the patch on master or the
 [patched utreexod branch](https://github.com/johnny9/utreexod/tree/core-sidecar-relay-v0.6.0).
-The existing beta.1 sidecar binary remains compatible.
+Build both the updated sidecar and consumer. The beta.1 sidecar binary sends the
+older block-target encoding and is not compatible with this adapter-free consumer.
+Existing state-bearing proof archives remain usable without rewriting them;
+nonempty proofs require the archived pre-block accumulator state.
 
 Transaction inventory, requests, and responses use
 the exact v0.6 format directly; see the [codec guide](transaction-proof-codec.md).
