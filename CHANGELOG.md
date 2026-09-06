@@ -6,6 +6,11 @@ proof-store formats remain explicitly versioned.
 
 ## Unreleased
 
+- Add a Core/sidecar/compact-utreexod discovery integration to CI. Fresh
+  consumers learn the sidecar through `addr` and `addrv2` bootstrap responses,
+  tolerate an unavailable bootstrap, and reconnect from saved addresses after
+  restart. Verify Core block traffic and discovered block/transaction proofs
+  using an isolated SOCKS5 router without weakening address routability checks.
 - The utreexod patch reuses the current template's assembled proof for matching
   `submitblock` transactions and parent, while allowing normal coinbase and
   header changes. Cache misses retain the local mempool proof fallback; full

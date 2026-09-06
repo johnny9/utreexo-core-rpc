@@ -240,6 +240,14 @@ jobs:
           --utreexod="${GITHUB_WORKSPACE}/build/utreexod-relay"
           --work-dir="${RUNNER_TEMP}/core-utreexod-proof-peers"
           --timeout=180
+      - name: Verify address gossip and automatic compact-node discovery
+        run: >-
+          python3 test/integration/core_utreexod_discovery.py
+          --core="${RUNNER_TEMP}/bitcoin-${CORE_VERSION}/bin/bitcoind"
+          --sidecar="${GITHUB_WORKSPACE}/build/utreexo-bridge"
+          --utreexod="${GITHUB_WORKSPACE}/build/utreexod-relay"
+          --work-dir="${RUNNER_TEMP}/core-utreexod-discovery"
+          --timeout=180
       - name: Report integration evidence
         if: always()
         run: |
@@ -252,6 +260,11 @@ jobs:
             cat "${RUNNER_TEMP}/core-utreexod-proof-peers/result.json"
           else
             tail -n 100 "${RUNNER_TEMP}/core-utreexod-proof-peers/"*.log || true
+          fi
+          if test -f "${RUNNER_TEMP}/core-utreexod-discovery/result.json"; then
+            cat "${RUNNER_TEMP}/core-utreexod-discovery/result.json"
+          else
+            tail -n 100 "${RUNNER_TEMP}/core-utreexod-discovery/"*.log || true
           fi
 
   differential-regtest:

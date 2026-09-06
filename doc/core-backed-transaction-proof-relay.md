@@ -160,6 +160,33 @@ proxies advertise archive-only and `NODE_UTREEXO`-only services and inject a
 timeout, invalid proof, and disconnect. The test requires recovery through the
 other provider, no block requests to proof-only peers, transaction proof relay,
 standard pool submission, and matching accumulator roots. Only the separate
-proof generator enables a proof index; the consumer remains compact. CI runs
-both integrations. Full mainnet catch-up, sustained mainnet load, and a combined
-reorg integration remain unvalidated.
+proof generator enables a proof index; the consumer remains compact. Full mainnet
+catch-up, sustained mainnet load, and a combined reorg integration remain unvalidated.
+
+Run the address-discovery integration with the same binaries and another fresh directory:
+
+```sh
+python3 test/integration/core_utreexod_discovery.py \
+  --core=/path/to/bitcoin-31.1/bin/bitcoind \
+  --sidecar=build/utreexo-bridge \
+  --utreexod=/path/to/utreexod-relay \
+  --work-dir=/path/to/fresh-discovery-test-directory --timeout=180
+```
+
+The sidecar announces its endpoint to two local bootstrap fixtures with
+`--p2p-advertise` and `--p2p-gossip-seed`. The fixtures learn their only address
+from that announcement and return it in response to `getaddr`. Two fresh compact
+consumers exercise legacy `addr` and negotiated `addrv2`, each with the other
+bootstrap unavailable. The consumers use `--addpeer` for Core and the bootstrap
+peers, leaving automatic discovery enabled; no sidecar address is configured.
+The test also restarts a consumer with both bootstraps unavailable and requires
+it to reconnect using the address saved in `peers.json`.
+
+A local SOCKS5 router maps synthetic public endpoints to loopback so utreexod's
+production address manager can enforce routability. It refuses every unmapped
+destination and records P2P messages without changing them. Assertions require
+block requests and responses from Core, block and transaction proofs from the
+discovered sidecar, nonempty inclusion proofs, and compact validation of the chain.
+This tests P2P address discovery and persistence; public DNS seed inclusion,
+third-party bootstrap relay policies, and public NAT/firewall reachability still
+need deployment checks. CI runs all three integrations.

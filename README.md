@@ -513,6 +513,12 @@ valid gossip seeds and the successful-send log does not claim downstream relay.
 The clearnet gossip implementation accepts numeric IPv4 endpoints only; use the Tor
 deployment below for onion reachability.
 
+The [compact-node discovery integration](doc/core-backed-transaction-proof-relay.md#reproduce-the-integration-test)
+checks sidecar announcements, `addr`/`addrv2` discovery, unavailable bootstrap
+peers, and reconnection from saved addresses using isolated bootstrap fixtures.
+Compact utreexod must allow automatic discovery: `--addpeer` preserves it, while
+`--connect` limits connections to explicitly configured peers.
+
 The first implementation supports the Bitcoin v1 transport. Current Floresta must be
 configured with `--allow-v1-fallback`. Floresta v0.9.1 requires its initial sync peer to
 provide headers and blocks as well as Utreexo archive service, which this proof-only
