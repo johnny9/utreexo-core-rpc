@@ -203,3 +203,23 @@ flags passes at `build/relay-integration/generic-proof-regtest/result.json`,
 including Core block downloads, sidecar proof validation, transaction relay,
 standard submission, restart recovery, and matching roots. Additional tests
 exercise fixed-row internal targets from both RAM cache and the proof archive.
+
+## Cached template proof reuse — 2026-09-06
+
+Reuse `BlockTemplate.UData` for ordinary submissions matching the current tip and
+the ordered non-coinbase witness transaction IDs. Cache those identities when the
+template is generated, allow pool changes to header and coinbase fields, and deep
+copy proof and leaf data before validation. Keep only the existing current
+template; on a miss, retain the mempool proof assembly path. Full proof and block
+validation remains in place.
+
+Root-package tests cover identity matching, changed witnesses with unchanged
+txids, stale tips, template replacement, concurrent access, and copy isolation.
+The regtest harness additionally checks rejection of an excessive coinbase reward
+on a cache hit, successful cached submission after that rejection, stale-tip
+rejection, and a valid modified-template fallback. CI includes the root Go suite.
+
+Local 500-input proof-preparation benchmark (three runs): cache matching and copy
+0.235–0.240 ms versus local assembly 0.807–0.822 ms. These measurements exclude
+full consensus validation and are not end-to-end RPC latency. Results are in
+`build/template-proof-benchmark.log`.

@@ -334,18 +334,54 @@ def run(args: argparse.Namespace) -> None:
         incomplete["transactions"] = [tx for tx in template["transactions"] if tx["txid"] != parent]
         rejected = utree("submitblock", [mine_template(incomplete)])
         assert isinstance(rejected, str) and "missing unconfirmed parent" in rejected, rejected
+
+        # An unchanged transaction body reuses its template proof even when the
+        # pool changes the coinbase. Full consensus checks must still reject an
+        # excessive reward, and that rejection must not mutate the cached proof.
+        overpaid = dict(template)
+        overpaid["coinbasevalue"] += 1
+        overpaid_block = mine_template(overpaid)
+        overpaid_hash = sha256d(bytes.fromhex(overpaid_block)[:80])[::-1].hex()
+        rejected = utree("submitblock", [overpaid_block])
+        assert isinstance(rejected, str) and "coinbase" in rejected.lower(), rejected
+        assert f"Reusing cached template proof for block {overpaid_hash}" in validator.log_path.read_text()
+        assert f"Assembled submission proof from mempool for block {overpaid_hash}" not in validator.log_path.read_text()
+        print("Cached proof still enforces coinbase reward validation", flush=True)
+
         raw_block = mine_template(template)
         result = utree("submitblock", [raw_block])
         assert result is None, result
         mined_hash = sha256d(bytes.fromhex(raw_block)[:80])[::-1].hex()
+        assert f"Reusing cached template proof for block {mined_hash}" in validator.log_path.read_text()
+        assert f"Assembled submission proof from mempool for block {mined_hash}" not in validator.log_path.read_text()
+        print("Standard submitblock reused the cached template proof", flush=True)
         wait("Standard submitblock relayed to Core", lambda: core("getbestblockhash") == mined_hash)
         assert utree("getbestblockhash") == mined_hash
         wait("Sidecar followed mined block", lambda: f"block_hash={mined_hash}" in sidecar.log_path.read_text())
         assert utree("getrawmempool") == []
+        stale = dict(template)
+        stale["curtime"] += 1
+        stale_block = mine_template(stale)
+        stale_hash = sha256d(bytes.fromhex(stale_block)[:80])[::-1].hex()
+        rejected = utree("submitblock", [stale_block])
+        assert isinstance(rejected, str) and "requires the current tip" in rejected, rejected
+        assert f"Reusing cached template proof for block {stale_hash}" not in validator.log_path.read_text()
         # Exercise the opposite block direction after the transaction anchor
         # changes: ordinary Core blocks, independently validated sidecar proofs.
         extra = spend([{"txid": child, "vout": 0}], 9.997)
         wait("Transaction at the new tip verified", lambda: extra in utree("getrawmempool"))
+        # A valid pool-selected subset misses the template cache and assembles
+        # its proof through the existing local fallback.
+        modified = utree("getblocktemplate", [{"rules": ["segwit"]}])
+        assert extra in {tx["txid"] for tx in modified["transactions"]}
+        modified["coinbasevalue"] -= sum(tx["fee"] for tx in modified["transactions"])
+        modified["transactions"] = []
+        fallback_block = mine_template(modified)
+        fallback_hash = sha256d(bytes.fromhex(fallback_block)[:80])[::-1].hex()
+        assert utree("submitblock", [fallback_block]) is None
+        assert f"Assembled submission proof from mempool for block {fallback_hash}" in validator.log_path.read_text()
+        assert f"Reusing cached template proof for block {fallback_hash}" not in validator.log_path.read_text()
+        wait("Modified template used the local proof fallback", lambda: core("getbestblockhash") == fallback_hash)
         next_hash = core("generatetoaddress", [1, mining_address])[0]
         wait("Core-mined block independently validated", lambda: utree("getbestblockhash") == next_hash)
         roots = utree("getutreexoroots", [next_hash])
@@ -362,6 +398,10 @@ def run(args: argparse.Namespace) -> None:
                   "core_p2p_intake": True, "sidecar_restart_recovered": True,
                   "full_partial_zero_requests": True, "core_mined_block": next_hash,
                   "incomplete_submitblock_rejected": True,
+                  "cached_template_proof_reused": True,
+                  "cached_proof_consensus_rejection": overpaid_hash,
+                  "stale_template_cache_miss": True,
+                  "modified_template_fallback": fallback_hash,
                   "matching_roots": roots}
         for name, path in {"utreexod_binary": Path(args.utreexod),
                            "sidecar_binary": Path(args.sidecar),

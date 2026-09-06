@@ -4,6 +4,14 @@ All notable changes to the Utreexo bridge sidecar are documented here. The
 project follows Semantic Versioning while the command line, checkpoint, and
 proof-store formats remain explicitly versioned.
 
+## Unreleased
+
+- The utreexod patch reuses the current template's assembled proof for matching
+  `submitblock` transactions and parent, while allowing normal coinbase and
+  header changes. Cache misses retain the local mempool proof fallback; full
+  consensus validation still runs. Add cache isolation, witness identity, stale
+  tip, race, and real mining regression coverage.
+
 ## 0.5.0-beta.2 - 2026-09-06
 
 - The utreexod v0.6 compatibility patch selects multiple proof providers by

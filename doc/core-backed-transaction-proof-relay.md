@@ -78,6 +78,14 @@ and submission proofs from verified mempool leaves. A submitted block whose
 needed transactions/proofs are unavailable fails closed. It also fixes the
 upstream sync-manager double reply on rejected RPC blocks.
 
+The current patch also reuses the assembled template proof on `submitblock` when
+the parent and ordered non-coinbase witness transaction IDs match. Header and
+coinbase changes are allowed. The proof is copied before normal validation; an
+invalid reward or other consensus violation still fails. A changed transaction
+body or unavailable template uses the local mempool proof fallback. This cache
+optimization follows the beta.2 bundled patch and is available on master and the
+updated consumer fork.
+
 The sidecar keeps native `TreeRows(num_leaves)` targets in its **block archive**
 and converts them to fixed 63-row positions when sending network proofs. Cached
 proofs retain their pre-block leaf count; archive reads use the authenticated

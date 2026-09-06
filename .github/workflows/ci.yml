@@ -214,7 +214,7 @@ jobs:
         run: |
           git apply --check --whitespace=error-all "${GITHUB_WORKSPACE}/contrib/utreexod-v0.6.0-core-relay.patch"
           git apply "${GITHUB_WORKSPACE}/contrib/utreexod-v0.6.0-core-relay.patch"
-          go test -mod=readonly ./netsync ./mining ./mempool ./wire
+          go test -mod=readonly . ./netsync ./mining ./mempool ./wire
           go build -mod=readonly -o "${GITHUB_WORKSPACE}/build/utreexod-relay" .
       - name: Install verified Bitcoin Core 31.1
         working-directory: ${{ runner.temp }}
