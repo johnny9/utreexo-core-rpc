@@ -76,9 +76,9 @@ unit starts `/usr/local/bin/utreexo-bridge`. Verify the adjacent basename-only c
 then extract the single top-level archive directory into that prefix:
 
 ```sh
-sha256sum --check utreexo-bridge-0.5.0-beta.2-Linux-x86_64.tar.gz.sha256
+sha256sum --check utreexo-bridge-0.5.0-Linux-x86_64.tar.gz.sha256
 sudo tar --no-same-owner \
-  -xzf utreexo-bridge-0.5.0-beta.2-Linux-x86_64.tar.gz \
+  -xzf utreexo-bridge-0.5.0-Linux-x86_64.tar.gz \
   -C /usr/local --strip-components=1
 ```
 

@@ -83,8 +83,7 @@ the parent and ordered non-coinbase witness transaction IDs match. Header and
 coinbase changes are allowed. The proof is copied before normal validation; an
 invalid reward or other consensus violation still fails. A changed transaction
 body or unavailable template uses the local mempool proof fallback. This cache
-optimization follows the beta.2 bundled patch and is available on master and the
-updated consumer fork.
+optimization is included in v0.5.0's bundled patch and the updated consumer fork.
 
 The sidecar keeps native `TreeRows(num_leaves)` targets in its **block archive**
 and converts them to fixed 63-row positions when sending network proofs. Cached
@@ -112,7 +111,12 @@ blocks. Historical catch-up waits for a provider covering the requested heights;
 `NODE_UTREEXO` alone does not promise historical proofs. The upstream committed-TTL
 synchronization path is unchanged.
 
-These consumer changes ship with v0.5.0-beta.2. Use its bundled patch or the
+A sidecar whose proof store begins at the production checkpoint advertises
+`NODE_UTREEXO`, not full archival coverage. The current consumer therefore needs
+an additional eligible historical-proof peer to catch up from that checkpoint;
+it cannot use the checkpoint-only sidecar as its sole proof source during catch-up.
+
+These consumer changes ship with v0.5.0. Use its bundled patch or the
 [patched utreexod branch](https://github.com/johnny9/utreexod/tree/core-sidecar-relay-v0.6.0).
 Build both the updated sidecar and consumer. The beta.1 sidecar binary sends the
 older block-target encoding and is not compatible with this adapter-free consumer.

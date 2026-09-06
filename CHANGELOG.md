@@ -6,16 +6,41 @@ proof-store formats remain explicitly versioned.
 
 ## Unreleased
 
-- Add a Core/sidecar/compact-utreexod discovery integration to CI. Fresh
-  consumers learn the sidecar through `addr` and `addrv2` bootstrap responses,
-  tolerate an unavailable bootstrap, and reconnect from saved addresses after
-  restart. Verify Core block traffic and discovered block/transaction proofs
-  using an isolated SOCKS5 router without weakening address routability checks.
-- The utreexod patch reuses the current template's assembled proof for matching
-  `submitblock` transactions and parent, while allowing normal coinbase and
-  header changes. Cache misses retain the local mempool proof fallback; full
-  consensus validation still runs. Add cache isolation, witness identity, stale
-  tip, race, and real mining regression coverage.
+## 0.5.0 - 2026-09-06
+
+- Relay Core-validated transactions with proofs to compact utreexod. The sidecar
+  maintains a bounded proof-preparation cache while Core handles transaction
+  submission and mempool policy. Implement the exact utreexod v0.6 transaction
+  codec, including witness transactions and full, partial, and zero-additional-hash
+  proof requests.
+- Bundle a generic utreexod v0.6 compatibility patch for separate block and proof
+  peers, multiple proof providers, and retry after timeout, disconnect, or invalid
+  proof. Core can supply blocks and headers while the sidecar supplies proofs.
+  Network block targets use standard fixed 63-row positions; stored proof archives
+  retain their native encoding.
+- Support compact mempool mining through utreexod's `getblocktemplate` and ordinary
+  `submitblock`. Reuse the cached template proof when the parent and ordered witness
+  transaction IDs match, allowing coinbase and header changes. Cache misses use
+  verified mempool data; full consensus validation still runs.
+- Add regtest coverage for proof rejection and recovery, independent providers,
+  mining, and automatic discovery through `addr` and `addrv2`. Discovery tests cover
+  unavailable bootstraps and saved-address recovery using isolated local fixtures.
+
+### Compatibility and scope
+
+- Targets Bitcoin Core 31.1 and utreexod v0.6.0 commit
+  `fe71f3d9282ef0812f7f6087f0c0df9ce0fda508` with the included patch, matching
+  [utreexod b8a4004](https://github.com/johnny9/utreexod/commit/b8a4004bd3bb6624dd5e3f88940f520b6667db86).
+  Upgrade both binaries from beta.1 and remove the retired `utreexoproofpeer` option.
+- Production bootstrap begins at the mainnet checkpoint at height 943,013.
+  A checkpoint-only sidecar advertises `NODE_UTREEXO`, which the bundled consumer
+  uses for new-block proofs. Historical catch-up currently requires an additional
+  proof peer advertising coverage for the requested heights; a checkpoint-only
+  sidecar cannot be its sole proof source during catch-up.
+- Regtest validates the local Core/sidecar/compact-node setup. Mainnet catch-up,
+  sustained mainnet load, public discovery infrastructure, and a combined reorg
+  integration remain unvalidated. Production genesis synchronization, TTL serving,
+  and compact-wallet `sendrawtransaction` proof acquisition remain outside scope.
 
 ## 0.5.0-beta.2 - 2026-09-06
 
