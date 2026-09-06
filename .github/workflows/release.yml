@@ -44,7 +44,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          release_flags=(--generate-notes --verify-tag)
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          changelog = Path("CHANGELOG.md").read_text()
+          heading = f"## {version} - "
+          section = next((part for part in changelog.split("\n## ")[1:]
+                          if ("## " + part).startswith(heading)), None)
+          if section is None:
+              raise SystemExit(f"Missing changelog section for {version}")
+          notes = section.split("\n", 1)[1].strip() + "\n"
+          Path(os.environ["RUNNER_TEMP"], "release-notes.md").write_text(notes)
+          PY
+          release_flags=(--notes-file "${RUNNER_TEMP}/release-notes.md" --verify-tag)
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
             release_flags+=(--prerelease)
           fi

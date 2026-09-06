@@ -104,8 +104,7 @@ blocks. Historical catch-up waits for a provider covering the requested heights;
 `NODE_UTREEXO` alone does not promise historical proofs. The upstream committed-TTL
 synchronization path is unchanged.
 
-These consumer changes are newer than the patch shipped in v0.5.0-beta.1. Use
-the patch on master or the
+These consumer changes ship with v0.5.0-beta.2. Use its bundled patch or the
 [patched utreexod branch](https://github.com/johnny9/utreexod/tree/core-sidecar-relay-v0.6.0).
 Build both the updated sidecar and consumer. The beta.1 sidecar binary sends the
 older block-target encoding and is not compatible with this adapter-free consumer.
