@@ -117,6 +117,11 @@ if(UTREEXO_BUILD_BENCHMARKS)
     target_link_libraries(utreexo-online-storage-benchmark PRIVATE utreexo_accumulator)
     target_compile_features(utreexo-online-storage-benchmark PRIVATE cxx_std_20)
     utreexo_configure_target(utreexo-online-storage-benchmark)
+
+    add_executable(utreexo-forest-validation-benchmark bench/forest_validation.cpp)
+    target_link_libraries(utreexo-forest-validation-benchmark PRIVATE utreexo_accumulator)
+    target_compile_features(utreexo-forest-validation-benchmark PRIVATE cxx_std_20)
+    utreexo_configure_target(utreexo-forest-validation-benchmark)
 endif()
 
 if(UTREEXO_BUILD_RPC)
@@ -262,6 +267,7 @@ install(TARGETS utreexo-checkpoint-compact
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(UTREEXO_BUILD_BENCHMARKS)
     install(TARGETS utreexo-resource-estimate utreexo-online-storage-benchmark
+        utreexo-forest-validation-benchmark
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 if(UTREEXO_BUILD_RPC)
@@ -287,6 +293,7 @@ install(FILES doc/tor.md
     DESTINATION ${CMAKE_INSTALL_DOCDIR})
 install(FILES doc/transaction-proof-codec.md doc/core-backed-transaction-proof-relay-plan.md
     doc/core-backed-transaction-proof-relay.md
+    doc/forest-validation.md
     DESTINATION ${CMAKE_INSTALL_DOCDIR}/doc)
 install(FILES contrib/utreexod-v0.6.0-core-relay.patch
     DESTINATION ${CMAKE_INSTALL_DOCDIR}/contrib)

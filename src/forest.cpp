@@ -9,6 +9,7 @@
 #include <bit>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -151,6 +152,7 @@ Result<void> PwriteAll(int descriptor, std::span<const std::byte> bytes, uint64_
 Result<void> PreadAll(int descriptor, std::span<std::byte> bytes, uint64_t file_offset);
 Result<void> WriteAll(int descriptor, std::span<const std::byte> bytes);
 uint64_t Checksum(std::span<const std::byte> bytes);
+void ExtendChecksum(uint64_t& value, std::span<const std::byte> bytes);
 
 class ScopedDescriptor
 {
@@ -453,6 +455,31 @@ public:
     bool Writable() const { return m_writable; }
     uint64_t Bytes() const { return m_capacity * (sizeof(Hash256) + sizeof(DiskMeta)); }
 
+    Result<void> ReadRange(NodeId first, std::span<NodeRecord> records) const
+    {
+        constexpr std::size_t BATCH{16 * 1024};
+        std::vector<Hash256> hashes(std::min(BATCH, records.size()));
+        std::vector<DiskMeta> metadata(hashes.size());
+        for (std::size_t offset{0}; offset < records.size(); offset += BATCH) {
+            const auto count{std::min(BATCH, records.size() - offset)};
+            const uint64_t id{static_cast<uint64_t>(first) + offset};
+            auto read{PreadAll(m_hash_fd,
+                std::as_writable_bytes(std::span{hashes}.first(count)),
+                id * sizeof(Hash256))};
+            if (!read) return read;
+            read = PreadAll(m_meta_fd,
+                std::as_writable_bytes(std::span{metadata}.first(count)),
+                id * sizeof(DiskMeta));
+            if (!read) return read;
+            for (std::size_t i{0}; i < count; ++i) {
+                const auto& meta{metadata[i]};
+                records[offset + i] = NodeRecord{hashes[i], meta.parent,
+                    meta.left, meta.right, static_cast<NodeType>(meta.type)};
+            }
+        }
+        return Result<void>::Ok();
+    }
+
     Result<void> SyncPages(std::span<const NodeId> ids)
     {
         m_last_sync = {};
@@ -613,6 +640,12 @@ public:
     {
         return m_records[index];
     }
+    Result<void> ReadRecords(std::size_t first,
+                            std::span<DeltaDiskRecord> records) const
+    {
+        return PreadAll(m_descriptor, std::as_writable_bytes(records),
+            DELTA_HEADER_SIZE + first * sizeof(DeltaDiskRecord));
+    }
     const DeltaDiskRecord* Find(NodeId id) const
     {
         if (!MayContain(id)) return nullptr;
@@ -716,7 +749,18 @@ private:
             expected_checksum |= static_cast<uint64_t>(
                 std::to_integer<uint8_t>(m_mapping[checksum_cursor++])) << (i * 8);
         }
-        if (Checksum(bytes.first(checksum_offset)) != expected_checksum) {
+        // Do not fault the entire run into this process just to checksum it.
+        std::vector<std::byte> checksum_buffer(1024 * 1024);
+        uint64_t checksum{Checksum({})};
+        for (std::size_t first{0}; first < checksum_offset;
+             first += checksum_buffer.size()) {
+            const auto part{std::span{checksum_buffer}.first(
+                std::min(checksum_buffer.size(), checksum_offset - first))};
+            auto read{PreadAll(m_descriptor, part, first)};
+            if (!read) return read;
+            ExtendChecksum(checksum, part);
+        }
+        if (checksum != expected_checksum) {
             return Result<void>::Err("forest delta checksum mismatch");
         }
 
@@ -790,8 +834,14 @@ private:
         auto initialized_index{InitializeLookupIndex()};
         if (!initialized_index) return initialized_index;
         NodeId previous{NO_NODE};
+        std::vector<DeltaDiskRecord> records(4096);
         for (std::size_t i{0}; i < RecordCount(); ++i) {
-            const auto& record{m_records[i]};
+            if (i % records.size() == 0) {
+                auto read{ReadRecords(i, std::span{records}.first(
+                    std::min(records.size(), RecordCount() - i)))};
+                if (!read) return read;
+            }
+            const auto& record{records[i % records.size()]};
             const auto valid_link{[this](NodeId link) {
                 return link == NO_NODE || link < m_state.next;
             }};
@@ -1054,6 +1104,70 @@ public:
     }
 
     const NodeRecord& DirtyRecord(NodeId id) const { return m_dirty.at(id); }
+
+    // Buffered reads keep full validation independent of the mmap working set.
+    // Each immutable run is consumed once, oldest to newest, with WAL overrides
+    // applied last. Memory for run cursors is bounded by the configured run cap.
+    template <typename Callback>
+    Result<void> ForEachWindow(std::size_t slots, Callback&& callback) const
+    {
+        struct Cursor {
+            std::array<DeltaDiskRecord, 128> records;
+            std::size_t next{0};
+            std::size_t position{0};
+            std::size_t count{0};
+        };
+        std::vector<Cursor> cursors(m_delta_runs.size());
+        const auto dirty_ids{SortedVisibleDirtyIds()};
+        auto dirty{dirty_ids.begin()};
+        std::vector<NodeRecord> records;
+        for (uint64_t first{0}; first < m_next; first += slots) {
+            records.assign(static_cast<std::size_t>(
+                std::min<uint64_t>(slots, m_next - first)), NodeRecord{});
+            const uint64_t end{first + records.size()};
+            if (Mapped()) {
+                if (first < m_base_next) {
+                    auto read{m_files.ReadRange(static_cast<NodeId>(first),
+                        std::span{records}.first(static_cast<std::size_t>(
+                            std::min<uint64_t>(records.size(), m_base_next - first))))};
+                    if (!read) return read;
+                }
+                for (std::size_t run_index{0}; run_index < m_delta_runs.size();
+                     ++run_index) {
+                    const auto& run{*m_delta_runs[run_index]};
+                    auto& cursor{cursors[run_index]};
+                    for (;;) {
+                        if (cursor.position == cursor.count) {
+                            cursor.count = std::min(cursor.records.size(),
+                                run.RecordCount() - cursor.next);
+                            if (cursor.count == 0) break;
+                            auto read{run.ReadRecords(cursor.next,
+                                std::span{cursor.records}.first(cursor.count))};
+                            if (!read) return read;
+                            cursor.next += cursor.count;
+                            cursor.position = 0;
+                        }
+                        const auto& record{cursor.records[cursor.position]};
+                        if (record.id >= end) break;
+                        records[record.id - first] = FromDisk(record);
+                        ++cursor.position;
+                    }
+                }
+                while (dirty != dirty_ids.end() && *dirty < end) {
+                    records[*dirty - first] = DirtyRecord(*dirty);
+                    ++dirty;
+                }
+            } else {
+                for (std::size_t i{0}; i < records.size(); ++i) {
+                    records[i] = Read(static_cast<NodeId>(first + i));
+                }
+            }
+            auto result{callback(static_cast<NodeId>(first),
+                                 std::span<const NodeRecord>{records})};
+            if (!result) return result;
+        }
+        return Result<void>::Ok();
+    }
 
     const std::vector<std::unique_ptr<MappedDeltaRun>>& DeltaRuns() const
     {
@@ -1968,6 +2082,110 @@ Result<void> PreadAll(int descriptor, std::span<std::byte> bytes,
     }
     return Result<void>::Ok();
 }
+
+constexpr std::size_t VALIDATION_WINDOW_SLOTS{256 * 1024};
+
+// Only cross-window child hashes are spilled. Fixed, sparse bucket offsets
+// avoid an external sort or an unbounded list of edges in RAM. No bucket can
+// have more than two children per node, even for malformed input.
+class ValidationEdges
+{
+public:
+    struct Edge {
+        Hash256 hash;
+        NodeId child;
+        NodeId parent;
+    };
+    static_assert(sizeof(Edge) == 40);
+
+    ValidationEdges(const std::filesystem::path& directory, uint64_t slots)
+        : m_directory{directory},
+          m_buckets(static_cast<std::size_t>(
+              (slots + VALIDATION_WINDOW_SLOTS - 1) / VALIDATION_WINDOW_SLOTS)),
+          m_buffer_records{std::min<std::size_t>(4096, std::bit_floor(
+              (32 * 1024 * 1024) /
+              (std::max<std::size_t>(1, m_buckets.size()) * sizeof(Edge))))}
+    {
+    }
+
+    Result<void> Append(const Edge& edge)
+    {
+        const std::size_t bucket{edge.parent / VALIDATION_WINDOW_SLOTS};
+        auto& state{m_buckets.at(bucket)};
+        if (state.written + state.buffer.size() >= 2 * VALIDATION_WINDOW_SLOTS) {
+            return Result<void>::Err("online branch has too many children");
+        }
+        if (state.buffer.empty()) state.buffer.reserve(m_buffer_records);
+        state.buffer.push_back(edge);
+        if (state.buffer.size() == m_buffer_records) return Flush(bucket);
+        return Result<void>::Ok();
+    }
+
+    template <typename Callback>
+    Result<void> Read(std::size_t bucket, Callback&& callback)
+    {
+        auto flushed{Flush(bucket)};
+        if (!flushed) return flushed;
+        const auto count{m_buckets[bucket].written};
+        std::array<Edge, 1024> records;
+        for (uint64_t first{0}; first < count; first += records.size()) {
+            auto part{std::span{records}.first(static_cast<std::size_t>(
+                std::min<uint64_t>(records.size(), count - first)))};
+            auto read{PreadAll(m_file.Get(), std::as_writable_bytes(part),
+                Offset(bucket, first))};
+            if (!read) return read;
+            for (const auto& edge : part) {
+                auto result{callback(edge)};
+                if (!result) return result;
+            }
+        }
+        return Result<void>::Ok();
+    }
+
+private:
+    struct Bucket {
+        uint64_t written{0};
+        std::vector<Edge> buffer;
+    };
+
+    static uint64_t Offset(std::size_t bucket, uint64_t record)
+    {
+        return (static_cast<uint64_t>(bucket) * 2 * VALIDATION_WINDOW_SLOTS +
+                record) * sizeof(Edge);
+    }
+
+    Result<void> Flush(std::size_t bucket)
+    {
+        auto& state{m_buckets[bucket]};
+        if (state.buffer.empty()) return Result<void>::Ok();
+        if (m_file.Get() < 0) {
+            auto name{(m_directory / "validation-edges.XXXXXX").string()};
+            m_file = ScopedDescriptor{::mkstemp(name.data())};
+            if (m_file.Get() < 0) {
+                return Result<void>::Err(ErrnoMessage("create forest validation scratch file"));
+            }
+            // Anonymous after creation: close, errors and process exit all
+            // reclaim it. It can never become part of the durable generation.
+            if (::unlink(name.c_str()) != 0 ||
+                ::fcntl(m_file.Get(), F_SETFD, FD_CLOEXEC) != 0) {
+                return Result<void>::Err(ErrnoMessage("prepare forest validation scratch file"));
+            }
+        }
+        auto written{PwriteAll(m_file.Get(), std::as_bytes(std::span{state.buffer}),
+            Offset(bucket, state.written))};
+        if (!written) return written;
+        state.written += state.buffer.size();
+        state.buffer.clear();
+        return Result<void>::Ok();
+    }
+
+    std::filesystem::path m_directory;
+    std::vector<Bucket> m_buckets;
+    // Share at most 32 MiB among buckets instead of issuing a tiny write for
+    // every edge. Even at the NodeId limit each bucket gets at least 32 records.
+    std::size_t m_buffer_records;
+    ScopedDescriptor m_file;
+};
 
 Result<void> SyncDirectory(const std::filesystem::path& directory)
 {
@@ -4150,49 +4368,145 @@ public:
         return Result<void>::Ok();
     }
 
-    Result<void> RebuildIndexAndValidate(
-        std::optional<uint64_t> counted_leaves = std::nullopt)
+    Result<void> RebuildIndexAndValidate(const std::filesystem::path& directory)
     {
-        uint64_t leaf_count{counted_leaves.value_or(0)};
-        if (!counted_leaves) {
-            for (uint64_t raw_id{0}; raw_id < arena.Next(); ++raw_id) {
-                if (arena.Type(static_cast<NodeId>(raw_id)) == NodeType::LEAF) {
-                    ++leaf_count;
+        ValidationEdges edges{directory, arena.Next()};
+        uint64_t leaf_count{0};
+        std::vector<NodeId> free_ids;
+        auto scanned{arena.ForEachWindow(VALIDATION_WINDOW_SLOTS,
+            [&](NodeId first, std::span<const NodeRecord> records) -> Result<void> {
+                const uint64_t end{static_cast<uint64_t>(first) + records.size()};
+                for (const NodeId root : roots) {
+                    if (root == NO_NODE) continue;
+                    if (root >= arena.Next()) {
+                        return Result<void>::Err("online forest has an invalid root");
+                    }
+                    if (root >= first && root < end &&
+                        (records[root - first].type == NodeType::FREE ||
+                         records[root - first].parent != NO_NODE)) {
+                        return Result<void>::Err("online forest has an invalid root");
+                    }
                 }
+                for (std::size_t offset{0}; offset < records.size(); ++offset) {
+                    const NodeId id{static_cast<NodeId>(first + offset)};
+                    const auto& record{records[offset]};
+                    if (record.type == NodeType::FREE) {
+                        free_ids.push_back(id);
+                        continue;
+                    }
+                    if (record.type == NodeType::LEAF) {
+                        if (record.left != NO_NODE || record.right != NO_NODE) {
+                            return Result<void>::Err("online leaf has children");
+                        }
+                        ++leaf_count;
+                    } else if (record.type == NodeType::BRANCH) {
+                        if (record.left >= arena.Next() || record.right >= arena.Next() ||
+                            record.left == record.right) {
+                            return Result<void>::Err("online branch has a missing or repeated child");
+                        }
+                    } else {
+                        return Result<void>::Err("online node has an invalid type");
+                    }
+                    if (record.parent == NO_NODE) {
+                        if (std::ranges::find(roots, id) == roots.end()) {
+                            return Result<void>::Err("online forest has an unlisted root");
+                        }
+                    } else {
+                        if (record.parent >= arena.Next() || record.parent == id) {
+                            return Result<void>::Err("online node has an invalid parent");
+                        }
+                        if (record.parent < first || record.parent >= end) {
+                            auto appended{edges.Append({record.hash, id, record.parent})};
+                            if (!appended) return appended;
+                        } else {
+                            const auto& parent{records[record.parent - first]};
+                            if (parent.type != NodeType::BRANCH ||
+                                (parent.left != id && parent.right != id)) {
+                                return Result<void>::Err("online branch child has an inconsistent parent");
+                            }
+                        }
+                    }
+                }
+                return Result<void>::Ok();
+            })};
+        if (!scanned) return scanned;
+        // The empty forest has no windows in which to check its roots.
+        for (const NodeId root : roots) {
+            if (root != NO_NODE && root >= arena.Next()) {
+                return Result<void>::Err("online forest has an invalid root");
             }
         }
+        auto bookkeeping{arena.LoadBookkeeping(static_cast<NodeId>(arena.Next()),
+                                               std::move(free_ids))};
+        if (!bookkeeping) return bookkeeping;
         const uint64_t required{std::max<uint64_t>(16, (leaf_count * 10 + 7) / 8)};
         if (required > std::numeric_limits<std::size_t>::max()) {
             return Result<void>::Err("online leaf index exceeds addressable memory");
         }
         index.Clear(static_cast<std::size_t>(required));
-        for (uint64_t raw_id{0}; raw_id < arena.Next(); ++raw_id) {
-            const NodeId id{static_cast<NodeId>(raw_id)};
-            const NodeType type{arena.Type(id)};
-            if (type == NodeType::LEAF) {
-                if (arena.Left(id) != NO_NODE || arena.Right(id) != NO_NODE) {
-                    return Result<void>::Err("online leaf has children");
+        std::vector<Hash256> pending;
+        std::vector<uint8_t> seen;
+        auto validated{arena.ForEachWindow(VALIDATION_WINDOW_SLOTS,
+            [&](NodeId first, std::span<const NodeRecord> records) -> Result<void> {
+                const uint64_t end{static_cast<uint64_t>(first) + records.size()};
+                pending.resize(records.size());
+                seen.assign(records.size(), 0);
+                const auto child = [&](NodeId parent_id, NodeId child_id,
+                                       const Hash256& hash) -> Result<void> {
+                    if (parent_id < first || parent_id >= end) {
+                        return Result<void>::Err("forest validation scratch parent is out of range");
+                    }
+                    const auto offset{parent_id - first};
+                    const auto& parent{records[offset]};
+                    const uint8_t side{static_cast<uint8_t>(
+                        parent.left == child_id ? 1 : parent.right == child_id ? 2 : 0)};
+                    if (parent.type != NodeType::BRANCH || side == 0 ||
+                        (seen[offset] & side) != 0) {
+                        return Result<void>::Err("online branch child has an inconsistent parent");
+                    }
+                    if (seen[offset] == 0) {
+                        pending[offset] = hash;
+                    } else {
+                        const auto combined{side == 1 ? ParentHash(hash, pending[offset]) :
+                                                       ParentHash(pending[offset], hash)};
+                        if (combined != parent.hash) {
+                            return Result<void>::Err("online branch hash does not match its children");
+                        }
+                    }
+                    seen[offset] |= side;
+                    return Result<void>::Ok();
+                };
+                for (std::size_t offset{0}; offset < records.size(); ++offset) {
+                    const NodeId id{static_cast<NodeId>(first + offset)};
+                    const auto& record{records[offset]};
+                    if (record.type == NodeType::LEAF) index.Insert(record.hash, id);
+                    if (record.type != NodeType::BRANCH) continue;
+                    for (const NodeId child_id : {record.left, record.right}) {
+                        if (child_id < first || child_id >= end) continue;
+                        const auto& descendant{records[child_id - first]};
+                        if (descendant.type == NodeType::FREE) {
+                            return Result<void>::Err("online branch has a missing child");
+                        }
+                        if (descendant.parent != id) {
+                            return Result<void>::Err("online branch child has an inconsistent parent");
+                        }
+                        auto checked{child(id, child_id, descendant.hash)};
+                        if (!checked) return checked;
+                    }
                 }
-                index.Insert(arena.Hash(id), id);
-            } else if (type == NodeType::BRANCH) {
-                const NodeId left{arena.Left(id)};
-                const NodeId right{arena.Right(id)};
-                if (left == NO_NODE || right == NO_NODE || !arena.Live(left) || !arena.Live(right)) {
-                    return Result<void>::Err("online branch has a missing child");
+                auto read{edges.Read(first / VALIDATION_WINDOW_SLOTS,
+                    [&](const ValidationEdges::Edge& edge) {
+                        return child(edge.parent, edge.child, edge.hash);
+                    })};
+                if (!read) return read;
+                for (std::size_t offset{0}; offset < records.size(); ++offset) {
+                    if (records[offset].type == NodeType::BRANCH && seen[offset] != 3) {
+                        return Result<void>::Err("online branch has a missing child or inconsistent parent");
+                    }
                 }
-                if (arena.Parent(left) != id || arena.Parent(right) != id) {
-                    return Result<void>::Err("online branch child has an inconsistent parent");
-                }
-                if (ParentHash(arena.Hash(left), arena.Hash(right)) != arena.Hash(id)) {
-                    return Result<void>::Err("online branch hash does not match its children");
-                }
-            }
-        }
-        for (const NodeId root : roots) {
-            if (root != NO_NODE && (root >= arena.Next() || !arena.Live(root) || arena.Parent(root) != NO_NODE)) {
-                return Result<void>::Err("online forest has an invalid root");
-            }
-        }
+                return Result<void>::Ok();
+            })};
+        if (!validated) return validated;
         if (leaf_count != index.Size()) return Result<void>::Err("online leaf index reconstruction failed");
         return Result<void>::Ok();
     }
@@ -4520,14 +4834,14 @@ Result<void> PackedForest::ModifyBlock(std::span<const Hash256> additions,
         m_impl->arena.RollbackTransaction();
         m_impl->roots = transaction.before_roots;
         m_impl->num_leaves = transaction.before_num_leaves;
-        static_cast<void>(m_impl->RebuildIndexAndValidate());
+        static_cast<void>(m_impl->RebuildIndexAndValidate(m_impl->online->Directory()));
         throw;
     }
     if (!modified) {
         m_impl->arena.RollbackTransaction();
         m_impl->roots = transaction.before_roots;
         m_impl->num_leaves = transaction.before_num_leaves;
-        auto rebuilt{m_impl->RebuildIndexAndValidate()};
+        auto rebuilt{m_impl->RebuildIndexAndValidate(m_impl->online->Directory())};
         if (!rebuilt) return Result<void>::Err(modified.Error() + "; rollback failed: " + rebuilt.Error());
         return modified;
     }
@@ -4545,14 +4859,14 @@ Result<void> PackedForest::ModifyBlock(std::span<const Hash256> additions,
         m_impl->arena.RollbackTransaction();
         m_impl->roots = transaction.before_roots;
         m_impl->num_leaves = transaction.before_num_leaves;
-        static_cast<void>(m_impl->RebuildIndexAndValidate());
+        static_cast<void>(m_impl->RebuildIndexAndValidate(m_impl->online->Directory()));
         throw;
     }
     if (!appended) {
         m_impl->arena.RollbackTransaction();
         m_impl->roots = transaction.before_roots;
         m_impl->num_leaves = transaction.before_num_leaves;
-        auto rebuilt{m_impl->RebuildIndexAndValidate()};
+        auto rebuilt{m_impl->RebuildIndexAndValidate(m_impl->online->Directory())};
         if (!rebuilt) return Result<void>::Err(appended.Error() + "; rollback failed: " + rebuilt.Error());
         return appended;
     }
@@ -4909,19 +5223,13 @@ Result<PackedForest> PackedForest::OpenOnline(const std::filesystem::path& direc
     bool cache_base_anchored{
         cache_hit && cache_loaded.Value().base_anchored};
     if (!cache_hit) {
-        auto bookkeeping{
-            forest.m_impl->arena.RebuildBookkeepingAndCountLeaves()};
-        if (!bookkeeping) {
-            return Result<PackedForest>::Err(bookkeeping.Error());
-        }
+        auto rebuilt{forest.m_impl->RebuildIndexAndValidate(directory)};
+        if (!rebuilt) return Result<PackedForest>::Err(rebuilt.Error());
         if (online->CurrentLsn() == online->BaseLsn() &&
             forest.m_impl->arena.LiveCount() != online->DurableLiveNodes()) {
             return Result<PackedForest>::Err(
                 "online arena live-node count does not match its durable state");
         }
-        auto rebuilt{forest.m_impl->RebuildIndexAndValidate(
-            bookkeeping.Value())};
-        if (!rebuilt) return Result<PackedForest>::Err(rebuilt.Error());
         full_scan = true;
 
         // A cache is derived state. Failure to publish it must not make an
@@ -5063,7 +5371,7 @@ Result<ChainPoint> PackedForest::RollbackOnlineBlock()
         m_impl->arena.RollbackTransaction();
         m_impl->roots = rollback.before_roots;
         m_impl->num_leaves = rollback.before_num_leaves;
-        auto rebuilt{m_impl->RebuildIndexAndValidate()};
+        auto rebuilt{m_impl->RebuildIndexAndValidate(m_impl->online->Directory())};
         if (!rebuilt) {
             return Result<ChainPoint>::Err(applied.Error() + "; rollback recovery failed: " + rebuilt.Error());
         }
@@ -5449,13 +5757,13 @@ Result<PackedForest> ReadForestOnline(std::istream& input,
     forest.m_impl->roots = roots;
     forest.m_impl->num_leaves = leaves;
     auto mapped{forest.m_impl->arena.OpenMapped(hashes_path, meta_path, capacity,
-                                                static_cast<NodeId>(slots))};
+                                                static_cast<NodeId>(slots), false)};
     if (!mapped) return fail(mapped.Error());
+    auto rebuilt{forest.m_impl->RebuildIndexAndValidate(temporary)};
+    if (!rebuilt) return fail(rebuilt.Error());
     if (forest.m_impl->arena.LiveCount() != live_nodes) {
         return fail("online arena live-node count does not match its superblock");
     }
-    auto rebuilt{forest.m_impl->RebuildIndexAndValidate()};
-    if (!rebuilt) return fail(rebuilt.Error());
     auto cache_written{WriteValidatedStartupCache(
         temporary, state,
         ValidationAnchor{

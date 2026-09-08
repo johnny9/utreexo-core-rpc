@@ -4,15 +4,19 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <sstream>
 #include <string>
+#include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -189,6 +193,155 @@ struct TestDelta {
 TEST(online_forest_defaults_to_wal_free_overlay)
 {
     CHECK(!OnlineForestConfig{}.sync_wal);
+}
+
+TEST(online_forest_full_validation_handles_scattered_nodes_and_corruption)
+{
+    const auto path{OnlinePath("scattered-validation")};
+    Cleanup(path);
+    const ChainPoint genesis{0, OnlineHash64(900'000)};
+    std::vector<Hash256> chain{genesis.block_hash};
+    std::vector<Hash256> live;
+    for (uint64_t i{0}; i < 150'000; ++i) live.push_back(OnlineHash64(i));
+    PackedForest reference;
+    CHECK(reference.Modify(live, {}));
+    const std::vector<Hash256> removed{live.begin(), live.begin() + 1000};
+    CHECK(reference.Modify({}, removed));
+    live.erase(live.begin(), live.begin() + 1000);
+
+    // Permute every ID, including free slots and roots, so links routinely
+    // cross validation windows in both directions. This is a valid forest
+    // independent of its physical layout, not a fixture tailored to tree order.
+    std::ostringstream output;
+    CHECK(WriteForest(output, reference));
+    const auto original{output.str()};
+    auto scattered{original};
+    constexpr std::size_t HEADER{8 + 4 + 8 + 8 + 64 * 4};
+    constexpr std::size_t RECORD{45};
+    const auto slots{static_cast<NodeId>((original.size() - HEADER) / RECORD)};
+    CHECK(slots > 256 * 1024U);
+    std::vector<NodeId> permutation(slots);
+    std::iota(permutation.begin(), permutation.end(), 0);
+    std::mt19937 random{91277};
+    std::shuffle(permutation.begin(), permutation.end(), random);
+    const auto read_id = [](const std::string& bytes, std::size_t offset) {
+        NodeId id{0};
+        for (std::size_t i{0}; i < 4; ++i) {
+            id |= static_cast<NodeId>(static_cast<unsigned char>(bytes[offset + i])) << (i * 8);
+        }
+        return id;
+    };
+    const auto write_id = [](std::string& bytes, std::size_t offset, NodeId id) {
+        for (std::size_t i{0}; i < 4; ++i) bytes[offset + i] = static_cast<char>(id >> (i * 8));
+    };
+    const auto remap = [&](NodeId id) { return id == NO_NODE ? NO_NODE : permutation[id]; };
+    for (std::size_t i{0}; i < 64; ++i) {
+        write_id(scattered, 28 + i * 4, remap(read_id(original, 28 + i * 4)));
+    }
+    for (NodeId id{0}; id < slots; ++id) {
+        const auto source{HEADER + id * RECORD};
+        const auto destination{HEADER + permutation[id] * RECORD};
+        scattered.replace(destination, RECORD, original, source, RECORD);
+        for (std::size_t link{33}; link < RECORD; link += 4) {
+            write_id(scattered, destination + link, remap(read_id(original, source + link)));
+        }
+    }
+    const OnlineForestConfig config{.max_dirty_bytes = 8 * 1024 * 1024,
+        .wal_segment_bytes = 1024 * 1024, .undo_depth = 8, .sync_wal = true};
+    {
+        std::istringstream input{scattered};
+        auto imported{ReadForestOnline(input, path, genesis, chain, config)};
+        CHECK(imported);
+        CheckEquivalent(reference, imported.Value(), live);
+    }
+
+    NodeId remote_leaf{NO_NODE};
+    NodeId remote_parent{NO_NODE};
+    NodeId local_leaf{NO_NODE};
+    for (NodeId id{0}; id < slots; ++id) {
+        const auto offset{HEADER + id * RECORD};
+        const auto parent{read_id(scattered, offset + 33)};
+        if (scattered[offset] == 1 && parent != NO_NODE &&
+            id / (256 * 1024U) != parent / (256 * 1024U)) {
+            remote_leaf = id;
+            remote_parent = parent;
+        } else if (scattered[offset] == 1 && parent != NO_NODE) {
+            local_leaf = id;
+        }
+        if (remote_leaf != NO_NODE && local_leaf != NO_NODE) break;
+    }
+    CHECK(remote_leaf != NO_NODE);
+    CHECK(local_leaf != NO_NODE);
+    CHECK(std::filesystem::remove(ValidatedCachePath(path)));
+    // Corrupt a remote child's hash, reciprocal link, type, and the parent's
+    // child ID. None may be accepted or produce a validated cache.
+    const std::array<std::pair<std::filesystem::path, std::streamoff>, 6> corruptions{{
+        {path / "forest.hashes", static_cast<std::streamoff>(remote_leaf) * 32},
+        {path / "forest.meta", static_cast<std::streamoff>(remote_leaf) * 16},
+        {path / "forest.meta", static_cast<std::streamoff>(remote_leaf) * 16 + 12},
+        {path / "forest.meta", static_cast<std::streamoff>(remote_parent) * 16 + 4},
+        {path / "forest.hashes", static_cast<std::streamoff>(local_leaf) * 32},
+        {path / "forest.meta", static_cast<std::streamoff>(local_leaf) * 16 + 4},
+    }};
+    for (const auto& [file, offset] : corruptions) {
+        FlipByte(file, offset);
+        std::vector<Hash256> recovered_chain;
+        ChainPoint recovered_point;
+        auto corrupt{PackedForest::OpenOnline(path, recovered_chain, recovered_point, config)};
+        CHECK(!corrupt);
+        CHECK(!std::filesystem::exists(ValidatedCachePath(path)));
+        FlipByte(file, offset);
+        for (const auto& entry : std::filesystem::directory_iterator(path)) {
+            CHECK(!entry.path().filename().string().starts_with("validation-edges."));
+        }
+    }
+    // A scratch-write failure must fail closed, remove temporary state, and
+    // leave the original generation usable on the next open.
+    const pid_t child{::fork()};
+    CHECK(child >= 0);
+    if (child == 0) {
+        ::signal(SIGXFSZ, SIG_IGN);
+        const rlimit limit{1024 * 1024, 1024 * 1024};
+        if (::setrlimit(RLIMIT_FSIZE, &limit) != 0) ::_exit(2);
+        std::vector<Hash256> recovered_chain;
+        ChainPoint recovered_point;
+        auto limited{PackedForest::OpenOnline(path, recovered_chain, recovered_point, config)};
+        ::_exit(!limited && limited.Error().find("write online-state range") !=
+            std::string::npos ? 0 : 3);
+    }
+    int child_status{0};
+    CHECK_EQ(::waitpid(child, &child_status, 0), child);
+    CHECK(WIFEXITED(child_status));
+    CHECK_EQ(WEXITSTATUS(child_status), 0);
+    CHECK(!std::filesystem::exists(ValidatedCachePath(path)));
+    for (const auto& entry : std::filesystem::directory_iterator(path)) {
+        CHECK(!entry.path().filename().string().starts_with("validation-edges."));
+    }
+    {
+        auto online{ReopenOnline(path, chain, genesis, config)};
+        CHECK(online.OnlineUsage().startup_full_scan);
+        CheckEquivalent(reference, online, live);
+        // Overlapping sealed runs followed by newer WAL changes must override
+        // the scattered base and each other in exactly the same order.
+        for (uint32_t height{1}; height <= 3; ++height) {
+            const std::array<Hash256, 1> deletion{live.back()};
+            const std::array<Hash256, 1> addition{OnlineHash64(910'000 + height)};
+            const ChainPoint point{height, OnlineHash64(920'000 + height)};
+            CHECK(online.ModifyBlock(addition, deletion, point));
+            CHECK(reference.Modify(addition, deletion));
+            live.back() = addition[0];
+            chain.push_back(point.block_hash);
+            if (height != 3) CHECK(online.FlushOnline());
+        }
+    }
+    CHECK_EQ(DeltaPaths(path).size(), 2U);
+    CHECK(std::filesystem::remove(ValidatedCachePath(path)));
+    {
+        auto online{ReopenOnline(path, chain, ChainPoint{3, chain.back()}, config)};
+        CHECK(online.OnlineUsage().startup_full_scan);
+        CheckEquivalent(reference, online, live);
+    }
+    Cleanup(path);
 }
 
 TEST(online_forest_reuses_validated_startup_cache_and_replays_newer_state)

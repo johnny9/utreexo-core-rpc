@@ -80,7 +80,7 @@ struct OnlineForestUsage {
     uint64_t startup_validation_us{0};
     /** The validated cache replaced a full arena scan on this open. */
     bool startup_cache_hit{false};
-    /** This open performed the legacy whole-forest validation path. */
+    /** This open performed bounded, sequential whole-forest validation. */
     bool startup_full_scan{false};
     uint64_t dirty_nodes{0};
     uint64_t dirty_bytes{0};

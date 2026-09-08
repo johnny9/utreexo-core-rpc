@@ -315,6 +315,38 @@ from its base, forest roots, allocator state, and a commit checksum. Do not copy
 directory as a shared checkpoint; use the preserved format-3 checkpoint until an
 explicit online export command is added.
 
+When the validation cache cannot be used, full validation makes two buffered,
+sequential passes over the recovered forest. It checks child hashes and reciprocal
+parent links in windows of 262,144 slots, merging the base, immutable deltas, and
+newer WAL overrides in order. The window needs about 21 MiB, with at most another
+32 MiB of spill buffers and about 7 MiB of delta cursors at the maximum run count.
+Delta checksums also use buffered reads. Validation does not need to keep the
+mapped base or entire delta files resident in RAM. The normal leaf index, free-node
+bookkeeping, delta lookup indexes, and recovered WAL overlay still require memory.
+
+Links crossing windows use an anonymous temporary file on the online-state
+filesystem: 40 bytes per crossing child, plus filesystem block overhead. The file
+is sparse, so its logical length can be larger than the space used. Its blocks are
+released when validation finishes or the process exits. Keep this directory on
+disk, with room for scratch data; a scratch I/O failure rejects the open without
+publishing a validation cache. No storage-format change or reimport is required.
+
+To measure validation, make an isolated copy of a **stopped** online directory,
+remove `validated-state.cache` from that copy, and run:
+
+```sh
+./build/utreexo-forest-validation-benchmark /disk/online-state-copy
+```
+
+The command reports the recovered roots, elapsed time, cache/full-scan status,
+index size, and Linux peak resident memory and filesystem I/O. It may write a new
+validation cache in the copy. Run again to measure cached startup. A process memory
+limit should include the normal leaf index and filesystem cache as well as the
+validation buffers.
+
+See [saved-forest validation measurements](doc/forest-validation.md) for the
+mainnet comparison under a 3 GiB memory limit.
+
 Run `utreexo-online-storage-benchmark` to measure update, seal, cached reopen, proof
 lookup, logical delta bytes, and Linux process write bytes. It reports startup-cache
 bytes, replayed records, and validation time; compaction amplification relative to the
