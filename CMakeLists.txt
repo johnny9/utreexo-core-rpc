@@ -215,6 +215,13 @@ if(BUILD_TESTING)
     utreexo_configure_target(utreexo_tests)
     add_test(NAME utreexo_tests COMMAND utreexo_tests)
 
+    find_package(Python3 3.10 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME export_assumeutreexo_tests
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/export_assumeutreexo_tests.py)
+        set_tests_properties(export_assumeutreexo_tests PROPERTIES TIMEOUT 30)
+    endif()
+
     add_test(NAME mainnet_rebuild_validate_tests
         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/mainnet_rebuild_validate_tests.sh)
     set_tests_properties(mainnet_rebuild_validate_tests PROPERTIES
@@ -265,6 +272,8 @@ endif()
 
 install(TARGETS utreexo-checkpoint-compact
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(PROGRAMS tools/export-assumeutreexo.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME utreexo-export-assumeutreexo)
 if(UTREEXO_BUILD_BENCHMARKS)
     install(TARGETS utreexo-resource-estimate utreexo-online-storage-benchmark
         utreexo-forest-validation-benchmark
@@ -294,6 +303,7 @@ install(FILES doc/tor.md
 install(FILES doc/transaction-proof-codec.md doc/core-backed-transaction-proof-relay-plan.md
     doc/core-backed-transaction-proof-relay.md
     doc/forest-validation.md
+    doc/assumeutreexo-snapshots.md
     DESTINATION ${CMAKE_INSTALL_DOCDIR}/doc)
 install(FILES contrib/utreexod-v0.6.0-core-relay.patch
     DESTINATION ${CMAKE_INSTALL_DOCDIR}/contrib)

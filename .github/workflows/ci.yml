@@ -120,6 +120,8 @@ jobs:
         run: python3 tools/verify-checkpoint-manifest.py
       - name: Test release checkpoint download verifier
         run: python3 test/verify_checkpoint_download_tests.py
+      - name: Test AssumeUtreexo snapshot exporter
+        run: python3 test/export_assumeutreexo_tests.py
       - name: Check whitespace
         run: git diff --check
 
@@ -214,7 +216,7 @@ jobs:
         run: |
           git apply --check --whitespace=error-all "${GITHUB_WORKSPACE}/contrib/utreexod-v0.6.0-core-relay.patch"
           git apply "${GITHUB_WORKSPACE}/contrib/utreexod-v0.6.0-core-relay.patch"
-          go test -mod=readonly . ./netsync ./mining ./mempool ./wire
+          go test -mod=readonly . ./blockchain ./netsync ./mining ./mempool ./wire
           go build -mod=readonly -o "${GITHUB_WORKSPACE}/build/utreexod-relay" .
       - name: Install verified Bitcoin Core 31.1
         working-directory: ${{ runner.temp }}
@@ -248,9 +250,22 @@ jobs:
           --utreexod="${GITHUB_WORKSPACE}/build/utreexod-relay"
           --work-dir="${RUNNER_TEMP}/core-utreexod-discovery"
           --timeout=180
+      - name: Verify snapshot export, compact bootstrap, and restart
+        run: >-
+          python3 test/integration/core_utreexod_snapshot.py
+          --core="${RUNNER_TEMP}/bitcoin-${CORE_VERSION}/bin/bitcoind"
+          --sidecar="${GITHUB_WORKSPACE}/build/utreexo-bridge"
+          --utreexod="${GITHUB_WORKSPACE}/build/utreexod-relay"
+          --work-dir="${RUNNER_TEMP}/core-utreexod-snapshot"
+          --timeout=180
       - name: Report integration evidence
         if: always()
         run: |
+          if test -f "${RUNNER_TEMP}/core-utreexod-snapshot/result.json"; then
+            cat "${RUNNER_TEMP}/core-utreexod-snapshot/result.json"
+          else
+            tail -n 100 "${RUNNER_TEMP}/core-utreexod-snapshot/"*.log || true
+          fi
           if test -f "${RUNNER_TEMP}/core-utreexod-relay/result.json"; then
             cat "${RUNNER_TEMP}/core-utreexod-relay/result.json"
           else

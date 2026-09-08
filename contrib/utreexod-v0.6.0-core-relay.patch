@@ -1,3 +1,463 @@
+diff --git a/assumeutreexosnapshot.go b/assumeutreexosnapshot.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6a51d830cefb65ab013bea252940c7c5e731363
+--- /dev/null
++++ b/assumeutreexosnapshot.go
+@@ -0,0 +1,174 @@
++package main
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"io"
++	"math/bits"
++	"os"
++	"time"
++
++	"github.com/utreexo/utreexo"
++	"github.com/utreexo/utreexod/chaincfg"
++	"github.com/utreexo/utreexod/chaincfg/chainhash"
++	"github.com/utreexo/utreexod/database"
++)
++
++const snapshotRootsEncoding = "sha512_256_internal_bytes_high_row_to_low_row_present_roots"
++const maxAssumeUtreexoSnapshotBytes = 16 * 1024
++
++// assumeUtreexoSnapshot is a compact, explicitly trusted bootstrap state, not a
++// UTXO dump or a full forest. Roots retain internal byte order (unlike block hashes).
++type assumeUtreexoSnapshot struct {
++	Format        string   `json:"format"`
++	Version       uint32   `json:"version"`
++	Network       string   `json:"network"`
++	GenesisHash   string   `json:"genesis_hash"`
++	Height        int32    `json:"height"`
++	BlockHash     string   `json:"block_hash"`
++	Bits          uint32   `json:"bits"`
++	BlockSize     uint64   `json:"block_size"`
++	BlockWeight   uint64   `json:"block_weight"`
++	NumTxns       uint64   `json:"num_txns"`
++	TotalTxns     uint64   `json:"total_txns"`
++	MedianTime    int64    `json:"median_time"`
++	NumLeaves     uint64   `json:"num_leaves"`
++	RootsEncoding string   `json:"roots_encoding"`
++	Roots         []string `json:"roots"`
++}
++
++func snapshotHash(value string) ([]byte, error) {
++	b, err := hex.DecodeString(value)
++	if err != nil || len(b) != 32 || hex.EncodeToString(b) != value {
++		return nil, fmt.Errorf("snapshot hashes must be 64 lowercase hexadecimal characters")
++	}
++	return b, nil
++}
++
++func loadAssumeUtreexoSnapshot(path, pin string, params *chaincfg.Params) (*chaincfg.AssumeUtreexo, error) {
++	expected, err := snapshotHash(pin)
++	if err != nil {
++		return nil, fmt.Errorf("--assumeutreexo-snapshot-sha256: %w", err)
++	}
++	f, err := os.Open(path)
++	if err != nil {
++		return nil, err
++	}
++	defer f.Close()
++	data, err := io.ReadAll(io.LimitReader(f, maxAssumeUtreexoSnapshotBytes+1))
++	if err != nil {
++		return nil, err
++	}
++	if len(data) > maxAssumeUtreexoSnapshotBytes {
++		return nil, fmt.Errorf("AssumeUtreexo snapshot exceeds 16 KiB")
++	}
++	digest := sha256.Sum256(data)
++	if !bytes.Equal(digest[:], expected) {
++		return nil, fmt.Errorf("AssumeUtreexo snapshot SHA256 does not match the supplied pin")
++	}
++	var s assumeUtreexoSnapshot
++	decoder := json.NewDecoder(bytes.NewReader(data))
++	decoder.DisallowUnknownFields()
++	if err := decoder.Decode(&s); err != nil {
++		return nil, fmt.Errorf("invalid AssumeUtreexo snapshot: %w", err)
++	}
++	if err := decoder.Decode(new(any)); err != io.EOF {
++		return nil, fmt.Errorf("AssumeUtreexo snapshot has trailing JSON data")
++	}
++	if s.Format != "utreexod-assumeutreexo" || s.Version != 1 || s.RootsEncoding != snapshotRootsEncoding {
++		return nil, fmt.Errorf("unsupported AssumeUtreexo snapshot format, version, or root encoding")
++	}
++	if s.Network != params.Name || s.GenesisHash != params.GenesisHash.String() {
++		return nil, fmt.Errorf("AssumeUtreexo snapshot belongs to a different network")
++	}
++	if _, err := snapshotHash(s.BlockHash); err != nil {
++		return nil, err
++	}
++	hash, err := chainhash.NewHashFromStr(s.BlockHash)
++	if err != nil || *hash == (chainhash.Hash{}) {
++		return nil, fmt.Errorf("invalid snapshot block hash")
++	}
++	if s.Height <= 0 || s.NumLeaves == 0 || s.NumLeaves > 1<<63 || len(s.Roots) != bits.OnesCount64(s.NumLeaves) {
++		return nil, fmt.Errorf("invalid snapshot height, leaf count, or root count")
++	}
++	for _, stump := range params.TTL.Stump {
++		if stump.NumLeaves > 0 && uint64(s.Height) < stump.NumLeaves-1 {
++			return nil, fmt.Errorf("snapshot height %d is below the committed TTL boundary %d", s.Height, stump.NumLeaves-1)
++		}
++	}
++	for _, checkpoint := range params.Checkpoints {
++		if s.Height < checkpoint.Height || (s.Height == checkpoint.Height && *hash != *checkpoint.Hash) {
++			return nil, fmt.Errorf("snapshot conflicts with checkpoint at height %d", checkpoint.Height)
++		}
++	}
++	if s.Bits == 0 || s.BlockSize < 81 || s.BlockSize > 4_000_000 ||
++		s.BlockWeight < s.BlockSize || s.BlockWeight > 4_000_000 || s.BlockWeight > 4*s.BlockSize ||
++		s.NumTxns == 0 || s.NumTxns > s.BlockSize/10 || s.TotalTxns < s.NumTxns+uint64(s.Height) || s.MedianTime <= 0 {
++		return nil, fmt.Errorf("invalid snapshot block statistics")
++	}
++	roots := make([]utreexo.Hash, len(s.Roots))
++	for i, value := range s.Roots {
++		b, err := snapshotHash(value)
++		if err != nil {
++			return nil, fmt.Errorf("snapshot root %d: %w", i, err)
++		}
++		copy(roots[i][:], b)
++	}
++	return &chaincfg.AssumeUtreexo{
++		BlockHash: hash, BlockHeight: s.Height, Bits: s.Bits,
++		BlockSize: s.BlockSize, BlockWeight: s.BlockWeight, NumTxns: s.NumTxns,
++		TotalTxns: s.TotalTxns, MedianTime: time.Unix(s.MedianTime, 0),
++		NumLeaves: s.NumLeaves, Roots: roots,
++	}, nil
++}
++
++func (c *config) loadAssumeUtreexoSnapshot(params *chaincfg.Params) error {
++	if c.AssumeUtreexoSnapshot == "" && c.AssumeUtreexoSnapshotSHA256 == "" {
++		return nil
++	}
++	if c.AssumeUtreexoSnapshot == "" || c.AssumeUtreexoSnapshotSHA256 == "" {
++		return fmt.Errorf("--assumeutreexo-snapshot and --assumeutreexo-snapshot-sha256 must be supplied together")
++	}
++	if c.NoAssumeUtreexo || c.NoUtreexo || c.DisableCheckpoints {
++		return fmt.Errorf("custom AssumeUtreexo snapshots require compact mode, AssumeUtreexo, and checkpoints enabled")
++	}
++	if c.SigNetChallenge != "" {
++		return fmt.Errorf("custom AssumeUtreexo snapshot network binding only supports standard signet")
++	}
++	// Check operator checkpoints too; the snapshot itself becomes a checkpoint
++	// so a reorganization cannot cross its trusted bootstrap boundary.
++	customParams := *params
++	customParams.Checkpoints = mergeCheckpoints(params.Checkpoints, c.addCheckpoints)
++	point, err := loadAssumeUtreexoSnapshot(cleanAndExpandPath(c.AssumeUtreexoSnapshot), c.AssumeUtreexoSnapshotSHA256, &customParams)
++	if err != nil {
++		return err
++	}
++	c.assumeUtreexoSnapshot = point
++	c.addCheckpoints = mergeCheckpoints(c.addCheckpoints, []chaincfg.Checkpoint{{Height: point.BlockHeight, Hash: point.BlockHash}})
++	return nil
++}
++
++// Pin the chosen trust anchor to this database. Import is only allowed before
++// any non-genesis block state exists; restarts must keep the same exact file pin.
++func bindAssumeUtreexoSnapshot(db database.DB, pin string, bestHeight int32) error {
++	return db.Update(func(tx database.Tx) error {
++		key := []byte("assumeutreexosnapshot-sha256")
++		stored := tx.Metadata().Get(key)
++		if stored != nil {
++			if string(stored) != pin {
++				return fmt.Errorf("database requires its original --assumeutreexo-snapshot and SHA256 pin; use a fresh data directory to change snapshots")
++			}
++			return nil
++		}
++		if pin == "" {
++			return nil
++		}
++		if bestHeight != 0 {
++			return fmt.Errorf("importing an AssumeUtreexo snapshot requires a fresh data directory")
++		}
++		return tx.Metadata().Put(key, []byte(pin))
++	})
++}
+diff --git a/assumeutreexosnapshot_test.go b/assumeutreexosnapshot_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a718987df7eb8504e6744ad102c164af4c562ec
+--- /dev/null
++++ b/assumeutreexosnapshot_test.go
+@@ -0,0 +1,182 @@
++package main
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/btcsuite/btclog"
++	"github.com/stretchr/testify/require"
++	"github.com/utreexo/utreexo"
++	"github.com/utreexo/utreexod/chaincfg"
++	"github.com/utreexo/utreexod/database"
++	"github.com/utreexo/utreexod/wire"
++)
++
++func testSnapshot() assumeUtreexoSnapshot {
++	return assumeUtreexoSnapshot{
++		Format: "utreexod-assumeutreexo", Version: 1, Network: "regtest",
++		GenesisHash: chaincfg.RegressionNetParams.GenesisHash.String(),
++		Height:      120, BlockHash: strings.Repeat("12", 32), Bits: 0x207fffff,
++		BlockSize: 200, BlockWeight: 800, NumTxns: 1, TotalTxns: 121,
++		MedianTime: 1_700_000_000, NumLeaves: 3, RootsEncoding: snapshotRootsEncoding,
++		Roots: []string{strings.Repeat("01", 32), strings.Repeat("02", 32)},
++	}
++}
++
++func writeTestSnapshot(t *testing.T, raw []byte) (string, string) {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "snapshot.json")
++	require.NoError(t, os.WriteFile(path, raw, 0600))
++	digest := sha256.Sum256(raw)
++	return path, hex.EncodeToString(digest[:])
++}
++
++func TestLoadAssumeUtreexoSnapshot(t *testing.T) {
++	for _, name := range []string{"valid", "network", "genesis", "height", "zero leaves", "large leaves",
++		"root count", "root encoding", "root hex", "block hash", "bits", "weight", "transactions",
++		"median time", "format", "version", "TTL", "checkpoint", "checkpoint hash", "pin", "unknown field", "trailing", "oversized"} {
++		t.Run(name, func(t *testing.T) {
++			s := testSnapshot()
++			params := chaincfg.RegressionNetParams
++			switch name {
++			case "network":
++				s.Network = "mainnet"
++			case "genesis":
++				s.GenesisHash = strings.Repeat("00", 32)
++			case "height":
++				s.Height = 0
++			case "zero leaves":
++				s.NumLeaves = 0
++			case "large leaves":
++				s.NumLeaves = 1<<63 + 1
++			case "root count":
++				s.Roots = s.Roots[:1]
++			case "root encoding":
++				s.RootsEncoding = "bitcoin_hex"
++			case "root hex":
++				s.Roots[0] = "ab"
++			case "block hash":
++				s.BlockHash = "00"
++			case "bits":
++				s.Bits = 0
++			case "weight":
++				s.BlockWeight = 4_000_001
++			case "transactions":
++				s.TotalTxns = 1
++			case "median time":
++				s.MedianTime = 0
++			case "format":
++				s.Format = "sidecar-forest"
++			case "version":
++				s.Version = 2
++			case "TTL":
++				params.TTL.Stump = []utreexo.Stump{{NumLeaves: 122}}
++			case "checkpoint":
++				params.Checkpoints = []chaincfg.Checkpoint{{Height: 121, Hash: params.GenesisHash}}
++			case "checkpoint hash":
++				params.Checkpoints = []chaincfg.Checkpoint{{Height: 120, Hash: params.GenesisHash}}
++			}
++			raw, err := json.Marshal(s)
++			require.NoError(t, err)
++			switch name {
++			case "unknown field":
++				raw = append([]byte(`{"surprise":1,`), raw[1:]...)
++			case "trailing":
++				raw = append(raw, []byte(" {}")...)
++			case "oversized":
++				raw = append(raw, []byte(strings.Repeat(" ", maxAssumeUtreexoSnapshotBytes))...)
++			}
++			path, pin := writeTestSnapshot(t, raw)
++			if name == "pin" {
++				pin = strings.Repeat("00", 32)
++			}
++			point, err := loadAssumeUtreexoSnapshot(path, pin, &params)
++			if name != "valid" {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++			require.Equal(t, int32(120), point.BlockHeight)
++			require.Equal(t, s.BlockHash, point.BlockHash.String())
++			require.Equal(t, uint64(3), point.NumLeaves)
++			require.Equal(t, s.Roots[0], hex.EncodeToString(point.Roots[0][:]))
++			require.Equal(t, s.Roots[1], hex.EncodeToString(point.Roots[1][:]))
++		})
++	}
++}
++
++func TestConfigureAssumeUtreexoSnapshot(t *testing.T) {
++	raw, err := json.Marshal(testSnapshot())
++	require.NoError(t, err)
++	path, pin := writeTestSnapshot(t, raw)
++	for _, name := range []string{"valid", "no path", "no pin", "no assume", "no compact", "no checkpoints", "custom checkpoint", "custom signet"} {
++		t.Run(name, func(t *testing.T) {
++			c := config{AssumeUtreexoSnapshot: path, AssumeUtreexoSnapshotSHA256: pin}
++			switch name {
++			case "no path":
++				c.AssumeUtreexoSnapshot = ""
++			case "no pin":
++				c.AssumeUtreexoSnapshotSHA256 = ""
++			case "no assume":
++				c.NoAssumeUtreexo = true
++			case "no compact":
++				c.NoUtreexo = true
++			case "no checkpoints":
++				c.DisableCheckpoints = true
++			case "custom checkpoint":
++				c.addCheckpoints = []chaincfg.Checkpoint{{Height: 121, Hash: chaincfg.RegressionNetParams.GenesisHash}}
++			case "custom signet":
++				c.SigNetChallenge = "51"
++			}
++			err := c.loadAssumeUtreexoSnapshot(&chaincfg.RegressionNetParams)
++			if name != "valid" {
++				require.Error(t, err)
++				return
++			}
++			require.NoError(t, err)
++			require.Len(t, c.addCheckpoints, 1)
++			require.Equal(t, c.assumeUtreexoSnapshot.BlockHash, c.addCheckpoints[0].Hash)
++		})
++	}
++}
++
++func TestBindAssumeUtreexoSnapshot(t *testing.T) {
++	db, err := database.Create("ffldb", filepath.Join(t.TempDir(), "blocks"), wire.TestNet)
++	require.NoError(t, err)
++	t.Cleanup(func() { require.NoError(t, db.Close()) })
++	pin := strings.Repeat("12", 32)
++	require.NoError(t, bindAssumeUtreexoSnapshot(db, "", 120))
++	require.ErrorContains(t, bindAssumeUtreexoSnapshot(db, pin, 120), "fresh data directory")
++	require.NoError(t, bindAssumeUtreexoSnapshot(db, pin, 0))
++	require.NoError(t, bindAssumeUtreexoSnapshot(db, pin, 121))
++	require.ErrorContains(t, bindAssumeUtreexoSnapshot(db, "", 121), "original")
++	require.ErrorContains(t, bindAssumeUtreexoSnapshot(db, strings.Repeat("34", 32), 121), "original")
++}
++
++func TestKeepRegressionDatabase(t *testing.T) {
++	previous := cfg
++	previousLog := btcdLog
++	btcdLog = btclog.Disabled
++	t.Cleanup(func() { cfg, btcdLog = previous, previousLog })
++	for _, scenario := range []struct{ regtest, keep bool }{{false, false}, {true, true}, {true, false}} {
++		path := filepath.Join(t.TempDir(), "blocks_ffldb")
++		require.NoError(t, os.Mkdir(path, 0700))
++		marker := filepath.Join(path, "saved-state")
++		require.NoError(t, os.WriteFile(marker, []byte("preserved"), 0600))
++		cfg = &config{RegressionTest: scenario.regtest, RegressionTestKeepDB: scenario.keep}
++		require.NoError(t, removeRegressionDB(path))
++		if scenario.regtest && !scenario.keep {
++			_, err := os.Stat(path)
++			require.True(t, os.IsNotExist(err))
++		} else {
++			contents, err := os.ReadFile(marker)
++			require.NoError(t, err)
++			require.Equal(t, "preserved", string(contents))
++		}
++	}
++}
+diff --git a/blockchain/utreexoviewpoint.go b/blockchain/utreexoviewpoint.go
+index 8b13bf7055b1add0b53b2d12b37e1ae0e6b93256..df1f5d5922a5253b32ae498d9f83df02d97e371b 100644
+--- a/blockchain/utreexoviewpoint.go
++++ b/blockchain/utreexoviewpoint.go
+@@ -1133,6 +1133,15 @@ func (b *BlockChain) FetchUtreexoViewpoint(blockHash *chainhash.Hash) (*UtreexoV
+ 		return nil, err
+ 	}
+ 
++	// The assumed block has no downloaded block/state record until the first
++	// suffix block is processed. Its authenticated roots are still available,
++	// including when the imported snapshot is already at the header tip.
++	point := b.assumeUtreexoPoint
++	if utreexoView == nil && point.BlockHash != nil && *blockHash == *point.BlockHash &&
++		b.bestChain.Tip().height >= point.BlockHeight {
++		utreexoView = NewUtreexoViewpoint()
++		utreexoView.accumulator = utreexo.NewMapPollardFromRoots(point.Roots, point.NumLeaves)
++	}
+ 	return utreexoView, nil
+ }
+ 
+diff --git a/config.go b/config.go
+index 86f830a897810a4f191f5a8d71e1feed928a9e9c..14e4b496f6af419e6329ab9b990f73d8747231c4 100644
+--- a/config.go
++++ b/config.go
+@@ -118,11 +118,12 @@ type config struct {
+ 	TraceProfile  string `long:"traceprofile" description:"Write trace profile to the specified file"`
+ 
+ 	// Network options.
+-	TestNet3        bool   `long:"testnet" description:"Use the test network"`
+-	RegressionTest  bool   `long:"regtest" description:"Use the regression test network"`
+-	SimNet          bool   `long:"simnet" description:"Use the simulation test network"`
+-	SigNet          bool   `long:"signet" description:"Use the signet test network"`
+-	SigNetChallenge string `long:"signetchallenge" description:"Connect to a custom signet network defined by this challenge instead of using the global default signet test network -- Can be specified multiple times"`
++	TestNet3             bool   `long:"testnet" description:"Use the test network"`
++	RegressionTest       bool   `long:"regtest" description:"Use the regression test network"`
++	RegressionTestKeepDB bool   `long:"regtestkeepdb" description:"Preserve the regression test database across restarts (regtest otherwise deletes it on startup)"`
++	SimNet               bool   `long:"simnet" description:"Use the simulation test network"`
++	SigNet               bool   `long:"signet" description:"Use the signet test network"`
++	SigNetChallenge      string `long:"signetchallenge" description:"Connect to a custom signet network defined by this challenge instead of using the global default signet test network -- Can be specified multiple times"`
+ 
+ 	// RPC server options and policy.
+ 	DisableTLS           bool     `long:"notls" description:"Disable TLS for the RPC server -- NOTE: This is only allowed if the RPC server is bound to localhost"`
+@@ -173,9 +174,11 @@ type config struct {
+ 	BanThreshold   uint32        `long:"banthreshold" description:"Maximum allowed ban score before disconnecting and banning misbehaving peers."`
+ 
+ 	// Chain related options.
+-	AddCheckpoints     []string `long:"addcheckpoint" description:"Add a custom checkpoint.  Format: '<height>:<hash>'"`
+-	DisableCheckpoints bool     `long:"nocheckpoints" description:"Disable built-in checkpoints.  Don't do this unless you know what you're doing."`
+-	NoAssumeUtreexo    bool     `long:"noassumeutreexo" description:"Disable starting from the assume utreexo point and start the initial block download from the genesis block"`
++	AddCheckpoints              []string `long:"addcheckpoint" description:"Add a custom checkpoint.  Format: '<height>:<hash>'"`
++	DisableCheckpoints          bool     `long:"nocheckpoints" description:"Disable built-in checkpoints.  Don't do this unless you know what you're doing."`
++	NoAssumeUtreexo             bool     `long:"noassumeutreexo" description:"Disable starting from the assume utreexo point and start the initial block download from the genesis block"`
++	AssumeUtreexoSnapshot       string   `long:"assumeutreexo-snapshot" description:"Load an explicitly trusted compact snapshot JSON file (requires its SHA256 pin and a fresh data directory)"`
++	AssumeUtreexoSnapshotSHA256 string   `long:"assumeutreexo-snapshot-sha256" description:"SHA256 of the trusted AssumeUtreexo snapshot file; retain both options on restart"`
+ 
+ 	// Relay and mempool policy.
+ 	BlocksOnly        bool    `long:"blocksonly" description:"Do not accept transactions from remote peers."`
+@@ -224,14 +227,15 @@ type config struct {
+ 	DisableElectrum      bool     `long:"disableelectrum" description:"Disable the electrum server while the --watchonlywallet flag is on"`
+ 
+ 	// Cooked options ready for use.
+-	lookup          func(string) ([]net.IP, error)
+-	oniondial       func(string, string, time.Duration) (net.Conn, error)
+-	dial            func(string, string, time.Duration) (net.Conn, error)
+-	addCheckpoints  []chaincfg.Checkpoint
+-	miningAddrs     []btcutil.Address
+-	minRelayTxFee   btcutil.Amount
+-	whitelists      []*net.IPNet
+-	extendedPubkeys map[string]string
++	lookup                func(string) ([]net.IP, error)
++	oniondial             func(string, string, time.Duration) (net.Conn, error)
++	dial                  func(string, string, time.Duration) (net.Conn, error)
++	addCheckpoints        []chaincfg.Checkpoint
++	assumeUtreexoSnapshot *chaincfg.AssumeUtreexo
++	miningAddrs           []btcutil.Address
++	minRelayTxFee         btcutil.Amount
++	whitelists            []*net.IPNet
++	extendedPubkeys       map[string]string
+ }
+ 
+ // serviceOptions defines the configuration options for the daemon as a service on
+@@ -1203,6 +1207,10 @@ func loadConfig() (*config, []string, error) {
+ 	if cfg.NoUtreexo {
+ 		cfg.NoAssumeUtreexo = true
+ 	}
++	if err := cfg.loadAssumeUtreexoSnapshot(activeNetParams.Params); err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		return nil, nil, err
++	}
+ 
+ 	// Specifying --noonion means the onion address dial function results in
+ 	// an error.
 diff --git a/mining/mining.go b/mining/mining.go
 index 08241ad09d6c7dd372060bf425cea5e5df3ec936..861dd2915966557f3747e39d410d660cf840c2ae 100644
 --- a/mining/mining.go
@@ -34,10 +494,10 @@ index 08241ad09d6c7dd372060bf425cea5e5df3ec936..861dd2915966557f3747e39d410d660c
  				tx.Hash(), err)
 diff --git a/netsync/assumeutreexo_test.go b/netsync/assumeutreexo_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..4b8d85c8035568b73ac9de98dc039a4ca789d7b7
+index 0000000000000000000000000000000000000000..b306422c4102dc028f6b233f8c40e29ff155040c
 --- /dev/null
 +++ b/netsync/assumeutreexo_test.go
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,90 @@
 +package netsync
 +
 +import (
@@ -116,6 +576,11 @@ index 0000000000000000000000000000000000000000..4b8d85c8035568b73ac9de98dc039a4c
 +			roots := chain.GetUtreexoView().GetRoots()
 +			require.Len(t, roots, 1)
 +			require.Equal(t, [32]byte(params.AssumeUtreexoPoint.Roots[0]), [32]byte(*roots[0]))
++			assumedView, err := chain.FetchUtreexoViewpoint(blocks[1].Hash())
++			require.NoError(t, err)
++			require.NotNil(t, assumedView, "assumed roots are queryable before a suffix block is stored")
++			require.Equal(t, roots, assumedView.GetRoots())
++			require.Equal(t, uint64(1), assumedView.NumLeaves())
 +			require.True(t, sm.independentProofs(), "post-checkpoint blocks use bounded independent proofs")
 +			resumed, err := New(&Config{Chain: chain, ChainParams: &params, PeerNotifier: noopPeerNotifier{}})
 +			require.NoError(t, err)
@@ -1581,7 +2046,7 @@ index 0000000000000000000000000000000000000000..6fad8e27b9a32971bcef85fed643cc96
 +	})
 +}
 diff --git a/rpcserver.go b/rpcserver.go
-index e3e2013b5bc40fccaf1e035848e991a23a071417..7a0e7efe185bc612fdaf5b0a7b82066e70addd26 100644
+index e3e2013b5bc40fccaf1e035848e991a23a071417..c7e500c98f1864d3de9c2fa2f65471bf3060ee54 100644
 --- a/rpcserver.go
 +++ b/rpcserver.go
 @@ -372,13 +372,14 @@ func rpcNoTxInfoError(txHash *chainhash.Hash) *btcjson.RPCError {
@@ -1629,7 +2094,20 @@ index e3e2013b5bc40fccaf1e035848e991a23a071417..7a0e7efe185bc612fdaf5b0a7b82066e
  		state.lastGenerated = time.Now()
  		state.lastTxUpdate = lastTxUpdate
  		state.prevHash = latestHash
-@@ -4439,6 +4441,17 @@ func handleSubmitBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
+@@ -3466,6 +3468,12 @@ func handleGetUtreexoRoots(s *rpcServer, cmd interface{}, closeChan <-chan struc
+ 					"the database. Error: %v", c.BlockHash, err),
+ 			}
+ 		}
++		if view == nil {
++			return nil, &btcjson.RPCError{
++				Code:    btcjson.ErrRPCBlockNotFound,
++				Message: "Utreexo state is unavailable for the requested block",
++			}
++		}
+ 		for _, root := range view.GetRoots() {
+ 			getReply.Roots = append(getReply.Roots, hex.EncodeToString(root[:]))
+ 		}
+@@ -4439,6 +4447,17 @@ func handleSubmitBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{})
  		}
  	}
  
@@ -1648,7 +2126,7 @@ index e3e2013b5bc40fccaf1e035848e991a23a071417..7a0e7efe185bc612fdaf5b0a7b82066e
  	// nodes.  This will in turn relay it to the network like normal.
  	_, err = s.cfg.SyncMgr.SubmitBlock(block, blockchain.BFNone)
 diff --git a/server.go b/server.go
-index 6db58e3ff57eb5218de62998af091a86af68b56b..6de3ba029abea11b39538828d332f128cab5be5c 100644
+index 6db58e3ff57eb5218de62998af091a86af68b56b..555f56a0fe70429e930f7d6dca4adcc70d6abac0 100644
 --- a/server.go
 +++ b/server.go
 @@ -22,6 +22,7 @@ import (
@@ -1724,6 +2202,42 @@ index 6db58e3ff57eb5218de62998af091a86af68b56b..6de3ba029abea11b39538828d332f128
  		}
  		// Add peers discovered through DNS to the address manager.
  		connmgr.SeedFromDNS(activeNetParams.Params, requiredServices,
+@@ -3547,6 +3533,11 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+ 	}
+ 
+ 	assumeUtreexoPoint := chainParams.AssumeUtreexoPoint
++	if cfg.assumeUtreexoSnapshot != nil {
++		assumeUtreexoPoint = *cfg.assumeUtreexoSnapshot
++		srvrLog.Warnf("Using explicitly trusted AssumeUtreexo snapshot at height %d (%s), SHA256 %s",
++			assumeUtreexoPoint.BlockHeight, assumeUtreexoPoint.BlockHash, cfg.AssumeUtreexoSnapshotSHA256)
++	}
+ 	if cfg.NoAssumeUtreexo {
+ 		assumeUtreexoPoint = chaincfg.AssumeUtreexo{}
+ 	}
+@@ -3571,6 +3562,10 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+ 		return nil, err
+ 	}
+ 
++	if err := bindAssumeUtreexoSnapshot(s.db, cfg.AssumeUtreexoSnapshotSHA256, s.chain.BestSnapshot().Height); err != nil {
++		return nil, err
++	}
++
+ 	// Search for a FeeEstimator state in the database. If none can be found
+ 	// or if it cannot be loaded, create a new one.
+ 	db.Update(func(tx database.Tx) error {
+diff --git a/utreexod.go b/utreexod.go
+index 1a6709e743fdd6bd5e8d7b52ad4c9567b970db5a..990ea51453240fb16e102c4a3bcc0e45c0d5fa0f 100644
+--- a/utreexod.go
++++ b/utreexod.go
+@@ -392,7 +392,7 @@ func btcdMain(serverChan chan<- *server) error {
+ // in regression test mode and it already exists.
+ func removeRegressionDB(dbPath string) error {
+ 	// Don't do anything if not in regression test mode.
+-	if !cfg.RegressionTest {
++	if !cfg.RegressionTest || cfg.RegressionTestKeepDB {
+ 		return nil
+ 	}
+ 
 diff --git a/wire/msgutreexoproof.go b/wire/msgutreexoproof.go
 index 4f3728377805e5de1c1674e92616c8079eb4426e..6d1e61fafb0929ac77ea136033c64130e0649eaf 100644
 --- a/wire/msgutreexoproof.go

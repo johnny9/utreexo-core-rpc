@@ -570,6 +570,11 @@ After `getblockchaininfo` reports that Floresta is active, call `addnode` for th
 block peer and the sidecar proof peer, then remove the temporary reference peer. See
 `test/integration/floresta_regtest.py` for the current JSON-RPC sequence.
 
+The [AssumeUtreexo snapshot exporter](doc/assumeutreexo-snapshots.md) creates a
+small bootstrap JSON file from a chosen proof-archive height while the sidecar
+keeps running. The bundled utreexod consumer can load it with an explicit SHA256
+pin, allowing a new compact node to start from a newer mainnet snapshot.
+
 For compact utreexod v0.6, `--core-tx-peer=IPv4:PORT` enables
 [Core-backed transaction proof relay](doc/core-backed-transaction-proof-relay.md)
 with a bounded preparation cache and the exact
