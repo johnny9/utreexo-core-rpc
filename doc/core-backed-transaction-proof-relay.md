@@ -59,7 +59,7 @@ git clone https://github.com/utreexo/utreexod utreexod-relay
 cd utreexod-relay
 git checkout --detach fe71f3d9282ef0812f7f6087f0c0df9ce0fda508
 git apply /path/to/sidecar/contrib/utreexod-v0.6.0-core-relay.patch
-go test -mod=readonly ./netsync ./mining ./mempool ./wire
+go test -mod=readonly . ./netsync ./mining ./mempool ./wire
 go build -mod=readonly -o utreexod-relay .
 ```
 
@@ -77,6 +77,16 @@ orders independently arriving block/proof pairs, and constructs mining UTXO view
 and submission proofs from verified mempool leaves. A submitted block whose
 needed transactions/proofs are unavailable fails closed. It also fixes the
 upstream sync-manager double reply on rejected RPC blocks.
+
+The bundled consumer also resumes AssumeUtreexo when headers are already beyond
+the trusted checkpoint, enables independent proofs after the committed TTL range,
+and requires the validated tip to reach the greatest-work header before mining.
+If no peer advertises historical coverage, it probes proof-only `NODE_UTREEXO`
+peers within the existing 32-pair window. Explicit limited-history ranges still
+apply. Proof deadlines track transfer progress and exclude local validation time,
+so a slow ARM64 consumer does not time out responsive providers while processing
+previously received work. The integration test covers historical restart catch-up
+and independent header reporting while proofs are stalled.
 
 The current patch also reuses the assembled template proof on `submitblock` when
 the parent and ordered non-coinbase witness transaction IDs match. Header and

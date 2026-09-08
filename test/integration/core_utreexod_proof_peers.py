@@ -147,7 +147,8 @@ def run(args):
             f"--rpc-auth={auth[0]}:{auth[1]}", f"--online-state={work / 'online'}",
             f"--proof-store={work / 'proofs'}", "--online-wal", "--follow",
             "--poll-interval-ms=100", "--memory-reserve-mib=0", "--p2p-network=regtest",
-            f"--p2p-port={sp}", f"--core-tx-peer=127.0.0.1:{cp}", "--log-level=debug"])
+            f"--p2p-port={sp}", "--p2p-bind=127.0.0.1",
+            f"--core-tx-peer=127.0.0.1:{cp}", "--log-level=debug"])
         wait("Sidecar ready", lambda: "event=p2p_listening" in sidecar.log_path.read_text())
         (work / "utreexod.conf").write_text("# Isolated regtest\n")
         common = [str(Path(args.utreexod).resolve()), "--regtest", "--noassumeutreexo", "--notls",
@@ -159,11 +160,14 @@ def run(args):
         wait("Standard v0.6 proof generator caught up", lambda: prover("getbestblockhash") == tip)
         a = ProofPeerProxy(ap, sp, mode="drop")
         processes.append(a)
-        node = launch("consumer", common + [f"--datadir={work / 'consumer'}",
+        consumer_command = common + [f"--datadir={work / 'consumer'}",
             f"--logdir={work / 'consumer-logs'}", f"--rpclisten=127.0.0.1:{ur}",
             f"--connect=127.0.0.1:{ap}",
-            f"--connect=127.0.0.1:{bp}"])
+            f"--connect=127.0.0.1:{bp}"]
+        node = launch("consumer", consumer_command)
         wait("First provider has outstanding requests", lambda: a.snapshot()["requests"])
+        syncing = consumer("getblockchaininfo")
+        assert syncing['headers'] == core('getblockcount') and syncing['blocks'] < syncing['headers']
         first_hash = a.snapshot()["requests"][0]
         # Archive-only: this connection has neither NODE_NETWORK nor NODE_UTREEXO.
         b = ProofPeerProxy(bp, pp, services=1 << 13)
@@ -214,6 +218,17 @@ def run(args):
             return any(p["addr"] == f"127.0.0.1:{bp}" and int(p["services"]) == ((1 << 12) | 8)
                        for p in consumer("getpeerinfo"))
         wait("NODE_UTREEXO-only provider connected", live_peer)
+        # A proof-only provider can retain history without claiming a complete
+        # archive. Resume behind the tip with this as the only proof source.
+        stop(node)
+        history = core("generatetoaddress", [3, payout])
+        wait("Proof generator ready for historical fallback", lambda:
+             prover("getbestblockhash") == history[-1])
+        node = launch("consumer-history-resume", consumer_command)
+        wait("Historical proofs received from NODE_UTREEXO-only provider", lambda:
+             consumer("getbestblockhash") == history[-1])
+        assert all(block_hash in b.snapshot()["served"] for block_hash in history)
+        assert consumer("getutreexoroots", [history[-1]]) == prover("getutreexoroots", [history[-1]])
         txid = wallet("sendtoaddress", [wallet("getnewaddress"), 1])
         wait("Transaction proof received from automatic provider", lambda: txid in consumer("getrawmempool"))
         tip = core("generatetoaddress", [1, payout])[0]
@@ -231,6 +246,8 @@ def run(args):
         assert roots == prover("getutreexoroots", [tip])
         assert b.snapshot()["block_requests"] == 0
         report = {"automatic_proof_peers": True, "archive_only_peer": True,
+                  "historical_proof_fallback": history,
+                  "headers_reported_while_waiting_for_proofs": True,
                   "utreexo_only_peer": True, "timeout_failover": first_hash,
                   "invalid_proof_failover": bad_hash, "disconnect_failover": disconnected_hash,
                   "standard_submitblock": True, "matching_roots": roots,
