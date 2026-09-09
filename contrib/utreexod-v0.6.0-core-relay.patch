@@ -367,7 +367,7 @@ index 0000000000000000000000000000000000000000..0a718987df7eb8504e6744ad102c164a
 +	}
 +}
 diff --git a/blockchain/utreexoviewpoint.go b/blockchain/utreexoviewpoint.go
-index 8b13bf7055b1add0b53b2d12b37e1ae0e6b93256..4ef7f65d777fa3ff26ed598a012d11dc7bd13eb8 100644
+index 8b13bf7055b1add0b53b2d12b37e1ae0e6b93256..3db16046d5da76a5c1fa9a76c3808f50a4d6dd12 100644
 --- a/blockchain/utreexoviewpoint.go
 +++ b/blockchain/utreexoviewpoint.go
 @@ -924,6 +924,18 @@ func (b *BlockChain) IsAssumeUtreexo() bool {
@@ -389,7 +389,22 @@ index 8b13bf7055b1add0b53b2d12b37e1ae0e6b93256..4ef7f65d777fa3ff26ed598a012d11dc
  	// Nothing to prove.
  	if len(txIns) == 0 {
  		return nil
-@@ -956,7 +968,11 @@ func (b *BlockChain) VerifyUData(ud *wire.UData, txIns []*wire.TxIn, remember bo
+@@ -950,13 +962,23 @@ func (b *BlockChain) VerifyUData(ud *wire.UData, txIns []*wire.TxIn, remember bo
+ 		delHashes = append(delHashes, ld.LeafHash())
+ 	}
+ 
+-	// Acquire read lock before accessing the accumulator state.
+-	b.chainLock.RLock()
+-	defer b.chainLock.RUnlock()
++	// Remembering also promotes leaves already present as proof siblings.
++	// Hold the chain write lock while updating their node metadata.
++	if remember {
++		b.chainLock.Lock()
++		defer b.chainLock.Unlock()
++	} else {
++		b.chainLock.RLock()
++		defer b.chainLock.RUnlock()
++	}
  
  	// VerifyBatchProof checks that the utreexo proofs are valid without
  	// mutating the accumulator.
@@ -402,7 +417,43 @@ index 8b13bf7055b1add0b53b2d12b37e1ae0e6b93256..4ef7f65d777fa3ff26ed598a012d11dc
  	if err != nil {
  		str := "Verify fail. All txIns-leaf datas:\n"
  		for i, txIn := range txIns {
-@@ -1133,6 +1149,15 @@ func (b *BlockChain) FetchUtreexoViewpoint(blockHash *chainhash.Hash) (*UtreexoV
+@@ -969,6 +991,18 @@ func (b *BlockChain) VerifyUData(ud *wire.UData, txIns []*wire.TxIn, remember bo
+ 	}
+ 
+ 	if remember {
++		// utreexo v0.18 skips already-expanded paths during Ingest, leaving
++		// an existing proof sibling's Remember flag false even when it is
++		// now a verified transaction input. Promote each verified target so
++		// removing its sibling cannot discard a live mempool input proof.
++		for _, hash := range delHashes {
++			node, found := b.utreexoView.accumulator.Nodes.Get(hash)
++			if !found {
++				return fmt.Errorf("verified input %s missing after proof ingestion", hash)
++			}
++			node.Remember = true
++			b.utreexoView.accumulator.Nodes.Put(hash, node)
++		}
+ 		log.Debugf("cached hashes: %v", delHashes)
+ 	}
+ 
+@@ -1053,6 +1087,16 @@ func (b *BlockChain) PruneFromAccumulator(leaves []wire.LeafData) error {
+ 	}
+ 
+ 	log.Debugf("uncaching hashes: %v", hashes)
++	// v0.18 Prune does not persist a cleared Remember flag when a sibling
++	// prevents immediate pruning. Clear it under the chain write lock first,
++	// so releasing the sibling later can reclaim both unreferenced leaves.
++	for _, hash := range hashes {
++		node, found := b.utreexoView.accumulator.Nodes.Get(hash)
++		if found {
++			node.Remember = false
++			b.utreexoView.accumulator.Nodes.Put(hash, node)
++		}
++	}
+ 
+ 	err := b.utreexoView.accumulator.Prune(hashes)
+ 	if err != nil {
+@@ -1133,6 +1177,15 @@ func (b *BlockChain) FetchUtreexoViewpoint(blockHash *chainhash.Hash) (*UtreexoV
  		return nil, err
  	}
  
@@ -417,6 +468,53 @@ index 8b13bf7055b1add0b53b2d12b37e1ae0e6b93256..4ef7f65d777fa3ff26ed598a012d11dc
 +	}
  	return utreexoView, nil
  }
+ 
+diff --git a/blockchain/utreexoviewpoint_test.go b/blockchain/utreexoviewpoint_test.go
+index b11e30fe84c8eb1108e0c0f4615fabd1491ef0bf..f090471d84ac9e323a3e3bc9115d267d8e689cf2 100644
+--- a/blockchain/utreexoviewpoint_test.go
++++ b/blockchain/utreexoviewpoint_test.go
+@@ -10,8 +10,42 @@ import (
+ 
+ 	"github.com/stretchr/testify/require"
+ 	"github.com/utreexo/utreexo"
++	"github.com/utreexo/utreexod/chaincfg"
++	"github.com/utreexo/utreexod/chaincfg/chainhash"
++	"github.com/utreexo/utreexod/wire"
+ )
+ 
++func TestRememberPreviouslyCachedProofSibling(t *testing.T) {
++	genesis := newBlockNode(&chaincfg.RegressionNetParams.GenesisBlock.Header, nil)
++	chain := &BlockChain{bestChain: newChainView(genesis), utreexoView: NewUtreexoViewpoint()}
++	leaves := []wire.LeafData{
++		{BlockHash: genesis.hash, OutPoint: wire.OutPoint{Hash: chainhash.Hash{1}}, Amount: 1000, PkScript: []byte{0x51}},
++		{BlockHash: genesis.hash, OutPoint: wire.OutPoint{Hash: chainhash.Hash{2}}, Amount: 2000, PkScript: []byte{0x51}},
++	}
++	full := utreexo.NewMapPollard(true)
++	require.NoError(t, full.Modify([]utreexo.Leaf{{Hash: leaves[0].LeafHash()}, {Hash: leaves[1].LeafHash()}}, nil, utreexo.Proof{}))
++	chain.utreexoView.accumulator = utreexo.NewMapPollardFromRoots(full.GetRoots(), full.NumLeaves)
++	chain.utreexoView.accumulator.TotalRows = full.TotalRows
++	for i, leaf := range leaves {
++		proof, err := full.Prove([]utreexo.Hash{leaf.LeafHash()})
++		require.NoError(t, err)
++		if i == 1 {
++			// Its sibling is already available from the first transaction.
++			proof.Proof = nil
++		}
++		ud := &wire.UData{LeafDatas: []wire.LeafData{leaf}, AccProof: proof}
++		require.NoError(t, chain.VerifyUData(ud, []*wire.TxIn{wire.NewTxIn(&leaf.OutPoint, nil, nil)}, true))
++	}
++	require.NoError(t, chain.PruneFromAccumulator(leaves[:1]))
++	proof, err := chain.GenerateUData(leaves[1:])
++	require.NoError(t, err, "a verified input must survive removal of its previously cached sibling")
++	require.NoError(t, full.Verify([]utreexo.Hash{leaves[1].LeafHash()}, proof.AccProof, false))
++	// Removing the final owner must still reclaim the cached pair.
++	require.NoError(t, chain.PruneFromAccumulator(leaves[1:]))
++	_, err = chain.GenerateUData(leaves[1:])
++	require.Error(t, err)
++}
++
+ func TestChainTipProofSerialize(t *testing.T) {
+ 	t.Parallel()
  
 diff --git a/config.go b/config.go
 index 86f830a897810a4f191f5a8d71e1feed928a9e9c..14e4b496f6af419e6329ab9b990f73d8747231c4 100644
@@ -663,10 +761,18 @@ index f44c55b5746a15b60fed154ecb715340a0a9030d..99578f5e1963ce96567ae99f7f4bb762
  // from the mempool also removes its cached utreexo leaf data.
  func TestRemoveTransactionCleansUtreexoData(t *testing.T) {
 diff --git a/mining/mining.go b/mining/mining.go
-index 08241ad09d6c7dd372060bf425cea5e5df3ec936..861dd2915966557f3747e39d410d660cf840c2ae 100644
+index 08241ad09d6c7dd372060bf425cea5e5df3ec936..e681b900a40180d2e1d94ff335fa5bd7d5ec62c4 100644
 --- a/mining/mining.go
 +++ b/mining/mining.go
-@@ -595,7 +595,28 @@ mempoolLoop:
+@@ -552,6 +552,7 @@ func (g *BlkTmplGenerator) NewBlockTemplate(payToAddress btcutil.Address) (*Bloc
+ 	blockTxns := make([]*btcutil.Tx, 0, len(sourceTxns))
+ 	blockTxns = append(blockTxns, coinbaseTx)
+ 	blockUtxos := blockchain.NewUtxoViewpoint()
++	blockLeaves := make(map[chainhash.Hash][]wire.LeafData)
+ 
+ 	// dependers is used to track transactions which depend on another
+ 	// transaction in the source pool.  This, in conjunction with the
+@@ -595,7 +596,32 @@ mempoolLoop:
  		// mempool since a transaction which depends on other
  		// transactions in the mempool must come after those
  		// dependencies in the final generated block.
@@ -684,6 +790,10 @@ index 08241ad09d6c7dd372060bf425cea5e5df3ec936..861dd2915966557f3747e39d410d660c
 +				err = fmt.Errorf("leaf/input count mismatch")
 +			}
 +			if err == nil {
++				// Keep the same leaf snapshot used to select this transaction.
++				// RBF can remove its pool entry while the template is assembled.
++				leaves = append([]wire.LeafData(nil), leaves...)
++				blockLeaves[*tx.Hash()] = leaves
 +				for _, leaf := range leaves {
 +					if !leaf.IsUnconfirmed() {
 +						utxos.Entries()[leaf.OutPoint] = blockchain.NewUtxoEntry(wire.NewTxOut(leaf.Amount, leaf.PkScript), leaf.Height, leaf.IsCoinBase)
@@ -696,6 +806,19 @@ index 08241ad09d6c7dd372060bf425cea5e5df3ec936..861dd2915966557f3747e39d410d660c
  		if err != nil {
  			log.Warnf("Unable to fetch utxo view for tx %s: %v",
  				tx.Hash(), err)
+@@ -936,11 +962,7 @@ mempoolLoop:
+ 				continue
+ 			}
+ 
+-			leafDatas, err := g.txSource.FetchLeafDatas(tx.Hash())
+-			if err != nil {
+-				return nil, fmt.Errorf("failed to fetch utreexo leaf "+
+-					"data for tx %s: %v", tx.Hash(), err)
+-			}
++			leafDatas := blockLeaves[*tx.Hash()]
+ 
+ 			for i := range tx.MsgTx().TxIn {
+ 				// Skip same-block spends using the inskip
 diff --git a/netsync/assumeutreexo_test.go b/netsync/assumeutreexo_test.go
 new file mode 100644
 index 0000000000000000000000000000000000000000..b306422c4102dc028f6b233f8c40e29ff155040c

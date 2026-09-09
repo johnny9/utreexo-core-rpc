@@ -104,6 +104,12 @@ references them. Fee replacement and orphan promotion no longer prune the
 surviving transaction's shared proof when the old pool entry is removed. The
 relay integration explicitly replaces a transaction and requires its replacement
 to appear in a valid compact mining template.
+The adapter promotes previously cached proof siblings to remembered inputs and
+persists cleared remember flags when releasing them. A regression verifies that
+removing one sibling preserves the surviving input's proof, then releases both
+after the last owner is gone. Template assembly retains the leaf data used for
+selection so concurrent replacement cannot remove that snapshot midway through
+assembly.
 
 The bundled consumer also resumes AssumeUtreexo when headers are already beyond
 the trusted checkpoint, enables independent proofs after the committed TTL range,
