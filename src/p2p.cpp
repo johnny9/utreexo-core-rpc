@@ -1738,7 +1738,6 @@ public:
         auto tx_announce_after{tx_repeat};
         struct AnnouncedTransaction {
             TransactionProofIdentity identity;
-            bool regenerate{true};
         };
         std::map<Hash256, AnnouncedTransaction> announced_transactions;
         auto last_input{std::chrono::steady_clock::now()};
@@ -1765,7 +1764,12 @@ public:
                 // transaction. Pace our invitations below the inbound message
                 // limit instead of disconnecting peers for answering a burst
                 // that this server itself created.
-                const bool announcement_ready{std::chrono::steady_clock::now() >= tx_announce_after};
+                // Drain queued requests before inviting more work. A slow
+                // consumer otherwise accumulates announcements that expire
+                // while earlier proof requests are still being processed.
+                pollfd pending_input{.fd = socket, .events = POLLIN, .revents = 0};
+                const bool announcement_ready{std::chrono::steady_clock::now() >= tx_announce_after &&
+                    ::poll(&pending_input, 1, 0) == 0};
                 auto entries{transactions->AnnouncementsAfter(next_cursor,
                     announcement_ready ? 64 : 0, 2048, tx_epoch)};
                 // Inventory sent during the consumer's initial block download
@@ -2127,7 +2131,7 @@ public:
                     const auto announced{announced_transactions.find(request.txid)};
                     auto entry{announced == announced_transactions.end() ? nullptr :
                         transactions->FindMatching({request.txid, announced->second.identity})};
-                    if (!entry && announced != announced_transactions.end() && announced->second.regenerate) {
+                    if (!entry && announced != announced_transactions.end()) {
                         entry = transactions->WaitFor({request.txid, announced->second.identity}, regeneration_deadline, &stopping);
                     }
                     if (stopping.load()) { failed = true; break; }
@@ -2135,6 +2139,16 @@ public:
                     // to the new accumulator, even if its positions happen to fit.
                     if (announced != announced_transactions.end() && transactions->Stats().epoch != announced->second.identity.epoch) {
                         disconnect_reason = "transaction proof anchor changed"; failed = true; break;
+                    }
+                    if (!entry && announced != announced_transactions.end()) {
+                        // v0.6 has no busy/retry response. A deadline or full
+                        // queue does not establish that a transaction is absent.
+                        // Reset outstanding announcements by reconnecting, as
+                        // for a changed anchor, rather than turning the rest of
+                        // a large request into a burst of false notfound replies.
+                        disconnect_reason = "announced transaction proof unavailable after regeneration";
+                        failed = true;
+                        break;
                     }
                     ProofWorkGuard work{*this};
                     if (!work.Acquired()) { ++proof_busy; disconnect_reason = "transaction proof server busy"; failed = true; break; }
@@ -2149,15 +2163,15 @@ public:
                     EgressReservation egress{*this, MESSAGE_HEADER_SIZE + bytes};
                     if (!egress.Acquired()) { ++egress_limited; disconnect_reason = "transaction proof egress limit"; failed = true; break; }
                     const auto current_cache{transactions->Stats()};
-                    if (entry && current_cache.ready && current_cache.epoch == entry->identity.epoch) {
+                    if (entry && (!current_cache.ready || current_cache.epoch != entry->identity.epoch)) {
+                        disconnect_reason = "transaction proof anchor changed"; failed = true; break;
+                    }
+                    if (entry) {
                         auto encoded{entry->proof.Serialize(request, config.max_payload_bytes)};
                         if (!encoded) { disconnect_reason = encoded.Error(); failed = true; break; }
                         payload = encoded.Take();
                     } else {
                         response = "notfound";
-                        // Do not repeatedly schedule a missing/stalled request.
-                        // A fresh preparation can announce this txid again.
-                        if (announced != announced_transactions.end()) announced->second.regenerate = false;
                         AppendCompactSize(payload, 1);
                         AppendLE(payload, request.inventory_type);
                         payload.insert(payload.end(), request.txid.Bytes().begin(), request.txid.Bytes().end());

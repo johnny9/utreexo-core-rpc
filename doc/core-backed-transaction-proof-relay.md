@@ -41,8 +41,8 @@ transaction from utreexod's independent mempool.
 
 Entries expire by time, count, and retained bytes. Chain mutations and metadata
 uncertainty withdraw them. Requests for previously announced preparations can
-regenerate expired or evicted proofs before responding. Unannounced or otherwise
-unavailable transaction requests return `notfound`. Because v0.6 requests carry no tip or
+regenerate expired or evicted proofs before responding. Unannounced transaction
+requests return `notfound`. Because v0.6 requests carry no tip or
 announcement identifier, a peer that received transaction inventory reconnects
 after an anchor change before the same txid can be announced at another tip.
 The compatibility patch recovers outstanding block-proof requests on reconnect.
@@ -67,10 +67,13 @@ request cannot silently select nodes from a different proof.
 The global queue holds at most 128 queued/in-progress jobs and coalesces matching
 requests. A whole `getdata` message shares a wait budget of at most five seconds
 (or the listener's configured proof-wait limit if lower), and waiting does not
-occupy a proof serialization slot. Queue exhaustion, deadline expiry and unavailable
-transactions return `notfound`; the same missing announcement does not repeatedly
-schedule work. Tip invalidation and shutdown wake waiters promptly. Forest and
-RPC work stay on the sync thread. Removed transactions are skipped, and genuine
+occupy a proof serialization slot. If an announced proof cannot be recovered,
+including queue exhaustion or deadline expiry, the provider closes the connection
+to reset outstanding inventory. The v0.6 protocol has no busy/retry response:
+a deadline does not establish that the transaction is absent, and translating
+the rest of a large request into `notfound` replies can cause a 24-hour consumer
+ban. A fresh connection can request newly announced preparations. Tip invalidation
+and shutdown wake waiters promptly. Forest and RPC work stay on the sync thread. Removed transactions are skipped, and genuine
 metadata uncertainty still invalidates the epoch.
 
 Core JSON-RPC 1.0 uses HTTP 500 for ordinary errors such as a transaction leaving
@@ -81,7 +84,8 @@ Authentication failures, malformed responses, and other metadata uncertainty
 continue to fail the operation.
 
 Transaction inventory is sent in batches of at most 64, at least one second
-apart per connection. A v0.6 consumer may answer each announcement with a
+apart per connection, and queued input is drained before more inventory is sent.
+A v0.6 consumer may answer each announcement with a
 separate `getdata`; unpaced inventory can make those legitimate replies exceed
 the listener's 256-message-per-second inbound limit. Pacing retains that limit
 and the existing byte, egress and work limits. The P2P regression receives 400
