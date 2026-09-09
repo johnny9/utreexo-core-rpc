@@ -173,6 +173,17 @@ Result<std::vector<Hash256>> TransactionRelay::RecoveryCandidates()
     return R::Ok(std::move(candidates));
 }
 
+Result<bool> TransactionRelay::PrepareById(const Hash256& txid, const ChainPoint& point)
+{
+    auto raw{m_client.Call("getrawtransaction", TxidParams(txid))};
+    if (!raw) return MissingTransaction(raw.Error()) ? Result<bool>::Ok(false) : Result<bool>::Err(raw.Error());
+    auto bytes{DecodeHex(raw.Value().get_str(), txwire::MAX_TX_PAYLOAD)};
+    if (!bytes) return Result<bool>::Err(bytes.Error());
+    auto tx{txwire::Transaction::Parse(bytes.Value())};
+    if (!tx || tx.Value().Txid() != txid) return Result<bool>::Err("invalid Core recovery transaction");
+    return Prepare(tx.Take(), point);
+}
+
 Result<void> TransactionRelay::Poll(std::vector<txwire::Transaction> incoming)
 {
     // All failures withdraw published proofs. Core can change tip or membership
@@ -185,25 +196,30 @@ Result<void> TransactionRelay::Poll(std::vector<txwire::Transaction> incoming)
         const auto epoch{m_cache->Stats().epoch};
         if (epoch != m_epoch) { m_scan_cursor = 0; m_next_recovery = {}; m_epoch = epoch; }
         m_cache->Activate(*point);
+        // Requested misses get priority over background inventory recovery.
+        // Bound each pass and return to chain synchronization between passes.
+        uint32_t regenerated{0};
+        for (; regenerated < 4; ++regenerated) {
+            const auto request{m_cache->TakeRegeneration()};
+            if (!request) break;
+            if (!m_cache->FindMatching(*request)) {
+                auto prepared{PrepareById(request->txid, *point)};
+                if (!prepared) return Result<void>::Err(prepared.Error());
+            }
+            const bool available{m_cache->CompleteRegeneration(*request)};
+            Log(LogLevel::INFO, "transaction_proof_regenerated", "txid=" + request->txid.ToBitcoinHex() +
+                " height=" + std::to_string(point->height) + " available=" + (available ? "true" : "false"));
+        }
         for (auto& tx : incoming) {
             if (m_cache->Find(tx.Txid())) continue;
             auto prepared{Prepare(std::move(tx), *point)};
             if (!prepared) return Result<void>::Err(prepared.Error());
         }
-        if (std::chrono::steady_clock::now() >= m_next_recovery) {
+        if (regenerated == 0 && std::chrono::steady_clock::now() >= m_next_recovery) {
             auto candidates{RecoveryCandidates()};
             if (!candidates) return Result<void>::Err(candidates.Error());
             for (const auto& txid : candidates.Value()) {
-                auto raw{m_client.Call("getrawtransaction", TxidParams(txid))};
-                if (!raw) {
-                    if (MissingTransaction(raw.Error())) continue;
-                    return Result<void>::Err(raw.Error());
-                }
-                auto bytes{DecodeHex(raw.Value().get_str(), txwire::MAX_TX_PAYLOAD)};
-                if (!bytes) return Result<void>::Err(bytes.Error());
-                auto tx{txwire::Transaction::Parse(bytes.Value())};
-                if (!tx || tx.Value().Txid() != txid) return Result<void>::Err("invalid Core recovery transaction");
-                auto prepared{Prepare(tx.Take(), *point)};
+                auto prepared{PrepareById(txid, *point)};
                 if (!prepared) return Result<void>::Err(prepared.Error());
             }
             // A full batch may have more inventory to recover; yield to chain

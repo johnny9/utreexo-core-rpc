@@ -27,6 +27,7 @@ public:
 private:
     Result<void> CheckTip(const ChainPoint& point);
     Result<bool> Prepare(txwire::Transaction tx, const ChainPoint& point);
+    Result<bool> PrepareById(const Hash256& txid, const ChainPoint& point);
     Result<std::vector<Hash256>> RecoveryCandidates();
     CoreRpcClient m_client;
     PackedForest& m_forest;

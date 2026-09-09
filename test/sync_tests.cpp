@@ -8,6 +8,7 @@
 #include <chrono>
 #include <filesystem>
 #include <thread>
+#include <future>
 #include <unistd.h>
 
 using namespace utreexo;
@@ -413,7 +414,8 @@ public:
             result = UniValue{UniValue::VARR};
             if (present) result.push_back(tx.Txid().ToBitcoinHex());
         } else if (method == "getrawtransaction") {
-            result = UniValue{raw};
+            if (!present) error = Json("{\"code\":-5,\"message\":\"No such mempool transaction\"}");
+            else result = UniValue{raw};
         } else {
             throw std::runtime_error{"unexpected transaction RPC: " + method};
         }
@@ -524,6 +526,44 @@ TEST(transaction_relay_regenerates_expired_proofs_and_preserves_unrelated_entrie
     CHECK(regenerated->proof.Serialize(regenerated->proof.FullRequest()));
     CHECK_EQ(observed->confirmed_lookups, 2);
     CHECK_EQ(cache->Stats().epoch, epoch);
+}
+
+TEST(transaction_relay_prioritizes_requested_proof_and_completes_missing_transactions)
+{
+    FakeBlockSource source;
+    PackedForest forest;
+    SequentialSync sync{source, forest};
+    CHECK(sync.ProcessNext());
+    CHECK(sync.ProcessNext());
+    const auto [tx, raw]{MetadataTransaction()};
+    auto cache{std::make_shared<TransactionProofCache>(TransactionCacheConfig{})};
+    auto transport{std::make_unique<TransactionMetadataTransport>(source.hashes[1], tx, raw)};
+    auto* observed{transport.get()};
+    TransactionRelay relay{CoreRpcClient{std::move(transport), 0}, forest, sync, cache,
+        TransactionRelayConfig{.recovery_interval = std::chrono::minutes(5)}};
+    CHECK(relay.Poll({tx}));
+    const auto original{cache->Find(tx.Txid())};
+    CHECK(original);
+    const TransactionRegenerationRequest request{tx.Txid(), original->identity};
+    for (const bool present : {true, false}) {
+        observed->present = present;
+        cache->Erase(tx.Txid());
+        const auto end{std::chrono::steady_clock::now() + std::chrono::seconds(3)};
+        auto waiting{std::async(std::launch::async, [&] { return cache->WaitFor(request, end); })};
+        while (cache->Stats().regeneration_pending == 0 && std::chrono::steady_clock::now() < end) std::this_thread::yield();
+        CHECK_EQ(cache->Stats().regeneration_pending, 1U);
+        // No incoming transaction and the five-minute background scan is not due.
+        CHECK(relay.Poll());
+        const auto result{waiting.get()};
+        CHECK_EQ(static_cast<bool>(result), present);
+        CHECK_EQ(cache->Stats().epoch, original->identity.epoch);
+        CHECK(cache->Stats().ready);
+        if (result) CHECK_EQ(result->proof.Serialize(result->proof.FullRequest()).Value(),
+                             original->proof.Serialize(original->proof.FullRequest()).Value());
+    }
+    CHECK_EQ(cache->Stats().regenerated, 1U);
+    CHECK_EQ(cache->Stats().regeneration_misses, 1U);
+    CHECK_EQ(cache->Stats().regeneration_pending, 0U);
 }
 
 TEST(sync_invalidates_tip_readers_before_accumulator_mutation)

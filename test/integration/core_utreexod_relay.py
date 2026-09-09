@@ -258,6 +258,7 @@ def run(args: argparse.Namespace) -> None:
             f"--proof-store={work / 'proofs'}", "--online-wal", "--follow",
             f"--state-json={work / 'sidecar-state.json'}",
             "--poll-interval-ms=100", "--memory-reserve-mib=0", "--p2p-network=regtest",
+            "--tx-cache-seconds=1",
             f"--p2p-port={sp}", f"--core-tx-peer=127.0.0.1:{cp}", "--log-level=debug"]
         sidecar = ManagedProcess("sidecar", sidecar_command, work)
         processes.append(sidecar)
@@ -324,6 +325,21 @@ def run(args: argparse.Namespace) -> None:
             expected_hashes = dict(zip(positions, full_hashes))
             assert partial_hashes == [expected_hashes[p] for p in partial_positions]
             assert probe.request(legacy, []) == (targets, [])
+            # Keep the peer's old announcement, let its preparation expire, then
+            # require the getdata response itself to regenerate at this tip.
+            # A background scan may win a particular race, so try boundedly.
+            regeneration_marker = f"event=transaction_proof_regenerated txid={legacy} "
+            log_start = sidecar.log_path.stat().st_size
+            for _ in range(4):
+                time.sleep(1.1)
+                assert probe.request(legacy, positions) == (targets, full_hashes)
+                with sidecar.log_path.open() as log:
+                    log.seek(log_start)
+                    if regeneration_marker in log.read():
+                        break
+            else:
+                raise AssertionError("no requested transaction proof regeneration observed")
+            print("Expired transaction proof regenerated for the original request", flush=True)
             # Targets advertised in inv are not acceptable proof-node requests.
             try:
                 probe.request(legacy, [targets[0]])
@@ -418,6 +434,7 @@ def run(args: argparse.Namespace) -> None:
                            "contrib/utreexod-v0.6.0-core-relay.patch"}.items():
             with path.open("rb") as stream:
                 report[name + "_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        report["requested_expired_transaction_regenerated"] = True
         (work / "result.json").write_text(json.dumps(report, indent=2) + "\n")
         print(f"PASS: {work / 'result.json'}", flush=True)
     finally:

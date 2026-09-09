@@ -1260,6 +1260,7 @@ public:
             stopping.store(true);
         }
         cache->NotifyWaiters();
+        if (transactions) transactions->NotifyWaiters();
         gossip_wakeup.notify_all();
     }
 
@@ -1735,7 +1736,11 @@ public:
         uint64_t tx_epoch{UINT64_MAX};
         auto tx_repeat{std::chrono::steady_clock::now()};
         auto tx_announce_after{tx_repeat};
-        std::map<Hash256, uint64_t> announced_transactions;
+        struct AnnouncedTransaction {
+            TransactionProofIdentity identity;
+            bool regenerate{true};
+        };
+        std::map<Hash256, AnnouncedTransaction> announced_transactions;
         auto last_input{std::chrono::steady_clock::now()};
         uint64_t messages_in_window{0};
         uint64_t inbound_bytes_remaining{config.max_inbound_bytes_per_second};
@@ -1775,7 +1780,16 @@ public:
                     if (!work.Acquired()) { disconnect_reason = "transaction announcement server busy"; break; }
                     std::vector<txwire::TransactionAnnouncement> announcements;
                     announcements.reserve(entries.size());
-                    for (auto& entry : entries) announcements.push_back(std::move(entry.announcement));
+                    bool identity_changed{false};
+                    for (auto& entry : entries) {
+                        const auto previous{announced_transactions.find(entry.announcement.txid)};
+                        if (previous != announced_transactions.end() && previous->second.identity != entry.identity) {
+                            identity_changed = true;
+                            break;
+                        }
+                        announcements.push_back(std::move(entry.announcement));
+                    }
+                    if (identity_changed) { disconnect_reason = "transaction proof identity changed"; break; }
                     auto payload{txwire::SerializeTransactionAnnouncements(announcements, config.max_payload_bytes)};
                     if (!payload) { disconnect_reason = payload.Error(); break; }
                     EgressReservation egress{*this, MESSAGE_HEADER_SIZE + payload.Value().size()};
@@ -1784,12 +1798,11 @@ public:
                         std::chrono::steady_clock::now() + std::chrono::seconds(config.idle_timeout_seconds))};
                     if (!sent) { disconnect_reason = sent.Error(); break; }
                     for (std::size_t i{0}; i < entries.size(); ++i) {
-                        // Drop records that no longer refer to a cached preparation.
-                        if (announced_transactions.size() >= transactions->MaxEntries()) {
-                            std::erase_if(announced_transactions, [&](const auto& item) { return !transactions->Find(item.first, item.second); });
-                        }
-                        if (announced_transactions.size() >= transactions->MaxEntries()) announced_transactions.erase(announced_transactions.begin());
-                        announced_transactions[announcements[i].txid] = entries[i].sequence;
+                        // Keep small identities after cache expiration so old
+                        // requests can regenerate. Bound retained peer history.
+                        if (!announced_transactions.contains(announcements[i].txid) &&
+                            announced_transactions.size() >= transactions->MaxEntries()) announced_transactions.erase(announced_transactions.begin());
+                        announced_transactions[announcements[i].txid] = AnnouncedTransaction{entries[i].identity};
                     }
                     tx_cursor = next_cursor;
                     tx_announce_after = std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -2105,12 +2118,26 @@ public:
             if (command == "getdata" && transactions) {
                 auto requests{txwire::ParseTransactionProofRequests(message.Value().payload)};
                 if (!requests) { disconnect_reason = requests.Error(); break; }
-                ProofWorkGuard work{*this};
-                if (!work.Acquired()) { ++proof_busy; disconnect_reason = "transaction proof server busy"; break; }
+                // One deadline for the entire message, not one wait per txid.
+                // Waiting does not consume a block-proof/serialization slot.
+                const auto regeneration_deadline{std::chrono::steady_clock::now() +
+                    std::chrono::seconds(std::min(config.proof_wait_seconds, uint32_t{5}))};
                 bool failed{false};
                 for (const auto& request : requests.Value()) {
                     const auto announced{announced_transactions.find(request.txid)};
-                    auto entry{announced == announced_transactions.end() ? nullptr : transactions->Find(request.txid, announced->second)};
+                    auto entry{announced == announced_transactions.end() ? nullptr :
+                        transactions->FindMatching({request.txid, announced->second.identity})};
+                    if (!entry && announced != announced_transactions.end() && announced->second.regenerate) {
+                        entry = transactions->WaitFor({request.txid, announced->second.identity}, regeneration_deadline, &stopping);
+                    }
+                    if (stopping.load()) { failed = true; break; }
+                    // A tip change while waiting must not bind the old request
+                    // to the new accumulator, even if its positions happen to fit.
+                    if (announced != announced_transactions.end() && transactions->Stats().epoch != announced->second.identity.epoch) {
+                        disconnect_reason = "transaction proof anchor changed"; failed = true; break;
+                    }
+                    ProofWorkGuard work{*this};
+                    if (!work.Acquired()) { ++proof_busy; disconnect_reason = "transaction proof server busy"; failed = true; break; }
                     std::vector<std::byte> payload;
                     std::string_view response{"utreexotx"};
                     uint64_t bytes{37}; // One ordinary notfound inventory vector.
@@ -2121,12 +2148,16 @@ public:
                     }
                     EgressReservation egress{*this, MESSAGE_HEADER_SIZE + bytes};
                     if (!egress.Acquired()) { ++egress_limited; disconnect_reason = "transaction proof egress limit"; failed = true; break; }
-                    if (entry && transactions->Find(request.txid, entry->sequence)) {
+                    const auto current_cache{transactions->Stats()};
+                    if (entry && current_cache.ready && current_cache.epoch == entry->identity.epoch) {
                         auto encoded{entry->proof.Serialize(request, config.max_payload_bytes)};
                         if (!encoded) { disconnect_reason = encoded.Error(); failed = true; break; }
                         payload = encoded.Take();
                     } else {
                         response = "notfound";
+                        // Do not repeatedly schedule a missing/stalled request.
+                        // A fresh preparation can announce this txid again.
+                        if (announced != announced_transactions.end()) announced->second.regenerate = false;
                         AppendCompactSize(payload, 1);
                         AppendLE(payload, request.inventory_type);
                         payload.insert(payload.end(), request.txid.Bytes().begin(), request.txid.Bytes().end());

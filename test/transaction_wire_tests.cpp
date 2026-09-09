@@ -4,6 +4,7 @@
 #include <utreexo/transaction_wire.h>
 #include <utreexo/transaction_cache.h>
 #include <thread>
+#include <future>
 
 #include <algorithm>
 #include <array>
@@ -254,6 +255,10 @@ TEST(transaction_codec_enforces_exact_payload_limits)
     CHECK(!prepared.Value().Serialize(request, UINT64_MAX));
     request.proof_positions.resize(1);
     CHECK(prepared.Value().Serialize(request));
+    TransactionProofCache cache{{}};
+    const ChainPoint point{1, Hash256{}};
+    cache.Activate(point);
+    CHECK(cache.Publish(point, prepared.Take()).Value());
 }
 
 TEST(transaction_inventory_packs_four_little_endian_positions)
@@ -640,4 +645,84 @@ TEST(transaction_cache_enforces_bytes_and_expiry)
     CHECK(!exact.Find(proof.Tx().Txid()));
     CHECK_EQ(exact.Stats().expired, 1U);
     CHECK_EQ(exact.Stats().bytes, 0U);
+}
+
+TEST(transaction_regeneration_coalesces_and_requires_exact_identity)
+{
+    const ChainPoint point{1, Hash256{}};
+    const auto proof{Prepare(TX_VECTORS[0])};
+    TransactionProofCache cache{{}};
+    cache.Activate(point);
+    CHECK(cache.Publish(point, proof).Value());
+    const TransactionRegenerationRequest request{proof.Tx().Txid(), cache.Find(proof.Tx().Txid())->identity};
+    cache.Erase(request.txid);
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds(3)};
+    auto first{std::async(std::launch::async, [&] { return cache.WaitFor(request, deadline); })};
+    auto second{std::async(std::launch::async, [&] { return cache.WaitFor(request, deadline); })};
+    while (cache.Stats().regeneration_coalesced == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    CHECK_EQ(cache.Stats().regeneration_queued, 1U);
+    CHECK_EQ(cache.Stats().regeneration_coalesced, 1U);
+    CHECK_EQ(cache.TakeRegeneration().value(), request);
+    CHECK(!cache.TakeRegeneration());
+    CHECK(cache.Publish(point, proof).Value());
+    CHECK(cache.CompleteRegeneration(request));
+    CHECK(first.get());
+    CHECK(second.get());
+    CHECK_EQ(cache.Stats().regeneration_pending, 0U);
+
+    // Changing even one full proof hash rejects an old zero-hash request's
+    // identity, despite keeping the same txid, targets and cache epoch.
+    const auto raw{MinimalTransaction()};
+    auto make = [&](Hash256 hash) {
+        return PreparedTransactionProof::Create(Transaction::Parse(raw).Take(),
+            Proof{{0}, {hash}}, {SIMPLE_LEAF}, 2).Take();
+    };
+    auto original{make(Hash256{})};
+    CHECK(cache.Publish(point, original).Value());
+    const TransactionRegenerationRequest changed{original.Tx().Txid(), cache.Find(original.Tx().Txid())->identity};
+    cache.Erase(changed.txid);
+    const auto end{std::chrono::steady_clock::now() + std::chrono::seconds(3)};
+    auto waiter{std::async(std::launch::async, [&] { return cache.WaitFor(changed, end); })};
+    while (cache.Stats().regeneration_pending == 0 && std::chrono::steady_clock::now() < end) std::this_thread::yield();
+    CHECK_EQ(cache.TakeRegeneration().value(), changed);
+    CHECK(cache.Publish(point, make(Hash256::FromHex(std::string(64, '1')).Value())).Value());
+    CHECK(!cache.CompleteRegeneration(changed));
+    CHECK(!waiter.get());
+    CHECK(!cache.FindMatching(changed));
+}
+
+TEST(transaction_regeneration_bounds_timeouts_invalidation_and_shutdown)
+{
+    TransactionProofCache cache{{.max_regenerations = 1}};
+    const ChainPoint point{1, Hash256{}};
+    cache.Activate(point);
+    const TransactionRegenerationRequest request{Hash256{}, {cache.Stats().epoch, Hash256{}}};
+    const auto end{std::chrono::steady_clock::now() + std::chrono::seconds(3)};
+    auto first{std::async(std::launch::async, [&] { return cache.WaitFor(request, end); })};
+    while (cache.Stats().regeneration_pending == 0 && std::chrono::steady_clock::now() < end) std::this_thread::yield();
+    auto other{request};
+    other.txid = Hash256::FromHex(std::string(64, '1')).Value();
+    CHECK(!cache.WaitFor(other, end));
+    CHECK_EQ(cache.Stats().regeneration_queued, 1U);
+    CHECK_EQ(cache.TakeRegeneration().value(), request);
+    cache.Invalidate();
+    CHECK(!first.get());
+    cache.Activate(point); // Even reactivating the same tip uses a new epoch.
+    CHECK(!cache.CompleteRegeneration(request));
+    CHECK(!cache.WaitFor(request, end));
+    CHECK_EQ(cache.Stats().regeneration_pending, 0U);
+
+    auto current{request};
+    current.identity.epoch = cache.Stats().epoch;
+    CHECK(!cache.WaitFor(current, std::chrono::steady_clock::now() + std::chrono::milliseconds(10)));
+    CHECK(!cache.TakeRegeneration());
+    CHECK_EQ(cache.Stats().regeneration_pending, 0U);
+    std::atomic<bool> cancelled{false};
+    auto stopped{std::async(std::launch::async, [&] { return cache.WaitFor(current, end, &cancelled); })};
+    while (cache.Stats().regeneration_pending == 0 && std::chrono::steady_clock::now() < end) std::this_thread::yield();
+    cancelled = true;
+    cache.NotifyWaiters();
+    CHECK(!stopped.get());
+    CHECK(!cache.TakeRegeneration());
+    CHECK_EQ(cache.Stats().regeneration_pending, 0U);
 }

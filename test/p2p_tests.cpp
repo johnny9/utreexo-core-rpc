@@ -546,6 +546,118 @@ TEST(p2p_transaction_inventory_does_not_trigger_its_own_inbound_limit)
     CHECK(WaitUntil([&] { return server->Stats().active_peers == 0; }));
 }
 
+TEST(p2p_transaction_requests_regenerate_before_notfound_and_reject_tip_changes)
+{
+    auto proofs{std::make_shared<RecentProofCache>(2, 1024 * 1024)};
+    auto transactions{std::make_shared<TransactionProofCache>(TransactionCacheConfig{
+        .lifetime = std::chrono::seconds(1),
+    })};
+    const ChainPoint point{1, Hash256{}};
+    std::vector<std::byte> raw(60, std::byte{0});
+    raw[0] = std::byte{2}; raw[4] = std::byte{1};
+    std::fill(raw.begin() + 5, raw.begin() + 37, std::byte{0xab});
+    std::fill(raw.begin() + 42, raw.begin() + 46, std::byte{0xff});
+    raw[46] = std::byte{1}; raw[47] = std::byte{1};
+    const auto prepared{txwire::PreparedTransactionProof::Create(txwire::Transaction::Parse(raw).Take(),
+        Proof{{0}, {RepeatedHash(1), RepeatedHash(2)}},
+        {CompactLeafData{2, 1000, ScriptPubkeyType::OTHER, {std::byte{0x51}}}}, 4).Take()};
+    const auto txid{prepared.Tx().Txid()};
+    transactions->Activate(point);
+    CHECK(transactions->Publish(point, prepared).Value());
+    auto started{P2PServer::Start(P2PServerConfig{
+        .network = BitcoinNetwork::REGTEST, .bind_address = "127.0.0.1", .port = 0,
+        .max_peers = 1, .idle_timeout_seconds = 10, .proof_wait_seconds = 1,
+    }, proofs, {}, transactions)};
+    if (ListenerUnavailable(started)) return;
+    CHECK(started);
+    auto server{started.Take()};
+    const int socket{Connect(server->BoundPort())};
+    struct CloseSocket { int value; ~CloseSocket() { ::close(value); } } close_socket{socket};
+    auto version{ClientVersion((uint64_t{1} << 12) | 8)};
+    version.back() = std::byte{1};
+    SendBytes(socket, EncodeP2PMessage(BitcoinNetwork::REGTEST, "version", version).Value());
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "version");
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "verack");
+    SendBytes(socket, EncodeP2PMessage(BitcoinNetwork::REGTEST, "verack", {}).Value());
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "inv");
+    auto send_request = [&](const txwire::TransactionProofRequest& request) {
+        const std::array requests{request};
+        SendBytes(socket, EncodeP2PMessage(BitcoinNetwork::REGTEST, "getdata",
+            txwire::SerializeTransactionProofRequests(requests).Value()).Value());
+    };
+    auto response = [&] {
+        auto message{ReadWireMessage(socket, BitcoinNetwork::REGTEST)};
+        while (message.command == "inv") message = ReadWireMessage(socket, BitcoinNetwork::REGTEST);
+        return message;
+    };
+    for (int mode{0}; mode < 3; ++mode) {
+        auto request{prepared.FullRequest(txwire::MSG_WITNESS_UTREEXO_TX)};
+        if (mode == 1) request.proof_positions.resize(1);
+        if (mode == 2) request.proof_positions.clear();
+        if (mode == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        else transactions->Erase(txid);
+        CHECK(!transactions->Find(txid));
+        send_request(request);
+        CHECK(WaitUntil([&] { return transactions->Stats().regeneration_pending == 1; }));
+        CHECK_EQ(server->Stats().active_proof_requests, 0U);
+        const auto job{transactions->TakeRegeneration()};
+        CHECK(job);
+        CHECK(transactions->Publish(point, prepared).Value());
+        CHECK(transactions->CompleteRegeneration(*job));
+        const auto received{response()};
+        CHECK_EQ(received.command, "utreexotx");
+        CHECK_EQ(received.payload, prepared.Serialize(request).Value());
+    }
+    transactions->Erase(txid);
+    send_request(prepared.FullRequest());
+    CHECK(WaitUntil([&] { return transactions->Stats().regeneration_pending == 1; }));
+    CHECK(!transactions->CompleteRegeneration(transactions->TakeRegeneration().value()));
+    CHECK_EQ(response().command, "notfound");
+    const auto queued{transactions->Stats().regeneration_queued};
+    send_request(prepared.FullRequest());
+    CHECK_EQ(response().command, "notfound");
+    CHECK_EQ(transactions->Stats().regeneration_queued, queued);
+    send_request({Hash256{}, txwire::MSG_UTREEXO_TX, {}});
+    CHECK_EQ(response().command, "notfound");
+    CHECK_EQ(transactions->Stats().regeneration_queued, queued);
+
+    // Two misses in one frame share one deadline. A stalled sync thread must
+    // not turn a batch into one full timeout for every requested transaction.
+    raw[37] = std::byte{1};
+    const auto second{txwire::PreparedTransactionProof::Create(txwire::Transaction::Parse(raw).Take(),
+        Proof{{1}, {RepeatedHash(1), RepeatedHash(2)}},
+        {CompactLeafData{2, 1000, ScriptPubkeyType::OTHER, {std::byte{0x51}}}}, 4).Take()};
+    CHECK(transactions->Publish(point, prepared).Value());
+    CHECK(transactions->Publish(point, second).Value());
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "inv");
+    transactions->Erase(txid);
+    transactions->Erase(second.Tx().Txid());
+    const std::array batch{prepared.FullRequest(), second.FullRequest()};
+    const auto begin{std::chrono::steady_clock::now()};
+    SendBytes(socket, EncodeP2PMessage(BitcoinNetwork::REGTEST, "getdata",
+        txwire::SerializeTransactionProofRequests(batch).Value()).Value());
+    CHECK_EQ(response().command, "notfound");
+    CHECK_EQ(response().command, "notfound");
+    CHECK(std::chrono::steady_clock::now() - begin < std::chrono::milliseconds(1900));
+    CHECK_EQ(transactions->Stats().regeneration_queued, queued + 1);
+    CHECK_EQ(transactions->Stats().regeneration_pending, 0U);
+
+    CHECK(transactions->Publish(point, prepared).Value());
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "inv");
+    transactions->Erase(txid);
+    send_request(prepared.FullRequest());
+    CHECK(WaitUntil([&] { return transactions->Stats().regeneration_pending == 1; }));
+    const auto old_job{transactions->TakeRegeneration().value()};
+    transactions->Invalidate();
+    const ChainPoint next{2, RepeatedHash(9)};
+    transactions->Activate(next);
+    CHECK(transactions->Publish(next, prepared).Value());
+    CHECK(!transactions->CompleteRegeneration(old_job));
+    CHECK(WaitUntil([&] { return server->Stats().active_peers == 0; }));
+    std::byte byte;
+    CHECK_EQ(::recv(socket, &byte, 1, 0), 0);
+}
+
 TEST(p2p_server_handshakes_and_serves_floresta_proof_request)
 {
     auto cache{std::make_shared<RecentProofCache>(8, 1024 * 1024)};
