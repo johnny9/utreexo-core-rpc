@@ -522,6 +522,26 @@ struct HttpRpcTransport::Impl {
 
     Result<std::string> Post(const std::string& body)
     {
+        auto response{PostWithAuthorization(body)};
+        if (response || config.cookie_file.empty() ||
+            !response.Error().starts_with("Bitcoin Core RPC returned HTTP 401:")) {
+            return response;
+        }
+        // Core replaces its cookie on restart. Refresh only after an explicit
+        // authentication rejection, which cannot have executed this request.
+        // Retry once, only if the credentials actually changed; permanent
+        // authentication failures must still fail closed.
+        auto cookie{ReadCookieAuthorization(config.cookie_file)};
+        if (!cookie || cookie.Value() == config.authorization) return response;
+        config.authorization = cookie.Take();
+        socket.Reset();
+        response_buffer.clear();
+        Log(LogLevel::INFO, "rpc_cookie_refreshed", "reason=http_401 action=retry_once");
+        return PostWithAuthorization(body);
+    }
+
+    Result<std::string> PostWithAuthorization(const std::string& body)
+    {
         std::ostringstream request;
         request << "POST " << config.path << " HTTP/1.1\r\n"
                 << "Host: " << config.host << ':' << config.port << "\r\n"

@@ -1243,7 +1243,8 @@ int BridgeMain(int argc, char** argv)
                 " storage_mode=ram_bootstrap risk=memory_exhaustion");
         }
     }
-    if (options.authorization.empty()) {
+    const bool cookie_authentication{options.authorization.empty()};
+    if (cookie_authentication) {
         auto cookie{utreexo::ReadCookieAuthorization(options.cookie)};
         if (!cookie) {
             utreexo::Log(utreexo::LogLevel::ERROR, "cookie_read_failed",
@@ -1258,6 +1259,7 @@ int BridgeMain(int argc, char** argv)
         .port = options.port,
         .path = "/",
         .authorization = options.authorization,
+        .cookie_file = cookie_authentication ? options.cookie : std::filesystem::path{},
     };
     utreexo::CoreRpcBlockSource source{utreexo::CoreRpcClient{
         std::make_unique<utreexo::HttpRpcTransport>(rpc_config)}};

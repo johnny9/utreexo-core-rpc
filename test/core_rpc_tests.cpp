@@ -8,7 +8,9 @@
 #include <charconv>
 #include <cerrno>
 #include <cstddef>
+#include <fstream>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -311,6 +313,95 @@ TEST(rpc_client_reuses_persistent_http_connection)
     CHECK_EQ(second.Value().getInt<int>(), 8);
     CHECK(first_request.find("Connection: keep-alive") != std::string::npos);
     CHECK_EQ(client.AggregateMetrics().calls, 2U);
+}
+
+TEST(rpc_cookie_rotation_refreshes_once_after_authentication_rejection)
+{
+    for (const std::string mode : {"rotate", "unchanged", "explicit", "missing"}) {
+        char cookie_name[]{"/tmp/utreexo-rpc-cookie-XXXXXX"};
+        const int cookie_fd{::mkstemp(cookie_name)};
+        CHECK(cookie_fd >= 0);
+        ::close(cookie_fd);
+        const std::filesystem::path cookie_path{cookie_name};
+        struct Cleanup {
+            std::filesystem::path path;
+            ~Cleanup() { std::error_code ignored; std::filesystem::remove(path, ignored); }
+        } cleanup{cookie_path};
+        { std::ofstream cookie{cookie_path}; cookie << "user:old\n"; CHECK(cookie.good()); }
+
+        const int listener{::socket(AF_INET, SOCK_STREAM, 0)};
+        if (listener < 0 && (errno == EPERM || errno == EACCES)) return;
+        CHECK(listener >= 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK_EQ(::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)), 0);
+        CHECK_EQ(::listen(listener, 1), 0);
+        socklen_t address_size{sizeof(address)};
+        CHECK_EQ(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_size), 0);
+        const auto accept_request = [&]() {
+            pollfd ready{.fd = listener, .events = POLLIN, .revents = 0};
+            if (::poll(&ready, 1, 3000) != 1) return -1;
+            const int connection{::accept(listener, nullptr, nullptr)};
+            const timeval timeout{3, 0};
+            if (connection >= 0) {
+                ::setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+                ::setsockopt(connection, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            }
+            return connection;
+        };
+        std::atomic<bool> server_ok{true};
+        std::thread server{[&] {
+            int connection{accept_request()};
+            if (connection < 0) { server_ok = false; return; }
+            std::string request;
+            const auto reply = [](int socket, std::string_view body) {
+                return SendAll(socket, "HTTP/1.1 200 OK\r\nContent-Length: " +
+                    std::to_string(body.size()) + "\r\nConnection: keep-alive\r\n\r\n" + std::string{body});
+            };
+            server_ok = ReadHttpRequest(connection, request) &&
+                request.find("Authorization: Basic dXNlcjpvbGQ=\r\n") != std::string::npos &&
+                reply(connection, "{\"result\":7,\"error\":null,\"id\":1}") &&
+                ReadHttpRequest(connection, request);
+            if (mode == "rotate" || mode == "explicit") {
+                const auto replacement{cookie_path.string() + ".next"};
+                { std::ofstream cookie{replacement}; cookie << "user:new\n"; if (!cookie) server_ok = false; }
+                if (::rename(replacement.c_str(), cookie_path.c_str()) != 0) server_ok = false;
+            } else if (mode == "missing") {
+                if (::unlink(cookie_path.c_str()) != 0) server_ok = false;
+            }
+            if (!SendAll(connection, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")) {
+                server_ok = false;
+            }
+            ::close(connection);
+            if (mode != "rotate") return;
+            connection = accept_request();
+            if (connection < 0) { server_ok = false; return; }
+            if (!ReadHttpRequest(connection, request) ||
+                request.find("Authorization: Basic dXNlcjpuZXc=\r\n") == std::string::npos ||
+                !reply(connection, "{\"result\":8,\"error\":null,\"id\":2}")) server_ok = false;
+            ::close(connection);
+        }};
+        CoreRpcClient client{std::make_unique<HttpRpcTransport>(HttpRpcConfig{
+            .host = "127.0.0.1", .port = ntohs(address.sin_port), .path = "/",
+            .authorization = "user:old", .cookie_file = mode == "explicit" ? std::filesystem::path{} : cookie_path,
+            .timeout_seconds = 3, .max_response_bytes = 1024 * 1024,
+        })};
+        const auto first{client.Call("getblockcount")};
+        const auto second{client.Call("getblockcount")};
+        server.join();
+        ::close(listener);
+        CHECK(server_ok.load());
+        CHECK(first);
+        CHECK_EQ(first.Value().getInt<int>(), 7);
+        if (mode == "rotate") {
+            CHECK(second);
+            CHECK_EQ(second.Value().getInt<int>(), 8);
+        } else {
+            CHECK(!second);
+            CHECK(second.Error().starts_with("Bitcoin Core RPC returned HTTP 401:"));
+        }
+    }
 }
 
 TEST(raw_rpc_envelope_exposes_result_without_copying_the_value)

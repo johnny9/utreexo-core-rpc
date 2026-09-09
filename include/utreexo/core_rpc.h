@@ -23,6 +23,8 @@ struct HttpRpcConfig {
     uint16_t port{8332};
     std::string path{"/"};
     std::string authorization;
+    /** Optional cookie source, refreshed once after HTTP 401 when it has rotated. */
+    std::filesystem::path cookie_file{};
     int timeout_seconds{30};
     // Verbosity-3 includes spent prevout scripts; a consensus-valid adversarial
     // block can expand far beyond its four-megabyte wire weight in JSON.
