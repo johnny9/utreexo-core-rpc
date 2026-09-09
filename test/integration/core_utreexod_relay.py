@@ -286,13 +286,20 @@ def run(args: argparse.Namespace) -> None:
         processes.append(validator)
         wait("Compact validator reopened", lambda: utree("getbestblockhash") == tip)
         wait("Bootstrap transaction verified", lambda: legacy in utree("getrawmempool"))
+        rbf_coin = max(wallet("listunspent", [100]), key=lambda coin: coin["confirmations"])
+        rbf_inputs = [{"txid": rbf_coin["txid"], "vout": rbf_coin["vout"], "sequence": 0}]
+        original = spend(rbf_inputs, round(rbf_coin["amount"] - 0.001, 8))
+        wait("Replaceable transaction proof remembered", lambda: original in utree("getrawmempool"))
+        replacement = spend(rbf_inputs, round(rbf_coin["amount"] - 0.003, 8))
+        wait("Replacement retains shared input proof", lambda:
+             replacement in utree("getrawmempool") and original not in utree("getrawmempool"))
         intake = next(p for p in core("getpeerinfo") if p["subver"] == "/utreexo-bridge:core-tx/")
         core("disconnectnode", ["", intake["id"]])
         wait("Core transaction connection recovered", lambda:
              sidecar.log_path.read_text().count("event=core_tx_connected") >= 2)
         parent = spend([{"txid": funding, "vout": outputs[a]}], 4.999)
         child = spend([{"txid": parent, "vout": 0}, {"txid": funding, "vout": outputs[b]}], 9.998)
-        expected = {legacy, parent, child}
+        expected = {legacy, replacement, parent, child}
         wait("Legacy, witness, and mixed-input transactions verified", lambda: expected <= set(utree("getrawmempool")))
         wait("Core P2P transaction intake observed", lambda: "event=core_tx_received" in sidecar.log_path.read_text())
         sidecar.stop()
@@ -330,6 +337,7 @@ def run(args: argparse.Namespace) -> None:
         template = utree("getblocktemplate", [{"rules": ["segwit"]}])
         (work / "template.json").write_text(json.dumps(template, indent=2) + "\n")
         assert expected <= {tx["txid"] for tx in template["transactions"]}
+        print("Replacement proof remains available for mining", flush=True)
         incomplete = dict(template)
         incomplete["transactions"] = [tx for tx in template["transactions"] if tx["txid"] != parent]
         rejected = utree("submitblock", [mine_template(incomplete)])
@@ -399,6 +407,7 @@ def run(args: argparse.Namespace) -> None:
                   "full_partial_zero_requests": True, "core_mined_block": next_hash,
                   "incomplete_submitblock_rejected": True,
                   "cached_template_proof_reused": True,
+                  "replacement_retains_shared_input_proof": replacement,
                   "cached_proof_consensus_rejection": overpaid_hash,
                   "stale_template_cache_miss": True,
                   "modified_template_fallback": fallback_hash,

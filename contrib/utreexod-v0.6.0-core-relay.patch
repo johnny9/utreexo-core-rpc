@@ -490,6 +490,178 @@ index 86f830a897810a4f191f5a8d71e1feed928a9e9c..14e4b496f6af419e6329ab9b990f73d8
  
  	// Specifying --noonion means the onion address dial function results in
  	// an error.
+diff --git a/mempool/mempool.go b/mempool/mempool.go
+index 75085622f5170db60ab49d07abb186d4188bf3d4..701e289a08e5da0e0a2b9ff0d5077b9c8d602823 100644
+--- a/mempool/mempool.go
++++ b/mempool/mempool.go
+@@ -194,6 +194,7 @@ type TxPool struct {
+ 	cfg           Config
+ 	pool          map[chainhash.Hash]*TxDesc
+ 	poolLeaves    map[chainhash.Hash][]wire.LeafData
++	leafRefs      map[wire.OutPoint]uint32
+ 	orphans       map[chainhash.Hash]*orphanTx
+ 	orphanUData   map[chainhash.Hash]*wire.UData
+ 	orphansByPrev map[wire.OutPoint]map[chainhash.Hash]*btcutil.Tx
+@@ -229,15 +230,8 @@ func (mp *TxPool) removeOrphan(tx *btcutil.Tx, removeRedeemers bool) {
+ 	if mp.cfg.IsUtreexoViewActive() {
+ 		ud, found := mp.orphanUData[*tx.Hash()]
+ 		if found {
+-			// Remove related utreexo data.
+-			//
+-			// TODO uncache from the accumulator.
+ 			delete(mp.orphanUData, *tx.Hash())
+-			err := mp.cfg.PruneFromAccumulator(ud.LeafDatas)
+-			if err != nil {
+-				log.Debugf("error while pruning proof for orphan tx %v"+
+-					"from the accumulator.", tx.Hash())
+-			}
++			mp.releaseLeafReferences(ud.LeafDatas)
+ 		}
+ 	}
+ 
+@@ -381,6 +375,7 @@ func (mp *TxPool) addOrphan(tx *btcutil.Tx, utreexoData *wire.UData, tag Tag) {
+ 		// here since we've already verified it above.
+ 		mp.cfg.VerifyUData(utreexoData, tx.MsgTx().TxIn, true)
+ 		mp.orphanUData[*tx.Hash()] = utreexoData
++		mp.retainLeafReferences(utreexoData.LeafDatas)
+ 	}
+ 
+ 	log.Debugf("Stored orphan transaction %v (total: %d)", tx.Hash(),
+@@ -624,6 +619,7 @@ func (mp *TxPool) addUtreexoData(tx *btcutil.Tx, udata *wire.UData) error {
+ 		return fmt.Errorf("error while ingesting proof. %v", err)
+ 	}
+ 	mp.poolLeaves[*tx.Hash()] = udata.LeafDatas
++	mp.retainLeafReferences(udata.LeafDatas)
+ 
+ 	return nil
+ }
+@@ -639,11 +635,32 @@ func (mp *TxPool) removeUtreexoData(txHash *chainhash.Hash) {
+ 	}
+ 	delete(mp.poolLeaves, *txHash)
+ 
+-	if mp.cfg.PruneFromAccumulator != nil {
+-		err := mp.cfg.PruneFromAccumulator(leaves)
+-		if err != nil {
+-			log.Debugf("error while pruning proof for tx %v "+
+-				"from the accumulator: %v", txHash, err)
++	mp.releaseLeafReferences(leaves)
++}
++
++// Each main-pool or orphan entry owns a reference to its input proofs. RBF
++// ingests the replacement before removing conflicts; orphan promotion likewise
++// adds to the main pool before removing the orphan. Pruning the old owner must
++// not uncache proofs still needed by the new one. Call with the write lock held.
++func (mp *TxPool) retainLeafReferences(leaves []wire.LeafData) {
++	for _, leaf := range leaves {
++		mp.leafRefs[leaf.OutPoint]++
++	}
++}
++
++func (mp *TxPool) releaseLeafReferences(leaves []wire.LeafData) {
++	var unused []wire.LeafData
++	for _, leaf := range leaves {
++		if mp.leafRefs[leaf.OutPoint] > 1 {
++			mp.leafRefs[leaf.OutPoint]--
++			continue
++		}
++		delete(mp.leafRefs, leaf.OutPoint)
++		unused = append(unused, leaf)
++	}
++	if len(unused) > 0 && mp.cfg.PruneFromAccumulator != nil {
++		if err := mp.cfg.PruneFromAccumulator(unused); err != nil {
++			log.Debugf("error pruning unreferenced mempool proofs: %v", err)
+ 		}
+ 	}
+ }
+@@ -1942,6 +1959,7 @@ func New(cfg *Config) *TxPool {
+ 		cfg:            *cfg,
+ 		pool:           make(map[chainhash.Hash]*TxDesc),
+ 		poolLeaves:     make(map[chainhash.Hash][]wire.LeafData),
++		leafRefs:       make(map[wire.OutPoint]uint32),
+ 		orphans:        make(map[chainhash.Hash]*orphanTx),
+ 		orphanUData:    make(map[chainhash.Hash]*wire.UData),
+ 		orphansByPrev:  make(map[wire.OutPoint]map[chainhash.Hash]*btcutil.Tx),
+diff --git a/mempool/mempool_test.go b/mempool/mempool_test.go
+index f44c55b5746a15b60fed154ecb715340a0a9030d..99578f5e1963ce96567ae99f7f4bb7625964b138 100644
+--- a/mempool/mempool_test.go
++++ b/mempool/mempool_test.go
+@@ -1923,6 +1923,76 @@ func TestRBFUtreexoDataFailure(t *testing.T) {
+ 	testPoolMembership(ctx, replacementTx, false, false)
+ }
+ 
++// TestSharedUtreexoProofOwnership exercises real pool transitions against a
++// recording accumulator. A transfer between owners must preserve the proof,
++// while removing its last owner must still release it.
++func TestSharedUtreexoProofOwnership(t *testing.T) {
++	for _, mode := range []string{"replacement", "orphan promotion"} {
++		t.Run(mode, func(t *testing.T) {
++			harness, _, err := newPoolHarness(&chaincfg.MainNetParams)
++			require.NoError(t, err)
++			ctx := &testContext{t, harness}
++			coinbase := ctx.addCoinbaseTx(2)
++			first := txOutToSpendableOut(coinbase, 0)
++			second := txOutToSpendableOut(coinbase, 1)
++			parent, err := harness.CreateSignedTx([]spendableOutput{first}, 1, btcutil.SatoshiPerBitcoin, true)
++			require.NoError(t, err)
++			makeLeaf := func(tx *btcutil.Tx, index uint32, height int32) wire.LeafData {
++				return wire.LeafData{OutPoint: wire.OutPoint{Hash: *tx.Hash(), Index: index},
++					Height: height, Amount: tx.MsgTx().TxOut[index].Value, PkScript: harness.payScript}
++			}
++			parentData := &wire.UData{LeafDatas: []wire.LeafData{makeLeaf(coinbase, 0, 1)}}
++			cached := make(map[wire.OutPoint]bool)
++			harness.txPool.cfg.IsUtreexoViewActive = func() bool { return true }
++			harness.txPool.cfg.VerifyUData = func(ud *wire.UData, _ []*wire.TxIn, remember bool) error {
++				if remember {
++					for _, leaf := range ud.LeafDatas {
++						if !leaf.IsUnconfirmed() {
++							cached[leaf.OutPoint] = true
++						}
++					}
++				}
++				return nil
++			}
++			harness.txPool.cfg.PruneFromAccumulator = func(leaves []wire.LeafData) error {
++				for _, leaf := range leaves {
++					delete(cached, leaf.OutPoint)
++				}
++				return nil
++			}
++			if mode == "replacement" {
++				_, err = harness.txPool.ProcessTransaction(parent, parentData, false, false, 0)
++				require.NoError(t, err)
++				replacement, err := harness.CreateSignedTx([]spendableOutput{first}, 1, 3*btcutil.SatoshiPerBitcoin, false)
++				require.NoError(t, err)
++				_, err = harness.txPool.ProcessTransaction(replacement, parentData.Copy(), false, false, 0)
++				require.NoError(t, err)
++				testPoolMembership(ctx, parent, false, false)
++				testPoolMembership(ctx, replacement, false, true)
++				require.True(t, cached[parentData.LeafDatas[0].OutPoint], "RBF must keep its shared input proof")
++				harness.txPool.RemoveTransaction(replacement, false)
++			} else {
++				child, err := harness.CreateSignedTx([]spendableOutput{txOutToSpendableOut(parent, 0), second},
++					1, btcutil.SatoshiPerBitcoin, false)
++				require.NoError(t, err)
++				childData := &wire.UData{LeafDatas: []wire.LeafData{makeLeaf(parent, 0, -1), makeLeaf(coinbase, 1, 1)}}
++				_, err = harness.txPool.ProcessTransaction(child, childData, true, false, 0)
++				require.NoError(t, err)
++				testPoolMembership(ctx, child, true, false)
++				_, err = harness.txPool.ProcessTransaction(parent, parentData, false, false, 0)
++				require.NoError(t, err)
++				testPoolMembership(ctx, child, false, true)
++				require.True(t, cached[childData.LeafDatas[1].OutPoint], "promotion must keep its confirmed input proof")
++				harness.txPool.RemoveTransaction(child, false)
++				require.True(t, cached[parentData.LeafDatas[0].OutPoint], "removing child must retain parent proof")
++				harness.txPool.RemoveTransaction(parent, false)
++			}
++			require.Empty(t, cached, "last owner must release its cached proofs")
++			require.Empty(t, harness.txPool.leafRefs)
++		})
++	}
++}
++
+ // TestRemoveTransactionCleansUtreexoData verifies that removing a transaction
+ // from the mempool also removes its cached utreexo leaf data.
+ func TestRemoveTransactionCleansUtreexoData(t *testing.T) {
 diff --git a/mining/mining.go b/mining/mining.go
 index 08241ad09d6c7dd372060bf425cea5e5df3ec936..861dd2915966557f3747e39d410d660cf840c2ae 100644
 --- a/mining/mining.go

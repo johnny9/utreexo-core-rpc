@@ -99,6 +99,12 @@ and submission proofs from verified mempool leaves. A submitted block whose
 needed transactions/proofs are unavailable fails closed. It also fixes the
 upstream sync-manager double reply on rejected RPC blocks.
 
+Input proofs remain cached while any accepted transaction or orphan still
+references them. Fee replacement and orphan promotion no longer prune the
+surviving transaction's shared proof when the old pool entry is removed. The
+relay integration explicitly replaces a transaction and requires its replacement
+to appear in a valid compact mining template.
+
 The bundled consumer also resumes AssumeUtreexo when headers are already beyond
 the trusted checkpoint, enables independent proofs after the committed TTL range,
 and requires the validated tip to reach the greatest-work header before mining.
