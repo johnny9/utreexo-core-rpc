@@ -62,8 +62,8 @@ class ProofPeerProxy(LegacyReferenceServiceProxy):
                         if (self.mode == "missing-tx" and self.missing_rounds < 2 and
                                 self.notfound_transactions >= 64 * self.missing_rounds):
                             count, offset = read_compact(payload, 0)
-                            # Advertised preparations can expire before getdata.
-                            # Reannounce the same hashes to also test request release.
+                            # Invent unavailable announcements to exercise the
+                            # consumer's ordinary transaction-notfound ban policy.
                             expired = b"".join(struct.pack("<I", 1) + hashlib.sha256(
                                 f"expired-preparation-{i}".encode()).digest() for i in range(64))
                             payload = compact(count + 64) + payload[offset:] + expired
@@ -189,7 +189,7 @@ def run(args):
         wait("Standard v0.6 proof generator caught up", lambda: prover("getbestblockhash") == tip)
         a = ProofPeerProxy(ap, sp, mode="drop")
         processes.append(a)
-        consumer_command = common + [f"--datadir={work / 'consumer'}",
+        consumer_command = common + ["--regtestkeepdb", f"--datadir={work / 'consumer'}",
             f"--logdir={work / 'consumer-logs'}", f"--rpclisten=127.0.0.1:{ur}",
             f"--connect=127.0.0.1:{ap}",
             f"--connect=127.0.0.1:{bp}"]
@@ -218,11 +218,21 @@ def run(args):
         before_id = next(p["id"] for p in consumer("getpeerinfo") if p["addr"] == f"127.0.0.1:{ap}")
         a.set_mode("missing-tx")
         missing_probe_tx = spend_mature_input()
-        wait("Expired transaction proofs return notfound without banning the provider", lambda:
-             a.snapshot()["notfound_transactions"] >= 128 and missing_probe_tx in consumer("getrawmempool"))
-        assert any(p["id"] == before_id for p in consumer("getpeerinfo"))
-        assert "banning and disconnecting" not in node.log_path.read_text()
+        wait("Repeated transaction notfound replies trigger the normal peer ban", lambda:
+             any(f"127.0.0.1:{ap}" in line and "banning and disconnecting" in line
+                 for line in node.log_path.read_text().splitlines()) and
+             not any(p["id"] == before_id for p in consumer("getpeerinfo")))
+        ban_evidence = node.log_path.read_text()
+        (work / "transaction-notfound-ban.log").write_text(ban_evidence)
         a.set_mode("normal")
+        # Restore the test provider and restart to clear the in-memory ban.
+        # Preserve the existing compact database across this regtest restart.
+        stop(node)
+        node = launch("consumer-after-ban", consumer_command)
+        wait("Consumer reopened with its existing compact database", lambda:
+             consumer("getbestblockhash") == tip)
+        wait("Restored provider relays transaction proofs after the ban test", lambda:
+             missing_probe_tx in consumer("getrawmempool"))
 
         # The next block spends an input whose proof the mempool remembers.
         # A corrupt full proof must still fail before ProcessBlock, without
@@ -298,8 +308,9 @@ def run(args):
                   "historical_proof_fallback": history,
                   "headers_reported_while_waiting_for_proofs": True,
                   "headers_advance_during_proof_stall": True,
-                  "expired_transaction_notfound": a.snapshot()["notfound_transactions"],
-                  "expired_transaction_peer_not_banned": True,
+                  "unavailable_transaction_notfound": a.snapshot()["notfound_transactions"],
+                  "transaction_notfound_peer_banned": True,
+                  "transaction_notfound_recovery_after_restart": True,
                   "corrupt_full_proof_rejected_with_cached_mempool_inputs": True,
                   "utreexo_only_peer": True, "timeout_failover": first_hash,
                   "invalid_proof_failover": bad_hash, "disconnect_failover": disconnected_hash,

@@ -2518,7 +2518,7 @@ index e3e2013b5bc40fccaf1e035848e991a23a071417..c7e500c98f1864d3de9c2fa2f65471bf
  	// nodes.  This will in turn relay it to the network like normal.
  	_, err = s.cfg.SyncMgr.SubmitBlock(block, blockchain.BFNone)
 diff --git a/server.go b/server.go
-index 6db58e3ff57eb5218de62998af091a86af68b56b..a00ce3621d687e9433d9ccef5c432736877f0c55 100644
+index 6db58e3ff57eb5218de62998af091a86af68b56b..d140891600f87c1d182c56a6ca4f225078dbcc79 100644
 --- a/server.go
 +++ b/server.go
 @@ -22,6 +22,7 @@ import (
@@ -2585,20 +2585,7 @@ index 6db58e3ff57eb5218de62998af091a86af68b56b..a00ce3621d687e9433d9ccef5c432736
  	}
  
  	// Add the remote peer time as a sample for creating an offset against
-@@ -1701,9 +1687,10 @@ func (sp *serverPeer) OnNotFound(p *peer.Peer, msg *wire.MsgNotFound) {
- 		case wire.InvTypeWitnessTx:
- 			numTxns++
- 		case wire.InvTypeWitnessUtreexoTx:
--			numTxns++
-+			// Proofs are tied to a moving accumulator tip and providers may
-+			// evict their bounded preparation cache after announcing a tx.
-+			// A cache miss is not misbehavior; release the request below.
- 		case wire.InvTypeUtreexoTx:
--			numTxns++
- 		default:
- 			peerLog.Debugf("Invalid inv type '%d' in notfound message from %s",
- 				inv.Type, sp)
-@@ -1720,7 +1707,7 @@ func (sp *serverPeer) OnNotFound(p *peer.Peer, msg *wire.MsgNotFound) {
+@@ -1720,7 +1706,7 @@ func (sp *serverPeer) OnNotFound(p *peer.Peer, msg *wire.MsgNotFound) {
  	}
  	if numTxns > 0 {
  		txStr := pickNoun(uint64(numTxns), "transaction", "transactions")
@@ -2607,7 +2594,7 @@ index 6db58e3ff57eb5218de62998af091a86af68b56b..a00ce3621d687e9433d9ccef5c432736
  		if sp.addBanScore(0, 10*numTxns, reason) {
  			return
  		}
-@@ -2825,7 +2812,7 @@ func (s *server) peerHandler() {
+@@ -2825,7 +2811,7 @@ func (s *server) peerHandler() {
  	if !cfg.DisableDNSSeed {
  		requiredServices := defaultRequiredServices
  		if !cfg.NoUtreexo {
@@ -2616,7 +2603,7 @@ index 6db58e3ff57eb5218de62998af091a86af68b56b..a00ce3621d687e9433d9ccef5c432736
  		}
  		// Add peers discovered through DNS to the address manager.
  		connmgr.SeedFromDNS(activeNetParams.Params, requiredServices,
-@@ -3547,6 +3534,11 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+@@ -3547,6 +3533,11 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
  	}
  
  	assumeUtreexoPoint := chainParams.AssumeUtreexoPoint
@@ -2628,7 +2615,7 @@ index 6db58e3ff57eb5218de62998af091a86af68b56b..a00ce3621d687e9433d9ccef5c432736
  	if cfg.NoAssumeUtreexo {
  		assumeUtreexoPoint = chaincfg.AssumeUtreexo{}
  	}
-@@ -3571,6 +3563,10 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+@@ -3571,6 +3562,10 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
  		return nil, err
  	}
  

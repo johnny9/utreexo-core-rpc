@@ -88,10 +88,10 @@ and the existing byte, egress and work limits. The P2P regression receives 400
 transactions over one connection, then verifies that a control-message flood
 still causes disconnection.
 
-The consumer releases outstanding proof-aware transaction requests on
-`notfound` without adding ban points. Expiration and eviction are normal for a
-bounded preparation cache; invalid proofs and missing block responses retain
-their existing failure handling. New block announcements continue header
+The consumer applies normal transaction ban scoring to proof-aware `notfound`
+replies: ten transient points per missing transaction. The temporary exemption
+for proof-cache misses has been removed; requested regeneration now addresses
+recoverable misses at the provider. New block announcements continue header
 download during compact IBD, so mining readiness follows the advancing header
 tip instead of the height advertised when the connection first opened.
 
@@ -245,10 +245,11 @@ python3 test/integration/core_utreexod_proof_peers.py \
 
 It runs the sidecar alongside a standard v0.6 utreexod proof generator. Loopback
 proxies advertise archive-only and `NODE_UTREEXO`-only services and inject a
-timeout, invalid proof, and disconnect. They also inject 128 transaction cache
-misses and announce new blocks while compact proofs are stalled. The test
-requires header progress, no cache-miss ban, and recovery through the
-other provider, no block requests to proof-only peers, transaction proof relay,
+timeout, invalid proof, and disconnect. They also advertise unavailable
+transactions and require repeated `notfound` replies to trigger the normal peer
+ban. A subsequent consumer restart preserves its compact database, clears the
+in-memory ban, and restores proof relay. The test requires header progress while
+proofs are stalled, recovery through the other provider, no block requests to proof-only peers, transaction proof relay,
 standard pool submission, and matching accumulator roots. A corrupt full block
 proof must be rejected even when the mempool remembers its input proof. Only
 the separate proof generator enables a proof index; the consumer remains compact.
