@@ -394,7 +394,7 @@ public:
             ++tip_checks;
             result = UniValue{mode == 4 && tip_checks > 1 ? std::string(64, '9') : tip.ToBitcoinHex()};
         } else if (method == "getmempoolentry") {
-            if (params[0].get_str() != tx.Txid().ToBitcoinHex() && mode == 2) {
+            if (params[0].get_str() != tx.Txid().ToBitcoinHex() && (mode == 2 || mode == 6)) {
                 error = Json("{\"code\":-5,\"message\":\"Transaction not in mempool\"}");
             } else {
                 result = UniValue{UniValue::VOBJ};
@@ -478,6 +478,52 @@ TEST(transaction_relay_checks_core_membership_tip_and_confirmed_metadata)
             else { CHECK(!prepared); CHECK(!cache->Stats().ready); }
         }
     }
+}
+
+TEST(transaction_relay_regenerates_expired_proofs_and_preserves_unrelated_entries)
+{
+    FakeBlockSource source;
+    PackedForest forest;
+    SequentialSync sync{source, forest};
+    CHECK(sync.ProcessNext());
+    CHECK(sync.ProcessNext());
+    const auto [tx, raw]{MetadataTransaction()};
+    auto cache{std::make_shared<TransactionProofCache>(TransactionCacheConfig{
+        .lifetime = std::chrono::seconds(1),
+    })};
+    auto transport{std::make_unique<TransactionMetadataTransport>(source.hashes[1], tx, raw)};
+    auto* observed{transport.get()};
+    observed->mode = 6;
+    TransactionRelay relay{CoreRpcClient{std::move(transport), 0}, forest, sync, cache,
+        TransactionRelayConfig{.recovery_interval = std::chrono::seconds(1)}};
+    CHECK(relay.Poll({tx}));
+    const auto original{cache->Find(tx.Txid())};
+    CHECK(original);
+    const auto epoch{cache->Stats().epoch};
+
+    // A different transaction disappeared between Core's announcement and
+    // metadata lookup. Its ordinary -5 must not withdraw the existing proof.
+    std::vector<std::byte> removed_bytes{tx.Bytes().begin(), tx.Bytes().end()};
+    removed_bytes.at(removed_bytes.size() - 1) = std::byte{1};
+    auto removed{txwire::Transaction::Parse(removed_bytes)};
+    CHECK(removed);
+    CHECK(relay.Poll({removed.Take()}));
+    CHECK_EQ(cache->Stats().epoch, epoch);
+    CHECK_EQ(cache->Find(tx.Txid()), original);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    CHECK(!cache->Find(tx.Txid()));
+    CHECK_EQ(cache->Stats().expired, 1U);
+    CHECK(relay.Poll()); // Recover from Core inventory without a new P2P event.
+    const auto regenerated{cache->Find(tx.Txid())};
+    CHECK(regenerated);
+    CHECK(regenerated->sequence > original->sequence);
+    CHECK_EQ(regenerated->point, original->point);
+    CHECK_EQ(regenerated->proof.WireProof().targets, original->proof.WireProof().targets);
+    CHECK_EQ(regenerated->proof.WireProof().hashes, original->proof.WireProof().hashes);
+    CHECK(regenerated->proof.Serialize(regenerated->proof.FullRequest()));
+    CHECK_EQ(observed->confirmed_lookups, 2);
+    CHECK_EQ(cache->Stats().epoch, epoch);
 }
 
 TEST(sync_invalidates_tip_readers_before_accumulator_mutation)

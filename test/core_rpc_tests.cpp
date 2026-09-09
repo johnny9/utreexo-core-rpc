@@ -315,6 +315,65 @@ TEST(rpc_client_reuses_persistent_http_connection)
     CHECK_EQ(client.AggregateMetrics().calls, 2U);
 }
 
+TEST(rpc_client_preserves_json_rpc_errors_from_http_error_responses)
+{
+    const std::string missing{"{\"result\":null,\"error\":{\"code\":-5,\"message\":\"Transaction not in mempool\"},\"id\":1}"};
+    struct Response { int status; std::string body; bool rpc_error; };
+    for (const auto& response : std::vector<Response>{
+             {500, missing, true}, {400, missing, true}, {404, missing, true},
+             {401, missing, false}, {503, missing, false},
+             {500, "<html>upstream failed</html>", false},
+             {500, "{\"error\":{\"code\":-5}", false},
+             {500, "{\"result\":7,\"error\":null,\"id\":1}", false}}) {
+        const int listener{::socket(AF_INET, SOCK_STREAM, 0)};
+        if (listener < 0 && (errno == EPERM || errno == EACCES)) return;
+        CHECK(listener >= 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK_EQ(::bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)), 0);
+        CHECK_EQ(::listen(listener, 1), 0);
+        socklen_t address_size{sizeof(address)};
+        CHECK_EQ(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_size), 0);
+        std::atomic<bool> server_ok{true};
+        std::thread server{[&] {
+            pollfd ready{.fd = listener, .events = POLLIN, .revents = 0};
+            if (::poll(&ready, 1, 3000) != 1) { server_ok = false; return; }
+            const int connection{::accept(listener, nullptr, nullptr)};
+            if (connection < 0) { server_ok = false; return; }
+            const timeval timeout{3, 0};
+            ::setsockopt(connection, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            ::setsockopt(connection, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            std::string request;
+            server_ok = ReadHttpRequest(connection, request) &&
+                SendAll(connection, "HTTP/1.1 " + std::to_string(response.status) +
+                    " Error\r\nContent-Length: " + std::to_string(response.body.size()) +
+                    "\r\nConnection: close\r\n\r\n" + response.body);
+            ::close(connection);
+        }};
+        CoreRpcClient client{std::make_unique<HttpRpcTransport>(HttpRpcConfig{
+            .host = "127.0.0.1", .port = ntohs(address.sin_port),
+            .authorization = "user:password", .timeout_seconds = 3,
+            .max_response_bytes = 1024 * 1024,
+        })};
+        const auto result{client.Call("getmempoolentry")};
+        server.join();
+        ::close(listener);
+        CHECK(server_ok.load());
+        CHECK(!result);
+        CHECK_EQ(client.LastCallMetrics().attempts, 1U);
+        CHECK_EQ(client.LastCallMetrics().retries, 0U);
+        if (response.rpc_error) {
+            constexpr std::string_view prefix{"Bitcoin Core RPC error:"};
+            CHECK(result.Error().starts_with(prefix));
+            CHECK_EQ(Json(std::string_view{result.Error()}.substr(prefix.size()))["code"].getInt<int>(), -5);
+            CHECK_EQ(client.LastCallMetrics().response_bytes, response.body.size());
+        } else {
+            CHECK(result.Error().starts_with("Bitcoin Core RPC returned HTTP " + std::to_string(response.status) + ":"));
+        }
+    }
+}
+
 TEST(rpc_cookie_rotation_refreshes_once_after_authentication_rejection)
 {
     for (const std::string mode : {"rotate", "unchanged", "explicit", "missing"}) {

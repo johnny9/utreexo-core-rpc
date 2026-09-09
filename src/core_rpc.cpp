@@ -334,6 +334,17 @@ Result<std::string> ParseHttpResponse(std::string response)
         body.resize(*content_length);
     }
     if (code != 200) {
+        // Core's JSON-RPC 1.0 reports application errors using HTTP 400,
+        // 404 or 500. Preserve a validated error envelope so callers can
+        // distinguish ordinary errors such as a removed mempool transaction
+        // from transport failure. Authentication and other HTTP failures,
+        // malformed bodies, and success envelopes on error statuses stay errors.
+        if (code == 400 || code == 404 || code == 500) {
+            const auto envelope{ExtractJsonRpcResult(body)};
+            if (!envelope && envelope.Error().starts_with("Bitcoin Core RPC error:")) {
+                return Result<std::string>::Ok(std::move(body));
+            }
+        }
         return Result<std::string>::Err("Bitcoin Core RPC returned HTTP " + std::to_string(code) + ": " + body);
     }
     return Result<std::string>::Ok(std::move(body));
