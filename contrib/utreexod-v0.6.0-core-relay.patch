@@ -367,10 +367,42 @@ index 0000000000000000000000000000000000000000..0a718987df7eb8504e6744ad102c164a
 +	}
 +}
 diff --git a/blockchain/utreexoviewpoint.go b/blockchain/utreexoviewpoint.go
-index 8b13bf7055b1add0b53b2d12b37e1ae0e6b93256..df1f5d5922a5253b32ae498d9f83df02d97e371b 100644
+index 8b13bf7055b1add0b53b2d12b37e1ae0e6b93256..4ef7f65d777fa3ff26ed598a012d11dc7bd13eb8 100644
 --- a/blockchain/utreexoviewpoint.go
 +++ b/blockchain/utreexoviewpoint.go
-@@ -1133,6 +1133,15 @@ func (b *BlockChain) FetchUtreexoViewpoint(blockHash *chainhash.Hash) (*UtreexoV
+@@ -924,6 +924,18 @@ func (b *BlockChain) IsAssumeUtreexo() bool {
+ // This function does not modify the underlying UtreexoViewpoint.
+ // This function is safe for concurrent access.
+ func (b *BlockChain) VerifyUData(ud *wire.UData, txIns []*wire.TxIn, remember bool) error {
++	return b.verifyUData(ud, txIns, remember, false)
++}
++
++// VerifyFullUData reconstructs leaves and checks the supplied full block proof,
++// even when the mempool already remembers a proof for these inputs.
++// Unlike transaction partial proofs, a block proof must validate on its own.
++// This function is safe for concurrent access and does not remember the proof.
++func (b *BlockChain) VerifyFullUData(ud *wire.UData, txIns []*wire.TxIn) error {
++	return b.verifyUData(ud, txIns, false, true)
++}
++
++func (b *BlockChain) verifyUData(ud *wire.UData, txIns []*wire.TxIn, remember, full bool) error {
+ 	// Nothing to prove.
+ 	if len(txIns) == 0 {
+ 		return nil
+@@ -956,7 +968,11 @@ func (b *BlockChain) VerifyUData(ud *wire.UData, txIns []*wire.TxIn, remember bo
+ 
+ 	// VerifyBatchProof checks that the utreexo proofs are valid without
+ 	// mutating the accumulator.
+-	err = b.utreexoView.accumulator.VerifyPartialProof(ud.AccProof.Targets, delHashes, ud.AccProof.Proof, remember)
++	if full {
++		err = b.utreexoView.accumulator.Verify(delHashes, ud.AccProof, false)
++	} else {
++		err = b.utreexoView.accumulator.VerifyPartialProof(ud.AccProof.Targets, delHashes, ud.AccProof.Proof, remember)
++	}
+ 	if err != nil {
+ 		str := "Verify fail. All txIns-leaf datas:\n"
+ 		for i, txIn := range txIns {
+@@ -1133,6 +1149,15 @@ func (b *BlockChain) FetchUtreexoViewpoint(blockHash *chainhash.Hash) (*UtreexoV
  		return nil, err
  	}
  
@@ -589,7 +621,7 @@ index 0000000000000000000000000000000000000000..b306422c4102dc028f6b233f8c40e29f
 +	}
 +}
 diff --git a/netsync/manager.go b/netsync/manager.go
-index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd3935868bc577f6 100644
+index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..7b2e1fa6246aaa58edc07c0853d5bc09cba09084 100644
 --- a/netsync/manager.go
 +++ b/netsync/manager.go
 @@ -7,6 +7,7 @@ package netsync
@@ -822,13 +854,13 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
 +			started := time.Now()
 +			proofErr = sm.verifyBlockProof(bmsg.block, &udata)
 +			sm.pauseProofTimeouts(started, time.Now())
- 		}
++		}
 +		if proofErr != nil {
 +			sm.queuedBlocks[*blockHash] = bmsg
 +			sm.failProofPeer(utreexoProofMsg.peer, proofErr.Error())
 +			sm.scheduleProofs(time.Now())
 +			return
-+		}
+ 		}
 +		delete(sm.queuedUtreexoProofs, *blockHash)
 +		delete(sm.queuedBlocks, *blockHash)
 +		delete(sm.proofRequests, *blockHash)
@@ -937,7 +969,15 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  	}
  
  	if sm.headersFirstMode {
-@@ -1300,6 +1354,19 @@ func (sm *SyncManager) handleUtreexoProofMsg(hmsg *utreexoProofMsg) {
+@@ -1274,7 +1328,6 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
+ 
+ 	if shouldFetchBlocks {
+ 		sm.fetchHeaderBlocks(hmsg.peer)
+-		return
+ 	}
+ 
+ 	// If we don't have the headers chain caught up to our peer, ask for more headers.
+@@ -1300,6 +1353,19 @@ func (sm *SyncManager) handleUtreexoProofMsg(hmsg *utreexoProofMsg) {
  	}
  
  	blockHash := hmsg.proof.BlockHash
@@ -957,7 +997,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  	if _, exists = state.requestedUtreexoProofs[blockHash]; !exists {
  		log.Warnf("Got unrequested utreexo proof %v from %s -- "+
  			"disconnecting", blockHash, peer.Addr())
-@@ -1307,7 +1374,12 @@ func (sm *SyncManager) handleUtreexoProofMsg(hmsg *utreexoProofMsg) {
+@@ -1307,7 +1373,12 @@ func (sm *SyncManager) handleUtreexoProofMsg(hmsg *utreexoProofMsg) {
  		return
  	}
  
@@ -970,7 +1010,36 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  
  	bmsg, haveBlock := sm.queuedBlocks[blockHash]
  	if haveBlock {
-@@ -1532,12 +1604,6 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1511,7 +1582,7 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+ 	lastBlock := -1
+ 	invVects := imsg.inv.InvList
+ 	for i := len(invVects) - 1; i >= 0; i-- {
+-		if invVects[i].Type == wire.InvTypeBlock {
++		if invVects[i].Type == wire.InvTypeBlock || invVects[i].Type == wire.InvTypeWitnessBlock {
+ 			lastBlock = i
+ 			break
+ 		}
+@@ -1526,18 +1597,26 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+ 		peer.UpdateLastAnnouncedBlock(&invVects[lastBlock].Hash)
+ 	}
+ 
++	// Keep the header target current while block/proof validation catches up.
++	// Ignoring block announcements throughout a long compact IBD freezes the
++	// target at the peer's handshake height and can enable mining too early.
++	if lastBlock != -1 && sm.chain.IsUtreexoViewActive() &&
++		servesBlocks(peer.Services()) && !sm.headersBuildMode &&
++		!sm.chain.IsValidHeader(&invVects[lastBlock].Hash) {
++		locator, err := sm.chain.LatestBlockLocatorByHeader()
++		if err != nil {
++			log.Warnf("Cannot request announced compact-sync headers: %v", err)
++		} else {
++			peer.PushGetHeadersMsg(locator, &invVects[lastBlock].Hash)
++		}
++	}
++
+ 	// Ignore invs from peers that aren't the sync if we are not current.
+ 	// Helps prevent fetching a mass of orphans.
+ 	if peer != sm.syncPeer && !sm.current() {
  		return
  	}
  
@@ -983,7 +1052,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  	// Ignore invs when we're in headers build mode.
  	if sm.headersBuildMode {
  		return
-@@ -1563,6 +1629,9 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1563,6 +1642,9 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  	// we already have and request more blocks to prevent them.
  	for i := 0; i < len(invVects); i++ {
  		iv := invVects[i]
@@ -993,7 +1062,17 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  
  		// Ignore unsupported inventory types.
  		switch iv.Type {
-@@ -1701,6 +1770,22 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1584,7 +1666,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+ 		// Ignore txs when we're not current as we can't verify them
+ 		// and they'll just go in the orphan pool.
+ 		if iv.Type == wire.InvTypeWitnessTx ||
+-			iv.Type == wire.InvTypeTx {
++			iv.Type == wire.InvTypeTx || iv.Type == wire.InvTypeUtreexoTx ||
++			iv.Type == wire.InvTypeWitnessUtreexoTx {
+ 
+ 			if !sm.current() {
+ 				continue
+@@ -1701,6 +1784,22 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  		case wire.InvTypeWitnessBlock:
  			fallthrough
  		case wire.InvTypeBlock:
@@ -1016,7 +1095,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  			// Request the block if there is not already a pending
  			// request.
  			if _, exists := sm.requestedBlocks[iv.Hash]; !exists {
-@@ -1782,8 +1867,11 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1782,8 +1881,11 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  						iv.Type = wire.InvTypeWitnessTx
  					}
  
@@ -1029,7 +1108,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  					gdmsg.AddInvVect(iv)
  					numRequested++
  
-@@ -1807,6 +1895,9 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1807,6 +1909,9 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  		}
  	}
  	state.requestQueue = requestQueue
@@ -1039,7 +1118,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  	if len(gdmsg.InvList) > 0 {
  		peer.QueueMessage(gdmsg, nil)
  	}
-@@ -1821,6 +1912,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
+@@ -1821,6 +1926,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
  func (sm *SyncManager) blockHandler() {
  	stallTicker := time.NewTicker(stallSampleInterval)
  	defer stallTicker.Stop()
@@ -1048,7 +1127,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  
  out:
  	for {
-@@ -1844,6 +1937,7 @@ out:
+@@ -1844,6 +1951,7 @@ out:
  
  			case *blockMsg:
  				sm.handleBlockMsg(msg)
@@ -1056,7 +1135,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  				msg.reply <- struct{}{}
  
  			case *invMsg:
-@@ -1854,6 +1948,7 @@ out:
+@@ -1854,6 +1962,7 @@ out:
  
  			case *utreexoProofMsg:
  				sm.handleUtreexoProofMsg(msg)
@@ -1064,7 +1143,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  
  			case *utreexoTTLsMsg:
  				sm.handleUtreexoTTLsMsg(msg)
-@@ -1872,6 +1967,12 @@ out:
+@@ -1872,6 +1981,12 @@ out:
  				msg.reply <- peerID
  
  			case processBlockMsg:
@@ -1077,7 +1156,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  				_, isOrphan, err := sm.chain.ProcessBlock(
  					msg.block, msg.flags)
  				if err != nil {
-@@ -1879,6 +1980,7 @@ out:
+@@ -1879,6 +1994,7 @@ out:
  						isOrphan: false,
  						err:      err,
  					}
@@ -1085,7 +1164,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  				}
  
  				msg.reply <- processBlockResponse{
-@@ -1898,6 +2000,15 @@ out:
+@@ -1898,6 +2014,15 @@ out:
  					"handler: %T", msg)
  			}
  
@@ -1101,7 +1180,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  		case <-stallTicker.C:
  			sm.handleStallSample()
  
-@@ -2191,6 +2302,7 @@ func (sm *SyncManager) Pause() chan<- struct{} {
+@@ -2191,6 +2316,7 @@ func (sm *SyncManager) Pause() chan<- struct{} {
  // block, tx, and inv updates.
  func New(config *Config) (*SyncManager, error) {
  	sm := SyncManager{
@@ -1109,7 +1188,7 @@ index ef492458f4798b57c612f3b22d7d68e26c1bcdbc..71a47bc30c92be4f97e4cfc4bd393586
  		peerNotifier:        config.PeerNotifier,
  		chain:               config.Chain,
  		txMemPool:           config.TxMemPool,
-@@ -2225,6 +2337,13 @@ func New(config *Config) (*SyncManager, error) {
+@@ -2225,6 +2351,13 @@ func New(config *Config) (*SyncManager, error) {
  	if sm.chain.IsUtreexoViewActive() && sm.chain.IsAssumeUtreexo() {
  		log.Info("Assumed Utreexo is enabled. Downloading headers...")
  		sm.headersBuildMode = true
@@ -1211,7 +1290,7 @@ index 0000000000000000000000000000000000000000..872ab964750148b755ea156177531fc4
 +}
 diff --git a/netsync/proofpeers.go b/netsync/proofpeers.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..c36a7ff7b8c8c02806a5d0a75b10e8c645594f22
+index 0000000000000000000000000000000000000000..955ab9033f3e98855041fb88793bc6df5812f805
 --- /dev/null
 +++ b/netsync/proofpeers.go
 @@ -0,0 +1,322 @@
@@ -1513,7 +1592,7 @@ index 0000000000000000000000000000000000000000..c36a7ff7b8c8c02806a5d0a75b10e8c6
 +			return fmt.Errorf("unconfirmed leaf in block proof")
 +		}
 +	}
-+	return sm.chain.VerifyUData(data, inputs, false)
++	return sm.chain.VerifyFullUData(data, inputs)
 +}
 +
 +// verifyBlockCommitments authenticates the block bytes before blaming a proof
@@ -1539,10 +1618,10 @@ index 0000000000000000000000000000000000000000..c36a7ff7b8c8c02806a5d0a75b10e8c6
 +}
 diff --git a/netsync/proofpeers_test.go b/netsync/proofpeers_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..bbc078b597017efb33d6e2f2b2ded86c15e6af04
+index 0000000000000000000000000000000000000000..a542c79322cec4ee250234b919d4cccbacb8c9bc
 --- /dev/null
 +++ b/netsync/proofpeers_test.go
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,273 @@
 +// Copyright (c) 2026 The Utreexo developers
 +// Use of this source code is governed by an ISC license.
 +
@@ -1583,6 +1662,24 @@ index 0000000000000000000000000000000000000000..bbc078b597017efb33d6e2f2b2ded86c
 +			require.Equal(t, tc.proofs, servesProof(tc.services, tc.height, 1000, 1000))
 +		})
 +	}
++}
++
++func TestNotFoundReleasesOnlySourceTransactions(t *testing.T) {
++	sm, _ := proofTestManager(t, 1)
++	a := proofTestPeer(t, sm, "127.0.0.1:10001", wire.SFNodeUtreexo)
++	b := proofTestPeer(t, sm, "127.0.0.1:10002", wire.SFNodeUtreexo)
++	aHash, bHash := chainhash.Hash{1}, chainhash.Hash{2}
++	sm.peerStates[a].requestedTxns = map[chainhash.Hash]struct{}{aHash: {}}
++	sm.peerStates[b].requestedTxns = map[chainhash.Hash]struct{}{bHash: {}}
++	sm.requestedTxns = map[chainhash.Hash]struct{}{aHash: {}, bHash: {}}
++	msg := wire.NewMsgNotFound()
++	require.NoError(t, msg.AddInvVect(wire.NewInvVect(wire.InvTypeWitnessUtreexoTx, &aHash)))
++	require.NoError(t, msg.AddInvVect(wire.NewInvVect(wire.InvTypeUtreexoTx, &bHash)))
++	sm.handleNotFoundMsg(&notFoundMsg{peer: a, notFound: msg})
++	require.Empty(t, sm.peerStates[a].requestedTxns)
++	require.NotContains(t, sm.requestedTxns, aHash)
++	require.Contains(t, sm.requestedTxns, bHash, "unsolicited notfound cannot release another peer's request")
++	require.Contains(t, sm.peerStates[b].requestedTxns, bHash)
 +}
 +
 +// proofTestManager provides real validated headers, without starting goroutines.
@@ -2126,7 +2223,7 @@ index e3e2013b5bc40fccaf1e035848e991a23a071417..c7e500c98f1864d3de9c2fa2f65471bf
  	// nodes.  This will in turn relay it to the network like normal.
  	_, err = s.cfg.SyncMgr.SubmitBlock(block, blockchain.BFNone)
 diff --git a/server.go b/server.go
-index 6db58e3ff57eb5218de62998af091a86af68b56b..555f56a0fe70429e930f7d6dca4adcc70d6abac0 100644
+index 6db58e3ff57eb5218de62998af091a86af68b56b..a00ce3621d687e9433d9ccef5c432736877f0c55 100644
 --- a/server.go
 +++ b/server.go
 @@ -22,6 +22,7 @@ import (
@@ -2193,7 +2290,29 @@ index 6db58e3ff57eb5218de62998af091a86af68b56b..555f56a0fe70429e930f7d6dca4adcc7
  	}
  
  	// Add the remote peer time as a sample for creating an offset against
-@@ -2825,7 +2811,7 @@ func (s *server) peerHandler() {
+@@ -1701,9 +1687,10 @@ func (sp *serverPeer) OnNotFound(p *peer.Peer, msg *wire.MsgNotFound) {
+ 		case wire.InvTypeWitnessTx:
+ 			numTxns++
+ 		case wire.InvTypeWitnessUtreexoTx:
+-			numTxns++
++			// Proofs are tied to a moving accumulator tip and providers may
++			// evict their bounded preparation cache after announcing a tx.
++			// A cache miss is not misbehavior; release the request below.
+ 		case wire.InvTypeUtreexoTx:
+-			numTxns++
+ 		default:
+ 			peerLog.Debugf("Invalid inv type '%d' in notfound message from %s",
+ 				inv.Type, sp)
+@@ -1720,7 +1707,7 @@ func (sp *serverPeer) OnNotFound(p *peer.Peer, msg *wire.MsgNotFound) {
+ 	}
+ 	if numTxns > 0 {
+ 		txStr := pickNoun(uint64(numTxns), "transaction", "transactions")
+-		reason := fmt.Sprintf("%d %v not found", numBlocks, txStr)
++		reason := fmt.Sprintf("%d %v not found", numTxns, txStr)
+ 		if sp.addBanScore(0, 10*numTxns, reason) {
+ 			return
+ 		}
+@@ -2825,7 +2812,7 @@ func (s *server) peerHandler() {
  	if !cfg.DisableDNSSeed {
  		requiredServices := defaultRequiredServices
  		if !cfg.NoUtreexo {
@@ -2202,7 +2321,7 @@ index 6db58e3ff57eb5218de62998af091a86af68b56b..555f56a0fe70429e930f7d6dca4adcc7
  		}
  		// Add peers discovered through DNS to the address manager.
  		connmgr.SeedFromDNS(activeNetParams.Params, requiredServices,
-@@ -3547,6 +3533,11 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+@@ -3547,6 +3534,11 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
  	}
  
  	assumeUtreexoPoint := chainParams.AssumeUtreexoPoint
@@ -2214,7 +2333,7 @@ index 6db58e3ff57eb5218de62998af091a86af68b56b..555f56a0fe70429e930f7d6dca4adcc7
  	if cfg.NoAssumeUtreexo {
  		assumeUtreexoPoint = chaincfg.AssumeUtreexo{}
  	}
-@@ -3571,6 +3562,10 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
+@@ -3571,6 +3563,10 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
  		return nil, err
  	}
  

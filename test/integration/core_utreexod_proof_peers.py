@@ -15,7 +15,7 @@ import struct
 import threading
 from pathlib import Path
 
-from core_utreexod_relay import mine_template, read_compact, sha256d
+from core_utreexod_relay import compact, mine_template, read_compact, sha256d
 from floresta_regtest import LegacyReferenceServiceProxy, ManagedProcess, free_port, rpc, wait_for
 
 
@@ -28,6 +28,8 @@ class ProofPeerProxy(LegacyReferenceServiceProxy):
         self.block_requests = 0
         self.corrupted = None
         self.disconnected = None
+        self.missing_rounds = 0
+        self.notfound_transactions = 0
         super().__init__(listen_port, target_port)
         self.name = "proof-peer-proxy"
 
@@ -39,7 +41,8 @@ class ProofPeerProxy(LegacyReferenceServiceProxy):
         with self._lock:
             return {"requests": list(self.requests), "served": list(self.served),
                     "block_requests": self.block_requests, "corrupted": self.corrupted,
-                    "disconnected": self.disconnected}
+                    "disconnected": self.disconnected, "missing_rounds": self.missing_rounds,
+                    "notfound_transactions": self.notfound_transactions}
 
     def _pump(self, source, destination, done, responses):
         try:
@@ -54,6 +57,22 @@ class ProofPeerProxy(LegacyReferenceServiceProxy):
                 if payload is None:
                     return
                 command = header[4:16].rstrip(b"\0")
+                if responses and command == b"inv":
+                    with self._lock:
+                        if (self.mode == "missing-tx" and self.missing_rounds < 2 and
+                                self.notfound_transactions >= 64 * self.missing_rounds):
+                            count, offset = read_compact(payload, 0)
+                            # Advertised preparations can expire before getdata.
+                            # Reannounce the same hashes to also test request release.
+                            expired = b"".join(struct.pack("<I", 1) + hashlib.sha256(
+                                f"expired-preparation-{i}".encode()).digest() for i in range(64))
+                            payload = compact(count + 64) + payload[offset:] + expired
+                            self.missing_rounds += 1
+                if responses and command == b"notfound":
+                    count, offset = read_compact(payload, 0)
+                    with self._lock:
+                        self.notfound_transactions += sum(struct.unpack_from("<I", payload, offset + i * 36)[0]
+                            in (0x01000001, 0x41000001) for i in range(count))
                 if responses and command == b"version" and self.services is not None:
                     payload = payload[:4] + struct.pack("<Q", self.services) + payload[12:]
                 if not responses and command == b"getdata":
@@ -116,6 +135,16 @@ def run(args):
     core_url = f"http://127.0.0.1:{cr}"
     def core(method, params=None): return rpc(core_url, method, params, auth)
     def wallet(method, params=None): return rpc(core_url + "/wallet/proofs", method, params, auth)
+    def spend_mature_input():
+        # Avoid spending fresh change whose leaf can itself be a root and need
+        # zero proof hashes: the corruption regression needs a nonempty proof.
+        coin = max(wallet("listunspent", [101]), key=lambda coin: coin["confirmations"])
+        raw = wallet("createrawtransaction", [[{"txid": coin["txid"], "vout": coin["vout"]}],
+                                              {wallet("getnewaddress"): 1}])
+        funded = wallet("fundrawtransaction", [raw, {"add_inputs": False}])
+        signed = wallet("signrawtransactionwithwallet", [funded["hex"]])
+        assert signed["complete"]
+        return wallet("sendrawtransaction", [signed["hex"]])
     def consumer(method, params=None): return rpc(f"http://127.0.0.1:{ur}", method, params, auth)
     def prover(method, params=None): return rpc(f"http://127.0.0.1:{pr}", method, params, auth)
     processes = []
@@ -168,6 +197,10 @@ def run(args):
         wait("First provider has outstanding requests", lambda: a.snapshot()["requests"])
         syncing = consumer("getblockchaininfo")
         assert syncing['headers'] == core('getblockcount') and syncing['blocks'] < syncing['headers']
+        tip = core("generatetoaddress", [3, payout])[-1]
+        wait("Headers advance while compact proof validation is stalled", lambda:
+             consumer("getblockchaininfo")["headers"] == core("getblockcount"))
+        assert consumer("getblockcount") < core("getblockcount")
         first_hash = a.snapshot()["requests"][0]
         # Archive-only: this connection has neither NODE_NETWORK nor NODE_UTREEXO.
         b = ProofPeerProxy(bp, pp, services=1 << 13)
@@ -182,9 +215,24 @@ def run(args):
         wait("Reconnected provider served a new block", lambda: consumer("getbestblockhash") == tip)
         wait("Both proof providers served data", lambda: a.snapshot()["served"] and b.snapshot()["served"])
 
-        # Keep both providers connected and exercise failures at the live tip.
+        before_id = next(p["id"] for p in consumer("getpeerinfo") if p["addr"] == f"127.0.0.1:{ap}")
+        a.set_mode("missing-tx")
+        missing_probe_tx = spend_mature_input()
+        wait("Expired transaction proofs return notfound without banning the provider", lambda:
+             a.snapshot()["notfound_transactions"] >= 128 and missing_probe_tx in consumer("getrawmempool"))
+        assert any(p["id"] == before_id for p in consumer("getpeerinfo"))
+        assert "banning and disconnecting" not in node.log_path.read_text()
+        a.set_mode("normal")
+
+        # The next block spends an input whose proof the mempool remembers.
+        # A corrupt full proof must still fail before ProcessBlock, without
+        # partial-proof verification hiding its bad hashes behind cached data.
         a.set_mode("corrupt")
-        for _ in range(8):
+        for attempt in range(8):
+            if attempt:
+                cached_tx = spend_mature_input()
+                wait("Mempool remembers the next block's input proof", lambda:
+                     cached_tx in consumer("getrawmempool"))
             tip = core("generatetoaddress", [1, payout])[0]
             wait("Block validated during bad-proof test", lambda: consumer("getbestblockhash") == tip)
             if a.snapshot()["corrupted"]:
@@ -192,6 +240,7 @@ def run(args):
         bad_hash = a.snapshot()["corrupted"]
         assert bad_hash and bad_hash in b.snapshot()["requests"]
         assert "Retrying proofs from another peer" in node.log_path.read_text()
+        assert "Failed to process block" not in node.log_path.read_text()
         print("Invalid proof replaced without rejecting Core's block", flush=True)
 
         a.set_mode("disconnect")
@@ -248,6 +297,10 @@ def run(args):
         report = {"automatic_proof_peers": True, "archive_only_peer": True,
                   "historical_proof_fallback": history,
                   "headers_reported_while_waiting_for_proofs": True,
+                  "headers_advance_during_proof_stall": True,
+                  "expired_transaction_notfound": a.snapshot()["notfound_transactions"],
+                  "expired_transaction_peer_not_banned": True,
+                  "corrupt_full_proof_rejected_with_cached_mempool_inputs": True,
                   "utreexo_only_peer": True, "timeout_failover": first_hash,
                   "invalid_proof_failover": bad_hash, "disconnect_failover": disconnected_hash,
                   "standard_submitblock": True, "matching_roots": roots,

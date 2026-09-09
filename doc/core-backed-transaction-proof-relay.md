@@ -49,6 +49,27 @@ The listener's existing concurrency, inbound, egress, peer, and deadline limits
 also apply to transaction service. Repeated inventory passes allow a consumer to
 recover announcements ignored during initial block download.
 
+The consumer releases outstanding proof-aware transaction requests on
+`notfound` without adding ban points. Expiration and eviction are normal for a
+bounded preparation cache; invalid proofs and missing block responses retain
+their existing failure handling. New block announcements continue header
+download during compact IBD, so mining readiness follows the advancing header
+tip instead of the height advertised when the connection first opened.
+
+At INFO level, `p2p_peer_disconnected` includes the disconnect reason. A
+`transaction proof anchor changed` reason is an intentional reconnect for the
+v0.6 protocol described above. A consumer ban or repeated failed handshakes
+needs investigation on the consumer as well as the sidecar. Upgrading and
+restarting an affected consumer clears its in-memory ban while preserving its
+existing database; disabling peer banning globally is unnecessary.
+
+With cookie authentication, an HTTP 401 causes the sidecar to reread the cookie
+and retry once only if its contents changed. `rpc_cookie_refreshed` records this
+recovery without logging credentials. Explicit `--rpc-auth` credentials are not
+replaced. A missing or unchanged cookie, another authentication rejection, or a
+Core outage beyond the existing RPC retry budget still fails the operation;
+supervise the sidecar for restart after such outages.
+
 ## Build the compact consumer
 
 Apply [the compatibility patch](../contrib/utreexod-v0.6.0-core-relay.patch) to
@@ -122,9 +143,9 @@ blocks. Historical catch-up waits for a provider covering the requested heights;
 synchronization path is unchanged.
 
 A sidecar whose proof store begins at the production checkpoint advertises
-`NODE_UTREEXO`, not full archival coverage. The current consumer therefore needs
-an additional eligible historical-proof peer to catch up from that checkpoint;
-it cannot use the checkpoint-only sidecar as its sole proof source during catch-up.
+`NODE_UTREEXO`, not full archival coverage. The consumer's bounded historical
+fallback can use that sidecar for the retained suffix after the checkpoint.
+Requests before the archive's first available proof still need another source.
 
 These consumer changes ship with v0.5.0. Use its bundled patch or the
 [patched utreexod branch](https://github.com/johnny9/utreexod/tree/core-sidecar-relay-v0.6.0).
@@ -171,11 +192,15 @@ python3 test/integration/core_utreexod_proof_peers.py \
 
 It runs the sidecar alongside a standard v0.6 utreexod proof generator. Loopback
 proxies advertise archive-only and `NODE_UTREEXO`-only services and inject a
-timeout, invalid proof, and disconnect. The test requires recovery through the
+timeout, invalid proof, and disconnect. They also inject 128 transaction cache
+misses and announce new blocks while compact proofs are stalled. The test
+requires header progress, no cache-miss ban, and recovery through the
 other provider, no block requests to proof-only peers, transaction proof relay,
-standard pool submission, and matching accumulator roots. Only the separate
-proof generator enables a proof index; the consumer remains compact. Full mainnet
-catch-up, sustained mainnet load, and a combined reorg integration remain unvalidated.
+standard pool submission, and matching accumulator roots. A corrupt full block
+proof must be rejected even when the mempool remembers its input proof. Only
+the separate proof generator enables a proof index; the consumer remains compact.
+Mainnet catch-up and matching pool jobs have been observed on ARM64; sustained
+mainnet load and a combined reorg integration remain unvalidated.
 
 Run the address-discovery integration with the same binaries and another fresh directory:
 

@@ -2262,7 +2262,7 @@ public:
                 " request_bytes=" + std::to_string(message.Value().payload.size()) +
                 " response_bytes=" + std::to_string(payload.Value().size()));
         }
-        Log(LogLevel::DEBUG, "p2p_peer_disconnected",
+        Log(LogLevel::INFO, "p2p_peer_disconnected",
             "peer_address=" + Quoted(peer_address) +
             " peer_port=" + std::to_string(peer_port) +
             " reason=" + Quoted(disconnect_reason));
