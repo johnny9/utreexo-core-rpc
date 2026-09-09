@@ -1,6 +1,7 @@
 #include <test_framework.h>
 #include <utreexo/p2p.h>
 #include <utreexo/proof_store.h>
+#include <utreexo/transaction_cache.h>
 
 #include <array>
 #include <arpa/inet.h>
@@ -13,6 +14,8 @@
 #include <functional>
 #include <memory>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <set>
 #include <span>
 #include <string>
 #include <sys/socket.h>
@@ -468,6 +471,79 @@ TEST(recent_proof_cache_skips_one_oversized_proof_without_stopping)
     CHECK_EQ(stats.oversized_skips, 1U);
     CHECK_EQ(stats.tip_height, delta.point.height);
     CHECK(!cache.Find(delta.point.block_hash));
+}
+
+TEST(p2p_transaction_inventory_does_not_trigger_its_own_inbound_limit)
+{
+    auto proofs{std::make_shared<RecentProofCache>(2, 1024 * 1024)};
+    auto transactions{std::make_shared<TransactionProofCache>(TransactionCacheConfig{})};
+    const ChainPoint point{0, Hash256{}};
+    transactions->Activate(point);
+    for (uint32_t i{0}; i < 400; ++i) {
+        // Distinct structurally valid transactions with one unconfirmed input.
+        std::vector<std::byte> raw(60, std::byte{0});
+        raw[0] = std::byte{2}; raw[4] = std::byte{1};
+        std::fill(raw.begin() + 5, raw.begin() + 37, std::byte{0xab});
+        for (unsigned int j{0}; j < 4; ++j) raw[37 + j] = static_cast<std::byte>((i >> (j * 8)) & 0xffU);
+        std::fill(raw.begin() + 42, raw.begin() + 46, std::byte{0xff});
+        raw[46] = std::byte{1}; raw[47] = std::byte{1};
+        auto tx{txwire::Transaction::Parse(raw)};
+        CHECK(tx);
+        auto prepared{txwire::PreparedTransactionProof::Create(tx.Take(), Proof{}, {std::nullopt}, 0)};
+        CHECK(prepared);
+        auto published{transactions->Publish(point, prepared.Take())};
+        CHECK(published && published.Value());
+    }
+    auto started{P2PServer::Start(P2PServerConfig{
+        .network = BitcoinNetwork::REGTEST, .bind_address = "127.0.0.1", .port = 0,
+        .max_peers = 1, .idle_timeout_seconds = 10,
+    }, proofs, {}, transactions)};
+    if (ListenerUnavailable(started)) return;
+    CHECK(started);
+    auto server{started.Take()};
+    const int socket{Connect(server->BoundPort())};
+    struct CloseSocket { int value; ~CloseSocket() { ::close(value); } } close_socket{socket};
+    const int enabled{1};
+    CHECK_EQ(::setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)), 0);
+    auto version_payload{ClientVersion((uint64_t{1} << 12) | 8)};
+    version_payload.back() = std::byte{1};
+    SendBytes(socket, EncodeP2PMessage(BitcoinNetwork::REGTEST, "version", version_payload).Value());
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "version");
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "verack");
+    SendBytes(socket, EncodeP2PMessage(BitcoinNetwork::REGTEST, "verack", {}).Value());
+    const auto begin{std::chrono::steady_clock::now()};
+    std::set<Hash256> received;
+    while (received.size() < 400) {
+        const auto message{ReadWireMessage(socket, BitcoinNetwork::REGTEST)};
+        if (message.command == "inv") {
+            const auto announcements{txwire::ParseTransactionAnnouncements(message.payload)};
+            CHECK(announcements);
+            std::vector<std::byte> requests;
+            for (const auto& entry : announcements.Value()) {
+                const std::array request{txwire::TransactionProofRequest{entry.txid, txwire::MSG_WITNESS_UTREEXO_TX, {}}};
+                const auto payload{txwire::SerializeTransactionProofRequests(request)};
+                CHECK(payload);
+                const auto frame{EncodeP2PMessage(BitcoinNetwork::REGTEST, "getdata", payload.Value())};
+                CHECK(frame);
+                requests.insert(requests.end(), frame.Value().begin(), frame.Value().end());
+            }
+            SendBytes(socket, requests);
+        } else {
+            CHECK_EQ(message.command, "utreexotx");
+            const auto tx{txwire::ParseUtreexoTransaction(message.payload)};
+            CHECK(tx);
+            received.insert(tx.Value().transaction.Txid());
+        }
+    }
+    CHECK(std::chrono::steady_clock::now() - begin >= std::chrono::seconds(3));
+    CHECK_EQ(server->Stats().accepted_peers, 1U);
+    // Pacing legitimate requests must not weaken the control-message limit.
+    const std::array<std::byte, 8> nonce{};
+    const auto ping{EncodeP2PMessage(BitcoinNetwork::REGTEST, "ping", nonce).Value()};
+    std::vector<std::byte> flood;
+    for (unsigned int i{0}; i < 1024; ++i) flood.insert(flood.end(), ping.begin(), ping.end());
+    SendBytes(socket, flood);
+    CHECK(WaitUntil([&] { return server->Stats().active_peers == 0; }));
 }
 
 TEST(p2p_server_handshakes_and_serves_floresta_proof_request)

@@ -49,6 +49,14 @@ The listener's existing concurrency, inbound, egress, peer, and deadline limits
 also apply to transaction service. Repeated inventory passes allow a consumer to
 recover announcements ignored during initial block download.
 
+Transaction inventory is sent in batches of at most 64, at least one second
+apart per connection. A v0.6 consumer may answer each announcement with a
+separate `getdata`; unpaced inventory can make those legitimate replies exceed
+the listener's 256-message-per-second inbound limit. Pacing retains that limit
+and the existing byte, egress and work limits. The P2P regression receives 400
+transactions over one connection, then verifies that a control-message flood
+still causes disconnection.
+
 The consumer releases outstanding proof-aware transaction requests on
 `notfound` without adding ban points. Expiration and eviction are normal for a
 bounded preparation cache; invalid proofs and missing block responses retain

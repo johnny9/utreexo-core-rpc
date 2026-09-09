@@ -1734,6 +1734,7 @@ public:
         uint64_t tx_cursor{0};
         uint64_t tx_epoch{UINT64_MAX};
         auto tx_repeat{std::chrono::steady_clock::now()};
+        auto tx_announce_after{tx_repeat};
         std::map<Hash256, uint64_t> announced_transactions;
         auto last_input{std::chrono::steady_clock::now()};
         uint64_t messages_in_window{0};
@@ -1755,11 +1756,17 @@ public:
                     tx_epoch = epoch;
                 }
                 auto next_cursor{tx_cursor};
-                auto entries{transactions->AnnouncementsAfter(next_cursor, 64, 2048, tx_epoch)};
+                // v0.6 consumers can send one getdata message per announced
+                // transaction. Pace our invitations below the inbound message
+                // limit instead of disconnecting peers for answering a burst
+                // that this server itself created.
+                const bool announcement_ready{std::chrono::steady_clock::now() >= tx_announce_after};
+                auto entries{transactions->AnnouncementsAfter(next_cursor,
+                    announcement_ready ? 64 : 0, 2048, tx_epoch)};
                 // Inventory sent during the consumer's initial block download
                 // is ignored by v0.6. Repeat bounded passes so it can recover
                 // once current, without a sidecar mempool protocol.
-                if (entries.empty() && std::chrono::steady_clock::now() - tx_repeat >= std::chrono::seconds(5)) {
+                if (announcement_ready && entries.empty() && std::chrono::steady_clock::now() - tx_repeat >= std::chrono::seconds(5)) {
                     tx_cursor = 0;
                     tx_repeat = std::chrono::steady_clock::now();
                 }
@@ -1785,6 +1792,7 @@ public:
                         announced_transactions[announcements[i].txid] = entries[i].sequence;
                     }
                     tx_cursor = next_cursor;
+                    tx_announce_after = std::chrono::steady_clock::now() + std::chrono::seconds(1);
                 }
                 // Poll only before a new frame, preserving one deadline for all
                 // bytes of a frame. Idle peers still receive new transactions.
