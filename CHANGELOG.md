@@ -6,6 +6,72 @@ proof-store formats remain explicitly versioned.
 
 ## Unreleased
 
+## 0.6.0 - 2026-09-10
+
+### Added
+
+- Export compact AssumeUtreexo snapshots from a running sidecar's state-bearing
+  proof archive with `utreexo-export-assumeutreexo`. The bundled utreexod consumer
+  accepts a snapshot file with an explicit SHA256 pin and preserves that trusted
+  anchor across restarts. Newer snapshots shorten block/proof catch-up; consumers
+  still download and verify headers from genesis.
+- Regenerate expired or evicted transaction proofs when a peer requests a
+  previously announced preparation. Bounded, coalesced jobs recheck Core metadata
+  and require the regenerated proof identity to match the original announcement,
+  including partial and zero-additional-hash requests.
+- Add a saved-forest validation benchmark and regression/integration coverage for
+  snapshots, historical restart catch-up, cache regeneration, peer ban policy,
+  transaction replacement, and shared input-proof ownership.
+
+### Changed
+
+- Bound full saved-forest validation memory with sequential node windows and
+  temporary disk storage for cross-window hashes. A recorded 330-million-node
+  mainnet test under a 3 GiB memory limit completed in 121.9 seconds at 1.36 GiB
+  peak RSS; v0.5.0 timed out after 300 seconds. Normal cached startup remains
+  available. Full validation needs scratch space on the online-state filesystem.
+- Improve compact consumer checkpoint recovery and historical proof catch-up.
+  Bounded fallback can use a checkpoint-only proof provider for its retained
+  suffix. Proof deadlines track transfer progress and exclude local validation
+  time; mining waits for the validated tip to reach the greatest-work header.
+- Pace transaction announcements to keep legitimate requests below the existing
+  inbound limit. If an announced proof cannot be regenerated, reconnect instead
+  of sending a burst of `notfound` responses that can trigger a consumer ban.
+  Normal consumer ban scoring remains enabled, and disconnect reasons are logged
+  at INFO level.
+
+### Fixed
+
+- Reload rotated Bitcoin Core authentication cookies after HTTP 401 and retry
+  once when the cookie changed. Preserve ordinary Core RPC error envelopes so a
+  transaction leaving the mempool does not withdraw unrelated prepared proofs.
+- Retain shared compact input proofs through fee replacement, orphan promotion,
+  and sibling removal; release them after their final owner disappears. Preserve
+  selected leaf data during concurrent mining-template assembly and replacement.
+- Recover compact peers after invalid proofs and verify complete block proofs
+  even when their inputs are already remembered by the mempool.
+- Isolate Ubuntu CI dependency installation from unrelated vendor package feeds.
+
+### Compatibility and scope
+
+- Targets Bitcoin Core 31.1 and utreexod v0.6.0 commit
+  `fe71f3d9282ef0812f7f6087f0c0df9ce0fda508` with the included patch, matching
+  [utreexod 5609e4f](https://github.com/johnny9/utreexod/commit/5609e4f72cc8848ffcbb5ca7733efeee1db7c8f3).
+  Upgrade both the sidecar and patched consumer to receive all fixes. An unpatched
+  upstream utreexod binary cannot load the new snapshot files.
+- Checkpoint, forest, proof-store, and validation-cache formats are unchanged;
+  existing sidecar state requires no migration or reimport. Snapshot export needs
+  Python 3.10 or later and a state-bearing v2 proof archive. A compact snapshot
+  initializes a fresh consumer, not a proof-serving sidecar, and explicitly trusts
+  the selected accumulator state through its anchor block.
+- Production sidecar bootstrap still begins at mainnet height 943,013. A compact
+  consumer may use a newer supported snapshot, but its proof provider must retain
+  every subsequent block proof. Mainnet catch-up and pool jobs have been observed
+  on ARM64, and recent-snapshot bootstrap has been measured on a workstation.
+  Sustained mainnet load, public discovery infrastructure, and a combined reorg
+  integration remain unvalidated. Production genesis synchronization, TTL serving,
+  and compact-wallet `sendrawtransaction` proof acquisition remain outside scope.
+
 ## 0.5.0 - 2026-09-06
 
 - Relay Core-validated transactions with proofs to compact utreexod. The sidecar

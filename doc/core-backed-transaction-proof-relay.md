@@ -202,9 +202,10 @@ A sidecar whose proof store begins at the production checkpoint advertises
 fallback can use that sidecar for the retained suffix after the checkpoint.
 Requests before the archive's first available proof still need another source.
 
-These consumer changes ship with v0.5.0. Use its bundled patch or the
+The current consumer changes ship with sidecar v0.6.0. Use its bundled patch or the
 [patched utreexod branch](https://github.com/johnny9/utreexod/tree/core-sidecar-relay-v0.6.0).
-Build both the updated sidecar and consumer. The beta.1 sidecar binary sends the
+Build both the updated sidecar and consumer to receive the relay, catch-up, and
+mining fixes. The v0.5.0-beta.1 sidecar binary sends the
 older block-target encoding and is not compatible with this adapter-free consumer.
 Existing state-bearing proof archives remain usable without rewriting them;
 nonempty proofs require the archived pre-block accumulator state.
