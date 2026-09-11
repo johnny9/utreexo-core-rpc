@@ -6,6 +6,21 @@ proof-store formats remain explicitly versioned.
 
 ## Unreleased
 
+## 0.6.1 - 2026-09-11
+
+### Fixed
+
+- Avoid false transaction `notfound` responses after bounded per-peer
+  announcement history is truncated. Ambiguous delayed requests now reset the
+  connection instead of causing a conforming compact consumer to ban the proof
+  provider; truly unannounced requests retain normal `notfound` handling.
+
+### Compatibility and scope
+
+- Targets the same Bitcoin Core 31.1 and patched utreexod v0.6.0 consumer as
+  v0.6.0. Checkpoint, forest, proof-store, and validation-cache formats are
+  unchanged, so existing sidecar state requires no migration or reimport.
+
 ## 0.6.0 - 2026-09-10
 
 ### Added

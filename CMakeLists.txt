@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(utreexo_bridge VERSION 0.6.0 LANGUAGES CXX)
+project(utreexo_bridge VERSION 0.6.1 LANGUAGES CXX)
 
 set(UTREEXO_VERSION_SUFFIX "")
 if(NOT UTREEXO_VERSION_SUFFIX STREQUAL "" AND
