@@ -663,6 +663,59 @@ TEST(p2p_transaction_requests_regenerate_or_reconnect_without_false_notfound)
     disconnected_without_response();
 }
 
+TEST(p2p_truncated_announcement_history_reconnects_without_false_notfound)
+{
+    auto proofs{std::make_shared<RecentProofCache>(2, 1024 * 1024)};
+    auto transactions{std::make_shared<TransactionProofCache>(TransactionCacheConfig{
+        .max_entries = 1, .lifetime = std::chrono::seconds(10),
+    })};
+    const ChainPoint point{1, Hash256{}};
+    auto prepared = [](uint32_t marker) {
+        std::vector<std::byte> raw(60, std::byte{0});
+        raw[0] = std::byte{2}; raw[4] = std::byte{1};
+        std::fill(raw.begin() + 5, raw.begin() + 37, std::byte{0xab});
+        for (unsigned int i{0}; i < 4; ++i) {
+            raw[37 + i] = static_cast<std::byte>((marker >> (i * 8)) & 0xffU);
+        }
+        std::fill(raw.begin() + 42, raw.begin() + 46, std::byte{0xff});
+        raw[46] = std::byte{1}; raw[47] = std::byte{1};
+        return txwire::PreparedTransactionProof::Create(
+            txwire::Transaction::Parse(raw).Take(), Proof{}, {std::nullopt}, 0).Take();
+    };
+    const auto first{prepared(1)};
+    const auto second{prepared(2)};
+    transactions->Activate(point);
+    CHECK(transactions->Publish(point, first).Value());
+    auto started{P2PServer::Start(P2PServerConfig{
+        .network = BitcoinNetwork::REGTEST, .bind_address = "127.0.0.1", .port = 0,
+        .max_peers = 1, .idle_timeout_seconds = 10,
+    }, proofs, {}, transactions)};
+    if (ListenerUnavailable(started)) return;
+    CHECK(started);
+    auto server{started.Take()};
+    const int socket{Connect(server->BoundPort())};
+    struct CloseSocket { int value; ~CloseSocket() { ::close(value); } } close_socket{socket};
+    auto version{ClientVersion((uint64_t{1} << 12) | 8)};
+    version.back() = std::byte{1};
+    SendBytes(socket, EncodeP2PMessage(BitcoinNetwork::REGTEST, "version", version).Value());
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "version");
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "verack");
+    SendBytes(socket, EncodeP2PMessage(BitcoinNetwork::REGTEST, "verack", {}).Value());
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "inv");
+
+    // The new entry evicts the first cache item. Sending its announcement also
+    // truncates the peer's bounded identity history.
+    CHECK(transactions->Publish(point, second).Value());
+    CHECK_EQ(ReadWireMessage(socket, BitcoinNetwork::REGTEST).command, "inv");
+    const std::array requests{first.FullRequest(txwire::MSG_WITNESS_UTREEXO_TX)};
+    SendBytes(socket, EncodeP2PMessage(BitcoinNetwork::REGTEST, "getdata",
+        txwire::SerializeTransactionProofRequests(requests).Value()).Value());
+    CHECK(WaitUntil([&] { return server->Stats().active_peers == 0; }));
+    std::byte byte;
+    CHECK_EQ(::recv(socket, &byte, 1, 0), 0);
+    CHECK_EQ(transactions->Stats().regeneration_queued, 0U);
+}
+
 TEST(p2p_server_handshakes_and_serves_floresta_proof_request)
 {
     auto cache{std::make_shared<RecentProofCache>(8, 1024 * 1024)};

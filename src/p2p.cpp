@@ -1740,6 +1740,7 @@ public:
             TransactionProofIdentity identity;
         };
         std::map<Hash256, AnnouncedTransaction> announced_transactions;
+        bool announcement_history_truncated{false};
         auto last_input{std::chrono::steady_clock::now()};
         uint64_t messages_in_window{0};
         uint64_t inbound_bytes_remaining{config.max_inbound_bytes_per_second};
@@ -1805,7 +1806,10 @@ public:
                         // Keep small identities after cache expiration so old
                         // requests can regenerate. Bound retained peer history.
                         if (!announced_transactions.contains(announcements[i].txid) &&
-                            announced_transactions.size() >= transactions->MaxEntries()) announced_transactions.erase(announced_transactions.begin());
+                            announced_transactions.size() >= transactions->MaxEntries()) {
+                            announced_transactions.erase(announced_transactions.begin());
+                            announcement_history_truncated = true;
+                        }
                         announced_transactions[announcements[i].txid] = AnnouncedTransaction{entries[i].identity};
                     }
                     tx_cursor = next_cursor;
@@ -2129,6 +2133,18 @@ public:
                 bool failed{false};
                 for (const auto& request : requests.Value()) {
                     const auto announced{announced_transactions.find(request.txid)};
+                    // Once bounded announcement history has been truncated, an
+                    // absent txid is ambiguous: it may be an old legitimate
+                    // request rather than unsolicited work. The v0.6 protocol
+                    // has no acknowledgement or retry response, so reset the
+                    // connection instead of falsely returning notfound and
+                    // causing a conforming consumer to ban this provider.
+                    if (announced == announced_transactions.end() &&
+                        announcement_history_truncated) {
+                        disconnect_reason = "transaction announcement history truncated";
+                        failed = true;
+                        break;
+                    }
                     auto entry{announced == announced_transactions.end() ? nullptr :
                         transactions->FindMatching({request.txid, announced->second.identity})};
                     if (!entry && announced != announced_transactions.end()) {
